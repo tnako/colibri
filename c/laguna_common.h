@@ -634,9 +634,14 @@ static Wt load_w(Model *m, const char *name) {
     return w;
 }
 
-static void wt_row_f32(Wt w, int64_t off, float *out, int n) {
-    if (w.f) memcpy(out, w.f + off, (size_t)n * sizeof(float));
-    else for (int i = 0; i < n; i++) out[i] = bf16_to_f32(w.h[off + i]);
+/* one row of a resident weight as f32. embed_tokens is a Wt like any other, and
+ * in an oQ checkpoint it is PACKED (8-bit in every variant seen), so the row has
+ * to be dequantized rather than copied -- reading it as bf16 walks off the end
+ * of a buffer that is bits/16 of the size the f32 view assumes. */
+static void wt_row_f32(Wt w, int64_t row, float *out, int n) {
+    if (w.qbits)  oq_dequant_row(w.q32, w.qs, w.qb, (int)row, n, w.qbits, w.gs, out);
+    else if (w.f) memcpy(out, w.f + row*n, (size_t)n * sizeof(float));
+    else for (int i = 0; i < n; i++) out[i] = bf16_to_f32(w.h[row*n + i]);
 }
 
 static double mem_avail_bytes(void) {
@@ -1092,7 +1097,7 @@ static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
             exit(1);
         }
     }
-    for (int s = 0; s < S; s++) wt_row_f32(m->embed, (int64_t)ids[s]*D, x + (int64_t)s*D, D);
+    for (int s = 0; s < S; s++) wt_row_f32(m->embed, ids[s], x + (int64_t)s*D, D);
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];

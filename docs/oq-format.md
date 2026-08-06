@@ -246,6 +246,32 @@ on the f32 row above, which is now the SLOWEST row in the table.
 Every number here is reproducible with `c/tools/bench_oq.c` and
 `c/tools/bench_bf16.c`.
 
+## End to end on a real oQ checkpoint
+
+`mlx-works/Laguna-XS-2.1-oQ2` (11 GB on disk, 2-bit default gs64, 322 per-tensor
+overrides), M5/32 GB, `task laguna:xs Q=oQ2`, 30 tokens, auto cache sizing:
+
+| build | prefill | decode | expert-mm | attn |
+|---|---|---|---|---|
+| scalar | 4.5 s | 2.70 tok/s | 6.4 s | 5.4 s |
+| **NEON + `-mcpu=native`** | **2.3 s** | **5.26 tok/s** | **3.5 s** | **2.0 s** |
+| | 2.0x | **1.95x** | 1.8x | 2.7x |
+
+RSS 6.8 GB for a 22B model with 161 experts/layer cached. Output is coherent
+prose, and the same binary still reproduces both bf16 tiny fixtures token-exactly
+(24/24 and 208/208), so the vectorization did not trade accuracy for speed.
+
+Two bugs the first real run exposed, neither reachable from the tiny fixtures:
+
+- `embed_tokens` is oQ-packed too (8-bit in every variant seen). `wt_row_f32`
+  read it as bf16 and walked off the end of a buffer 1/2 the assumed size —
+  instant SEGV on the first token. It now dequantizes the row.
+- The same function took a flat element offset while the packed path needs a row
+  index, so the callers had to change with it.
+
+Worth stating plainly: the fixtures are synthetic f32, so no amount of fixture
+passing would have caught either. Running the real checkpoint was the test.
+
 ## Metal: measured, then deliberately not used for oQ decode
 
 Asked for, benchmarked, rejected on evidence. `c/backend_metal.mm` already has an
