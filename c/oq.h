@@ -110,6 +110,12 @@ static inline void oq_group_dot(const uint8_t *c, const float *x, int gs,
 #endif
 }
 
+/* Does this width need an unpack pass at all? At 8 bits the packed stream IS a
+ * byte array, so the codes can be read straight from the weight buffer and the
+ * copy into scratch is pure overhead -- which matters because oQ8e checkpoints
+ * are 8-bit for every tensor. */
+static inline int oq_is_byte_aligned(int bits) { return bits == 8; }
+
 /* y[S,O] = x[S,I] @ dequant(W)^T, W packed [O, I*bits/32].
  * Dequantizes inside the loop: materializing f32 would spend the whole point of
  * the format. Per group the affine form factors,
@@ -126,6 +132,7 @@ static void matmul_oq(float *y, const float *x, const uint32_t *q,
                       int S, int I, int O, int bits, int gs){
     int ng=(int)oq_groups(I,gs), wpg=gs*bits/32;
     int64_t rw=oq_words(I,bits);
+    const int byte_aligned = oq_is_byte_aligned(bits);
     #pragma omp parallel
     {
         uint8_t c[OQ_MAX_GROUP];
@@ -138,11 +145,15 @@ static void matmul_oq(float *y, const float *x, const uint32_t *q,
                 int nb = S-s0 < OQ_MAX_BATCH ? S-s0 : OQ_MAX_BATCH;
                 for(int s=0;s<nb;s++) accs[s]=0.f;
                 for(int g=0;g<ng;g++){
-                    oq_unpack(w+(int64_t)g*wpg,bits,gs,c);     /* once per group */
+                    /* ROUND 9: at 8 bits the stream is already bytes, so point at
+                     * it instead of memcpy-ing every group into scratch. */
+                    const uint8_t *cp;
+                    if(byte_aligned) cp = (const uint8_t*)(w) + (int64_t)g*gs;
+                    else { oq_unpack(w+(int64_t)g*wpg,bits,gs,c); cp = c; }
                     float sc=scl[g], bs=bi[g];
                     for(int s=0;s<nb;s++){
                         float dot, xsum;
-                        oq_group_dot(c, x+(int64_t)(s0+s)*I+(int64_t)g*gs, gs, &dot, &xsum);
+                        oq_group_dot(cp, x+(int64_t)(s0+s)*I+(int64_t)g*gs, gs, &dot, &xsum);
                         accs[s]+=sc*dot+bs*xsum;
                     }
                 }
