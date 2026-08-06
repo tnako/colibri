@@ -11,12 +11,21 @@ version: '3'
 # step that fails stops the chain — a build against a half-merged tree is worse
 # than no build.
 #
+# Pick a quant with Q= (bf16 is the default; oQ widths are bit-packed):
+#   task laguna:s  Q=oQ2e-fast     35 GB   smallest, 2-bit experts
+#   task laguna:s  Q=oQ4e          64 GB
+#   task laguna:s  Q=oQ6e          93 GB
+#   task laguna:xs Q=oQ2           12 GB
+#   task laguna:s  Q=bf16         235 GB   original release
+# `task quants` lists every wired variant with its size. Anything not listed can
+# still be run directly: task laguna:s REPO=<hf-repo> DIR=<subdir>
+#
 # Pass a prompt:            task laguna:xs -- "write a haiku about ring buffers"
 # Override where models live: LAGUNA_MODELS=/Volumes/ext/models task laguna:xs
 # Skip the upstream sync:     SYNC=0 task laguna:xs
 
 vars:
-  REPO: '{{.ROOT_DIR}}'
+  REPO_DIR: '{{.ROOT_DIR}}'
   C: '{{.ROOT_DIR}}/c'
   WORK_BRANCH: laguna-support
   # `main` is kept as a clean mirror of upstream/main and never carries our
@@ -24,15 +33,15 @@ vars:
   MIRROR_BRANCH: main
   # Where checkpoints are downloaded to. Each model gets its own subdirectory.
   MODELS: '{{.LAGUNA_MODELS | default (printf "%s/models" .ROOT_DIR)}}'
-  XS_REPO: poolside/Laguna-XS-2.1
-  S_REPO: poolside/Laguna-S-2.1
+  # Quant selector. Every value here was verified to exist on the Hub with
+  # c/tools/probe_oq.py; sizes are the sum of the repo's safetensors blobs.
+  Q: '{{.Q | default "bf16"}}'
   DEFAULT_PROMPT: 'Explain what a ring buffer is, in two sentences.'
-  # Generated tokens per run; override with NGEN=512.
   NGEN: '{{.NGEN | default "256"}}'
   # Expert cache slots per layer. 0 = size it from available RAM at startup.
   CAP: '{{.CAP | default "0"}}'
-  # Routed-expert precision: 0 keeps f32 (bit-exact), 8 runtime-quantizes to int8
-  # and roughly halves the cache footprint.
+  # Routed-expert precision for a bf16 checkpoint: 0 = f32, 8 = runtime int8.
+  # Ignored for oQ, whose widths come from the checkpoint itself.
   BITS: '{{.BITS | default "0"}}'
   SYNC: '{{.SYNC | default "1"}}'
 
@@ -45,30 +54,103 @@ tasks:
   # ---------------------------------------------------------------- the two commands
 
   laguna:xs:
-    desc: 'Sync upstream, build, and run Laguna-XS (22B/2B). Prompt: task laguna:xs -- "..."'
+    desc: 'Sync, build, run Laguna-XS (22B/2B). Q=bf16|oQ2|oQ4e|oQ8e. Prompt: task laguna:xs -- "..."'
     cmds:
       - task: sync
       - task: build
         vars: {ENGINE: laguna_xs}
-      - task: run
+      - task: resolve-run
         vars:
           ENGINE: laguna_xs
-          MODEL_REPO: '{{.XS_REPO}}'
-          DIR: Laguna-XS-2.1
+          FAMILY: laguna-xs
           PROMPT: '{{if .CLI_ARGS}}{{.CLI_ARGS}}{{else}}{{.DEFAULT_PROMPT}}{{end}}'
 
   laguna:s:
-    desc: 'Sync upstream, build, and run Laguna-S (118B/8B). Prompt: task laguna:s -- "..."'
+    desc: 'Sync, build, run Laguna-S (118B/8B). Q=bf16|oQ2e-fast|oQ3e|oQ4e|oQ5e|oQ6e|oQ8e.'
     cmds:
       - task: sync
       - task: build
         vars: {ENGINE: laguna_s}
-      - task: run
+      - task: resolve-run
         vars:
           ENGINE: laguna_s
-          MODEL_REPO: '{{.S_REPO}}'
-          DIR: Laguna-S-2.1
+          FAMILY: laguna-s
           PROMPT: '{{if .CLI_ARGS}}{{.CLI_ARGS}}{{else}}{{.DEFAULT_PROMPT}}{{end}}'
+
+  # ---------------------------------------------------------------- quant registry
+
+  quants:
+    desc: List every wired model/quant variant with its on-disk size
+    cmds:
+      - |
+        cat <<'EOF'
+        family     Q             size   HF repo
+        ---------- ------------- ------ --------------------------------------------
+        laguna-xs  bf16           44 GB poolside/Laguna-XS-2.1
+        laguna-xs  oQ2            12 GB mlx-works/Laguna-XS-2.1-oQ2
+        laguna-xs  oQ4e           20 GB mlx-coders/Laguna-XS-2.1-oQ4e
+        laguna-xs  oQ8e           36 GB mlx-coders/Laguna-XS-2.1-oQ8e
+
+        laguna-s   bf16          235 GB poolside/Laguna-S-2.1
+        laguna-s   oQ2e-fast      35 GB mlx-community/Laguna-S-2.1-oQ2e-fast
+        laguna-s   oQ2e           36 GB mlx-community/Laguna-S-2.1-oQ2e
+        laguna-s   oQ3e           49 GB mlx-community/Laguna-S-2.1-oQ3e
+        laguna-s   oQ3e-fast      49 GB mlx-community/Laguna-S-2.1-oQ3e-fast
+        laguna-s   oQ4e           64 GB mlx-community/Laguna-S-2.1-oQ4e
+        laguna-s   oQ4e-fast      63 GB mlx-community/Laguna-S-2.1-oQ4e-fast
+        laguna-s   oQ5e           78 GB mlx-community/Laguna-S-2.1-oQ5e
+        laguna-s   oQ6e           93 GB mlx-community/Laguna-S-2.1-oQ6e
+        laguna-s   oQ8e          125 GB dfp-official/Laguna-S-2.1-oQ8e
+
+        Ornith-1.0-35B oQ variants are PROBE-ONLY (task ornith:probe): they are
+        qwen3_5_moe with 30 linear_attention (Gated DeltaNet) layers, which this
+        engine does not implement. Wired here so the oQ loader can be exercised
+        against a second architecture's metadata.
+        ornith-35b oQ3.5          17 GB NapYang/Ornith-1.0-35B-MLX-oQ3.5-fp16
+        ornith-35b oQ4            20 GB deepsweet/Ornith-1.0-35B-MLX-oQ4
+        ornith-35b oQ5            25 GB deepsweet/Ornith-1.0-35B-MLX-oQ5
+        ornith-35b oQ6            29 GB deepsweet/Ornith-1.0-35B-MLX-oQ6
+        ornith-35b oQ8            37 GB deepsweet/Ornith-1.0-35B-MLX-oQ8
+
+        Sizes are the sum of each repo's safetensors blobs. RAM needed is far
+        lower: routed experts stream from disk into a bounded LRU cache, so the
+        resident set is roughly the dense weights plus CAP experts per layer.
+        EOF
+
+  resolve-run:
+    desc: Map (FAMILY, Q) to a repo and run it (internal)
+    internal: true
+    cmds:
+      - |
+        set -e
+        case "{{.FAMILY}}:{{.Q}}" in
+          laguna-xs:bf16)       R=poolside/Laguna-XS-2.1 ;;
+          laguna-xs:oQ2)        R=mlx-works/Laguna-XS-2.1-oQ2 ;;
+          laguna-xs:oQ4e)       R=mlx-coders/Laguna-XS-2.1-oQ4e ;;
+          laguna-xs:oQ8e)       R=mlx-coders/Laguna-XS-2.1-oQ8e ;;
+          laguna-s:bf16)        R=poolside/Laguna-S-2.1 ;;
+          laguna-s:oQ2e-fast)   R=mlx-community/Laguna-S-2.1-oQ2e-fast ;;
+          laguna-s:oQ2e)        R=mlx-community/Laguna-S-2.1-oQ2e ;;
+          laguna-s:oQ3e)        R=mlx-community/Laguna-S-2.1-oQ3e ;;
+          laguna-s:oQ3e-fast)   R=mlx-community/Laguna-S-2.1-oQ3e-fast ;;
+          laguna-s:oQ4e)        R=mlx-community/Laguna-S-2.1-oQ4e ;;
+          laguna-s:oQ4e-fast)   R=mlx-community/Laguna-S-2.1-oQ4e-fast ;;
+          laguna-s:oQ5e)        R=mlx-community/Laguna-S-2.1-oQ5e ;;
+          laguna-s:oQ6e)        R=mlx-community/Laguna-S-2.1-oQ6e ;;
+          laguna-s:oQ8e)        R=dfp-official/Laguna-S-2.1-oQ8e ;;
+          *)
+            if [ -n "{{.REPO}}" ]; then R="{{.REPO}}"; else
+              echo "unknown variant {{.FAMILY}} Q={{.Q}}"
+              echo "  run 'task quants' for the list, or pass REPO=<hf-repo> explicitly"
+              exit 1
+            fi ;;
+        esac
+        DIR="{{.DIR | default ""}}"
+        [ -n "$DIR" ] || DIR=$(basename "$R")
+        # Delegate so fetch/run see concrete values; keeps the case table in one place.
+        exec task --taskfile '{{.ROOT_DIR}}/Taskfile.yml' run \
+          ENGINE='{{.ENGINE}}' MODEL_REPO="$R" DIR="$DIR" \
+          PROMPT='{{.PROMPT}}' CAP='{{.CAP}}' BITS='{{.BITS}}' NGEN='{{.NGEN}}'
 
   # ---------------------------------------------------------------- upstream sync
 
@@ -79,7 +161,7 @@ tasks:
     cmds:
       - |
         set -e
-        cd '{{.REPO}}'
+        cd '{{.REPO_DIR}}'
         if [ -n "$(git status --porcelain)" ]; then
           echo "==> working tree is dirty; refusing to sync"
           echo "    commit or stash first, then re-run (or pass SYNC=0 to build as-is)"
@@ -90,8 +172,8 @@ tasks:
         echo "==> fetching upstream"
         git fetch upstream --prune
         # The mirror branch never carries our commits, so it must fast-forward.
-        # If it cannot, upstream rewrote published history (which CONTRIBUTING.md
-        # says should not happen) and that is worth stopping for, not forcing past.
+        # If it cannot, upstream rewrote published history and that is worth
+        # stopping for, not forcing past.
         echo "==> fast-forwarding {{.MIRROR_BRANCH}} to upstream/main"
         git checkout '{{.MIRROR_BRANCH}}'
         if ! git merge --ff-only upstream/main; then
@@ -128,14 +210,13 @@ tasks:
   # ---------------------------------------------------------------- run
 
   run:
-    desc: Download if needed, then run one engine (internal)
-    internal: true
+    desc: 'Run an engine on a specific repo: task run ENGINE=.. MODEL_REPO=.. DIR=..'
     cmds:
       - task: fetch
         vars: {MODEL_REPO: '{{.MODEL_REPO}}', DIR: '{{.DIR}}'}
       - |
         set -e
-        echo "==> {{.ENGINE}} geometry"
+        echo "==> {{.ENGINE}} geometry ({{.DIR}})"
         SNAP='{{.MODELS}}/{{.DIR}}' '{{.C}}/{{.ENGINE}}' --config
         echo "==> generating (cap={{.CAP}} bits={{.BITS}} ngen={{.NGEN}})"
         SNAP='{{.MODELS}}/{{.DIR}}' '{{.C}}/{{.ENGINE}}' {{.CAP}} {{.BITS}} \
@@ -144,9 +225,8 @@ tasks:
   fetch:
     desc: Download a checkpoint if it is not already complete (internal)
     internal: true
-    # hf download is itself resumable and idempotent, but it still walks the
-    # whole repo listing on every call. Skip it entirely once the marker files
-    # and at least one shard are present.
+    # hf download is resumable and idempotent, but it still walks the whole repo
+    # listing on every call. Skip it once the marker files and a shard exist.
     status:
       - test -f '{{.MODELS}}/{{.DIR}}/config.json'
       - test -f '{{.MODELS}}/{{.DIR}}/tokenizer.json'
@@ -156,27 +236,84 @@ tasks:
         set -e
         command -v hf >/dev/null || { echo "hf CLI not found: pip install -U huggingface_hub"; exit 1; }
         echo "==> downloading {{.MODEL_REPO}} to {{.MODELS}}/{{.DIR}}"
-        echo "    (bf16 weights: XS is ~44 GB, S is ~235 GB)"
+        echo "    ('task quants' lists sizes; oQ variants are far smaller than bf16)"
         mkdir -p '{{.MODELS}}'
         hf download '{{.MODEL_REPO}}' --local-dir '{{.MODELS}}/{{.DIR}}'
 
-  # ---------------------------------------------------------------- serve / chat
+  # ---------------------------------------------------------------- serve
 
   laguna:xs:serve:
-    desc: Serve Laguna-XS on an OpenAI-compatible endpoint (port 8000)
-    deps: [{task: build, vars: {ENGINE: laguna_xs}}]
+    desc: Serve Laguna-XS on an OpenAI-compatible endpoint (port 8000). Honors Q=.
     cmds:
-      - task: fetch
-        vars: {MODEL_REPO: '{{.XS_REPO}}', DIR: Laguna-XS-2.1}
-      - '{{.C}}/coli serve --model {{.MODELS}}/Laguna-XS-2.1'
+      - task: build
+        vars: {ENGINE: laguna_xs}
+      - task: serve-resolved
+        vars: {FAMILY: laguna-xs}
 
   laguna:s:serve:
-    desc: Serve Laguna-S on an OpenAI-compatible endpoint (port 8000)
-    deps: [{task: build, vars: {ENGINE: laguna_s}}]
+    desc: Serve Laguna-S on an OpenAI-compatible endpoint (port 8000). Honors Q=.
     cmds:
-      - task: fetch
-        vars: {MODEL_REPO: '{{.S_REPO}}', DIR: Laguna-S-2.1}
-      - '{{.C}}/coli serve --model {{.MODELS}}/Laguna-S-2.1'
+      - task: build
+        vars: {ENGINE: laguna_s}
+      - task: serve-resolved
+        vars: {FAMILY: laguna-s}
+
+  serve-resolved:
+    internal: true
+    cmds:
+      - |
+        set -e
+        case "{{.FAMILY}}:{{.Q}}" in
+          laguna-xs:bf16)     R=poolside/Laguna-XS-2.1 ;;
+          laguna-xs:oQ2)      R=mlx-works/Laguna-XS-2.1-oQ2 ;;
+          laguna-xs:oQ4e)     R=mlx-coders/Laguna-XS-2.1-oQ4e ;;
+          laguna-xs:oQ8e)     R=mlx-coders/Laguna-XS-2.1-oQ8e ;;
+          laguna-s:bf16)      R=poolside/Laguna-S-2.1 ;;
+          laguna-s:oQ2e-fast) R=mlx-community/Laguna-S-2.1-oQ2e-fast ;;
+          laguna-s:oQ3e)      R=mlx-community/Laguna-S-2.1-oQ3e ;;
+          laguna-s:oQ4e)      R=mlx-community/Laguna-S-2.1-oQ4e ;;
+          laguna-s:oQ5e)      R=mlx-community/Laguna-S-2.1-oQ5e ;;
+          laguna-s:oQ6e)      R=mlx-community/Laguna-S-2.1-oQ6e ;;
+          *) echo "unknown variant {{.FAMILY}} Q={{.Q}} (see: task quants)"; exit 1 ;;
+        esac
+        D=$(basename "$R")
+        task --taskfile '{{.ROOT_DIR}}/Taskfile.yml' fetch MODEL_REPO="$R" DIR="$D"
+        exec '{{.C}}/coli' serve --model '{{.MODELS}}'/"$D"
+
+  # ---------------------------------------------------------------- oQ tooling
+
+  oq:probe:
+    desc: 'Verify an oQ checkpoint layout from its metadata only: task oq:probe M=<repo|dir>'
+    cmds:
+      - '{{.PYTHON | default "python3"}} {{.C}}/tools/probe_oq.py {{.M | default "mlx-community/Laguna-S-2.1-oQ2e-fast"}}'
+
+  oq:probe:all:
+    desc: Probe every wired oQ variant (metadata only, no weight downloads)
+    cmds:
+      - for: 
+          - mlx-works/Laguna-XS-2.1-oQ2
+          - mlx-coders/Laguna-XS-2.1-oQ4e
+          - mlx-coders/Laguna-XS-2.1-oQ8e
+          - mlx-community/Laguna-S-2.1-oQ2e-fast
+          - mlx-community/Laguna-S-2.1-oQ3e
+          - mlx-community/Laguna-S-2.1-oQ4e
+          - mlx-community/Laguna-S-2.1-oQ5e
+          - mlx-community/Laguna-S-2.1-oQ6e
+          - NapYang/Ornith-1.0-35B-MLX-oQ3.5-fp16
+          - deepsweet/Ornith-1.0-35B-MLX-oQ5
+          - deepsweet/Ornith-1.0-35B-MLX-oQ6
+        cmd: '{{.PYTHON | default "python3"}} {{.C}}/tools/probe_oq.py {{.ITEM}} || true'
+
+  ornith:probe:
+    desc: Probe Ornith-35B oQ variants (engine cannot RUN these; see task quants)
+    cmds:
+      - for:
+          - NapYang/Ornith-1.0-35B-MLX-oQ3.5-fp16
+          - deepsweet/Ornith-1.0-35B-MLX-oQ4
+          - deepsweet/Ornith-1.0-35B-MLX-oQ5
+          - deepsweet/Ornith-1.0-35B-MLX-oQ6
+          - deepsweet/Ornith-1.0-35B-MLX-oQ8
+        cmd: '{{.PYTHON | default "python3"}} {{.C}}/tools/probe_oq.py {{.ITEM}} || true'
 
   # ---------------------------------------------------------------- validation
 
@@ -193,7 +330,6 @@ tasks:
       - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs --fixture {{.ROOT_DIR}}/laguna_tiny'
       - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_s  --fixture {{.ROOT_DIR}}/laguna_tiny'
       - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs --fixture {{.ROOT_DIR}}/laguna_tiny --bits 8'
-      - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs --fixture {{.ROOT_DIR}}/laguna_tiny --cap 1'
 
   test:baseline:
     desc: Confirm the upstream engines still build after a sync
@@ -207,7 +343,7 @@ tasks:
   diff:upstream:
     desc: Show every place this fork diverges from upstream in a shared file
     cmds:
-      - git -C '{{.REPO}}' grep -n LAGUNA-FORK || true
+      - git -C '{{.REPO_DIR}}' grep -n LAGUNA-FORK || true
 
   clean:
     desc: Remove the Laguna binaries and the tiny fixture

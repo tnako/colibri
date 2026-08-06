@@ -48,6 +48,7 @@
 #include "tok.h"
 #include "route_trace.h"
 #include "coli_moe_route.h"
+#include "oq.h"                   /* LAGUNA-FORK: oMLX oQ packed-weight kernels */
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
@@ -82,7 +83,12 @@ typedef struct {
 } Cfg;
 
 /* ---------- weights ---------- */
-typedef struct { float *f; uint16_t *h; } Wt;   /* resident: f32 or raw bf16 */
+/* ---------- weights ----------
+ * A resident weight is f32, raw bf16, or oQ-packed. The oQ case keeps the codes
+ * packed and dequantizes inside the matmul (c/oq.h), which is the only shape
+ * that actually saves memory -- dequantizing on load would spend the savings
+ * immediately. */
+typedef struct { float *f; uint16_t *h; OQTensor q; } Wt;
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -93,11 +99,23 @@ typedef struct {
     Wt sh_g, sh_u, sh_d;                   /* shared expert               */
 } Layer;
 
+/* ---------- oQ per-tensor quantization map (populated from config.json) ----
+ * Declared before Model because Model holds one. The loader that fills it lives
+ * further down, next to the other weight-loading code. */
+typedef struct { char *name; int bits, gs; } OQEntry;
+
+typedef struct {
+    int      is_oq;                /* checkpoint carries a "quantization" block */
+    int      def_bits, def_gs;
+    OQEntry *e; int n, cap;
+} OQMap;
+
 /* ---------- routed-expert LRU cache ---------- */
 typedef struct {
     int eid; uint64_t used; int filled;
     float *fg, *fu, *fd;                   /* bits == 0: f32 (oracle)     */
     int8_t *qg, *qu, *qd; float *sg, *su, *sd;   /* bits > 0: int8 + row scales */
+    OQTensor og, ou, od;                   /* oQ: packed codes, kept packed */
 } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
@@ -111,6 +129,8 @@ typedef struct {
      * [E,2I,D] / [E,D,I] — what transformers holds in memory, so what a
      * save_pretrained fixture writes). Both are read; neither is guessed. */
     int fused_experts;
+    OQMap oq;                      /* oQ per-tensor bits/group_size map */
+    int   oq_tensors;              /* how many weights were read oQ-packed */
     Wt embed, lm_head;
     float *final_norm;
     Layer *L;
@@ -138,6 +158,18 @@ static float *falloc(int64_t n) {
     return p;
 }
 static float sigmoidf_(float x) { return 1.f / (1.f + expf(-x)); }
+
+/* pread that survives short reads and >2 GB requests. Defined here because both
+ * the oQ loader and load_w need it. */
+static void pread_all(int fd, void *buf, int64_t nb, int64_t off) {
+    char *p = buf;
+    while (nb > 0) {
+        int64_t chunk = nb < (1<<30) ? nb : (1<<30);
+        ssize_t got = pread(fd, p, (size_t)chunk, off);
+        if (got <= 0) { perror("pread chunk"); exit(1); }
+        p += got; off += got; nb -= got;
+    }
+}
 static float siluf(float x) { return x / (1.f + expf(-x)); }
 /* softplus in f32 with the large-x guard the reference's float() path gets for
  * free: expf overflows to inf above ~88 and log1pf(inf) is inf, so the gate
@@ -172,8 +204,14 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 }
 
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
-    if (W.f) matmul(y, x, W.f, S, I, O);
-    else     matmul_h(y, x, W.h, S, I, O);
+    if (oq_valid(&W.q)) {
+        /* S==1 is the decode path and by far the hottest; it skips the
+         * per-group activation-sum scratch that the batched kernel needs. */
+        if (S == 1) oq_matvec(y, x, &W.q);
+        else        oq_matmul(y, x, &W.q, S);
+    }
+    else if (W.f) matmul(y, x, W.f, S, I, O);
+    else          matmul_h(y, x, W.h, S, I, O);
 }
 
 /* y[1,O] = x @ q^T, int8 rows + per-row scale */
@@ -187,6 +225,17 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
     }
 }
 
+/* Runtime int8 row-symmetric quantization for streamed routed experts.
+ *
+ * BITS is 0 (keep f32) or 8. Sub-byte widths are deliberately NOT offered here:
+ * the codes are stored one-per-int8_t, so a 4-bit request cost exactly the same
+ * RAM as int8 while being measurably less accurate (measured on the tiny
+ * fixture: bits=8 matched the oracle 12/12, bits=4 matched 11/12). That is a
+ * pure loss, so it is rejected at the CLI rather than silently accepted.
+ *
+ * Real sub-byte weights come from oQ instead (c/oq.h), where the codes are
+ * genuinely bit-packed and the width is chosen per tensor by an importance
+ * matrix rather than uniformly by a flag. */
 static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
     int qmax = (1 << (bits - 1)) - 1;
     #pragma omp parallel for schedule(static)
@@ -319,7 +368,63 @@ static void load_rope(RopeCfg *r, jval *o, int head_dim, double dflt_theta, doub
     else                           r->attn_factor = 1.0;
 }
 
-static void load_cfg(Cfg *c, const char *snap) {
+/* ---------- oQ: per-tensor quantization map from config.json ----------
+ * The map lives under "quantization": scalar bits/group_size/mode are the
+ * default, and any key whose value is an object overrides them for that tensor
+ * stem (see docs/oq-format.md). Names in the map are MLX's, i.e. prefixed
+ * "language_model.", so lookups go through oq_lookup() which tries both.
+ * (OQEntry / OQMap are declared above, next to Model.) */
+static void oq_map_add(OQMap *m, const char *name, int bits, int gs) {
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap*2 : 256;
+        m->e = realloc(m->e, (size_t)m->cap * sizeof(OQEntry));
+        if (!m->e) { fprintf(stderr, "OOM oq map\n"); exit(1); }
+    }
+    m->e[m->n].name = strdup(name);
+    m->e[m->n].bits = bits; m->e[m->n].gs = gs; m->n++;
+}
+
+static void oq_map_load(OQMap *m, jval *root) {
+    memset(m, 0, sizeof(*m));
+    jval *q = json_get(root, "quantization");
+    if (!q) q = json_get(root, "quantization_config");
+    if (!q || q->t != J_OBJ) return;
+    m->is_oq = 1;
+    m->def_bits = (int)jnum(q, "bits", 4);
+    m->def_gs   = (int)jnum(q, "group_size", 64);
+    for (int i = 0; i < q->len; i++) {
+        jval *v = q->kids[i];
+        if (!v || v->t != J_OBJ) continue;          /* scalars = the defaults */
+        const char *mode = NULL;
+        jval *md = json_get(v, "mode");
+        if (md && md->t == J_STR) mode = md->str;
+        if (mode && strcmp(mode, "affine")) {
+            fprintf(stderr, "oQ: tensor '%s' uses mode '%s'; only 'affine' is implemented\n",
+                    q->keys[i], mode);
+            exit(1);
+        }
+        oq_map_add(m, q->keys[i], (int)jnum(v, "bits", m->def_bits),
+                                 (int)jnum(v, "group_size", m->def_gs));
+    }
+}
+
+/* Resolve (bits, gs) for a tensor stem. `stem` is in HF naming; the map may be
+ * in MLX naming, so try the prefixed form too. Unlisted tensors get the global
+ * default -- that is how the routed experts of an oQ<N>e checkpoint are
+ * described, and they are the bulk of the weights. */
+static void oq_lookup(const OQMap *m, const char *stem, int *bits, int *gs) {
+    *bits = m->def_bits; *gs = m->def_gs;
+    if (!m->n) return;
+    char alt[352];
+    snprintf(alt, sizeof(alt), "language_model.%s", stem);
+    for (int i = 0; i < m->n; i++) {
+        if (!strcmp(m->e[i].name, stem) || !strcmp(m->e[i].name, alt)) {
+            *bits = m->e[i].bits; *gs = m->e[i].gs; return;
+        }
+    }
+}
+
+static void load_cfg(Cfg *c, const char *snap, OQMap *oq) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if (!f) { perror(path); exit(1); }
     fseek(f,0,SEEK_END); long n = ftell(f); fseek(f,0,SEEK_SET);
@@ -374,26 +479,105 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *rp = json_get(r,"rope_parameters");
     load_rope(&c->rope[LG_FULL],  rp ? json_get(rp,"full_attention")    : NULL, c->head_dim, 500000.0, 0.5);
     load_rope(&c->rope[LG_SLIDE], rp ? json_get(rp,"sliding_attention") : NULL, c->head_dim,  10000.0, 1.0);
+    /* oQ map must be read before any weight load; it decides whether a tensor is
+     * looked up as a packed triple or a plain float array. */
+    if (oq) oq_map_load(oq, r);
     free(buf); free(arena);
+}
+
+/* Load one oQ tensor triple. `stem` is the HF-style stem WITHOUT ".weight".
+ * Returns 0 when the tensor is not oQ-packed (caller falls back to load_w).
+ * expert < 0 = whole tensor; expert >= 0 slices a routed expert out of the
+ * leading [E, N, ...] axis. */
+static int oq_load(Model *m, const char *stem, OQTensor *out, int expert) {
+    char nm[384];
+    snprintf(nm, sizeof(nm), "%s.weight", stem);
+    st_tensor *tw = st_find(&m->S, nm);
+    if (!tw || tw->dtype != 7) return 0;               /* not U32 -> not oQ */
+    snprintf(nm, sizeof(nm), "%s.scales", stem);
+    st_tensor *ts = st_find(&m->S, nm);
+    snprintf(nm, sizeof(nm), "%s.biases", stem);
+    st_tensor *tb = st_find(&m->S, nm);
+    if (!ts || !tb) {
+        fprintf(stderr, "oQ: %s has packed codes but no scales/biases\n", stem); exit(1); }
+
+    int bits, gs;
+    oq_lookup(&m->oq, stem, &bits, &gs);
+    /* Trust the FILE over the config for K: scales' last axis times gs is the
+     * real input dim, and it is what the packed width must agree with. A config
+     * whose group_size disagrees would otherwise mis-stride every row. */
+    int ngroups = (int)ts->shape[ts->rank-1];
+    int K = ngroups * gs;
+    int words = (int)tw->shape[tw->rank-1];
+    if ((int64_t)K * bits != (int64_t)words * 32) {
+        fprintf(stderr, "oQ: %s inconsistent: bits=%d gs=%d ngroups=%d -> K=%d, "
+                        "but %d packed words (expected %d).\n"
+                        "  The config's bits/group_size disagree with the tensor shapes.\n",
+                stem, bits, gs, ngroups, K, words, (int)((int64_t)K*bits/32));
+        exit(1);
+    }
+    if ((gs * bits) % 32) {
+        fprintf(stderr, "oQ: %s has group_size*bits = %d, not a whole number of 32-bit "
+                        "words; the unpacker assumes group alignment\n", stem, gs*bits);
+        exit(1);
+    }
+    if (gs > 512) { fprintf(stderr, "oQ: %s group_size %d exceeds the 512 unpack buffer\n", stem, gs); exit(1); }
+
+    int rows = (int)tw->shape[tw->rank-2];
+    memset(out, 0, sizeof(*out));
+    out->rows = rows; out->K = K; out->bits = bits; out->gs = gs;
+    out->words = words; out->ngroups = ngroups;
+
+    int64_t ncode = (int64_t)rows * words, nsb = (int64_t)rows * ngroups;
+    out->code  = malloc((size_t)ncode * 4);
+    out->scale = falloc(nsb);
+    out->bias  = falloc(nsb);
+    if (!out->code) { fprintf(stderr, "OOM oQ codes for %s\n", stem); exit(1); }
+
+    int64_t coff = expert >= 0 ? (int64_t)expert * ncode : 0;
+    int64_t soff = expert >= 0 ? (int64_t)expert * nsb  : 0;
+    snprintf(nm, sizeof(nm), "%s.weight", stem);
+    pread_all(tw->fd, out->code, ncode*4, tw->off + coff*4);
+    /* scales/biases are BF16 on disk; widen once here so the matmul inner loop
+     * never converts (they are read once per group, not once per weight) */
+    uint16_t *tmp = malloc((size_t)nsb * 2);
+    if (!tmp) { fprintf(stderr, "OOM oQ scale scratch\n"); exit(1); }
+    pread_all(ts->fd, tmp, nsb*2, ts->off + soff*2);
+    for (int64_t i = 0; i < nsb; i++) out->scale[i] = bf16_to_f32(tmp[i]);
+    pread_all(tb->fd, tmp, nsb*2, tb->off + soff*2);
+    for (int64_t i = 0; i < nsb; i++) out->bias[i] = bf16_to_f32(tmp[i]);
+    free(tmp);
+    return 1;
 }
 
 /* ---------- weight loading ---------- */
 static float *load_t(Model *m, const char *name) {
-    int64_t n = st_numel(&m->S, name);
+    char resolved[384];
+    snprintf(resolved, sizeof(resolved), "%s", name);
+    if (!st_find(&m->S, resolved)) {
+        char alt[384];
+        snprintf(alt, sizeof(alt), "language_model.%s", name);
+        if (st_find(&m->S, alt)) snprintf(resolved, sizeof(resolved), "%s", alt);
+    }
+    int64_t n = st_numel(&m->S, resolved);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
     float *p = falloc(n);
-    st_read_f32(&m->S, name, p, 0);
+    st_read_f32(&m->S, resolved, p, 0);
     return p;
 }
 
-static void pread_all(int fd, void *buf, int64_t nb, int64_t off) {
-    char *p = buf;
-    while (nb > 0) {
-        int64_t chunk = nb < (1<<30) ? nb : (1<<30);
-        ssize_t got = pread(fd, p, (size_t)chunk, off);
-        if (got <= 0) { perror("pread chunk"); exit(1); }
-        p += got; off += got; nb -= got;
-    }
+/* Resolve a logical tensor stem to whatever this checkpoint actually calls it.
+ * MLX prefixes everything with "language_model." and renames a few modules
+ * (docs/oq-format.md has the table). Returns a pointer into `buf`. */
+static const char *lg_name(Model *m, char *buf, size_t n, const char *stem, const char *suffix) {
+    snprintf(buf, n, "%s%s", stem, suffix);
+    if (st_find(&m->S, buf)) return buf;
+    char alt[384];
+    snprintf(alt, sizeof(alt), "language_model.%s%s", stem, suffix);
+    if (st_find(&m->S, alt)) { snprintf(buf, n, "%s", alt); return buf; }
+    /* also try the oQ triple's stem, whose ".weight" sibling may be U32 */
+    snprintf(buf, n, "%s%s", stem, suffix);
+    return buf;
 }
 
 /* bf16 tensors stay bf16 in RAM (Laguna S's dense set is ~10 GB at bf16 and
@@ -401,7 +585,31 @@ static void pread_all(int fd, void *buf, int64_t nb, int64_t off) {
  * tiny oracle fixtures ship so parity checks stay bit-exact. */
 static Wt load_w(Model *m, const char *name) {
     Wt w = {0};
-    st_tensor *t = st_find(&m->S, name);
+    /* strip a trailing ".weight" to get the oQ stem; oQ stores the triple
+     * <stem>.{weight,scales,biases} and `name` already carries ".weight". */
+    char stem[384];
+    snprintf(stem, sizeof(stem), "%s", name);
+    size_t sl = strlen(stem);
+    if (sl > 7 && !strcmp(stem + sl - 7, ".weight")) stem[sl-7] = 0;
+    if (m->oq.is_oq) {
+        char probe[384];
+        /* try both HF and MLX naming for the packed form */
+        const char *cands[2] = { stem, NULL };
+        char mlx[384];
+        snprintf(mlx, sizeof(mlx), "language_model.%s", stem);
+        cands[1] = mlx;
+        for (int i = 0; i < 2; i++) {
+            snprintf(probe, sizeof(probe), "%s.weight", cands[i]);
+            st_tensor *t = st_find(&m->S, probe);
+            if (t && t->dtype == 7 && oq_load(m, cands[i], &w.q, -1)) {
+                m->oq_tensors++;
+                return w;
+            }
+        }
+    }
+    char resolved[384];
+    lg_name(m, resolved, sizeof(resolved), stem, ".weight");
+    st_tensor *t = st_find(&m->S, resolved);
     if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
     if (t->dtype == 0) {
         w.h = malloc(t->nbytes);
@@ -409,7 +617,7 @@ static Wt load_w(Model *m, const char *name) {
         pread_all(t->fd, w.h, t->nbytes, t->off);
     } else {
         w.f = falloc(t->numel);
-        st_read_f32(&m->S, name, w.f, 0);
+        st_read_f32(&m->S, resolved, w.f, 0);
     }
     return w;
 }
@@ -441,7 +649,7 @@ static double mem_avail_bytes(void) {
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
-    load_cfg(&m->c, snap);
+    load_cfg(&m->c, snap, &m->oq);
     st_init(&m->S, snap);
     Cfg *c = &m->c;
     int D = c->hidden;
@@ -465,19 +673,33 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         if (!c->sparse[i]) {
             LDW(dg, "mlp.gate_proj.weight"); LDW(du, "mlp.up_proj.weight"); LDW(dd, "mlp.down_proj.weight");
         } else {
-            LD(router, "mlp.gate.weight");
+            /* MLX renames the router projection to mlp.gate.proj.weight; both
+             * forms stay BF16 and unquantized in an oQ checkpoint. */
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight",i);
+            if (!st_find(&m->S, nm)) {
+                char alt[384];
+                snprintf(alt,sizeof(alt),"language_model.model.layers.%d.mlp.gate.proj.weight",i);
+                if (st_find(&m->S, alt)) snprintf(nm,sizeof(nm),"%s",alt);
+                else snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.proj.weight",i);
+            }
+            l->router = load_t(m, nm);
             /* The bias hangs off the router module in transformers
              * (mlp.gate.e_score_correction_bias) but off the expert block in
              * the released checkpoints (mlp.experts.e_score_correction_bias).
              * Same tensor, two homes. */
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.e_score_correction_bias",i);
-            if (!st_has(&m->S, nm))
+            if (!st_find(&m->S, nm))
                 snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias",i);
             l->rbias = load_t(m, nm);
             /* Released checkpoints name it shared_expert (singular); the HF
              * module is shared_experts. Accept both instead of guessing. */
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.gate_proj.weight",i);
-            const char *sh = st_has(&m->S, nm) ? "shared_expert" : "shared_experts";
+            const char *sh = "shared_expert";
+            if (!st_find(&m->S, nm)) {
+                char alt[384];
+                snprintf(alt,sizeof(alt),"language_model.model.layers.%d.mlp.shared_expert.gate_proj.weight",i);
+                if (!st_find(&m->S, alt)) sh = "shared_experts";
+            }
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.%s.gate_proj.weight",i,sh); l->sh_g = load_w(m,nm);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.%s.up_proj.weight",  i,sh); l->sh_u = load_w(m,nm);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.%s.down_proj.weight",i,sh); l->sh_d = load_w(m,nm);
@@ -489,6 +711,12 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     int nsp = 0; for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
     /* expert layout probe: look for the fused tensor on the first sparse layer */
     for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) {
+        /* MLX packs routed experts as switch_mlp with a leading [E, ...] axis;
+         * probe that first since an oQ checkpoint has no per-expert tensors. */
+        snprintf(nm,sizeof(nm),"language_model.model.layers.%d.mlp.switch_mlp.gate_proj.weight",i);
+        if (st_find(&m->S, nm)) { m->fused_experts = 3; break; }
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.switch_mlp.gate_proj.weight",i);
+        if (st_find(&m->S, nm)) { m->fused_experts = 3; break; }
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
         if (st_has(&m->S, nm)) m->fused_experts = 1;
         else {
@@ -498,7 +726,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         break;
     }
     int64_t I = c->moe_inter;
-    int64_t slotb = bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
+    /* Bytes per cached expert. oQ keeps codes packed, so a slot costs
+     * bits/8 per weight plus the f32 group scale+bias pair -- for 2-bit gs128
+     * that is ~13x smaller than the f32 slot, which is what lets a useful cache
+     * fit at all on Laguna-S. */
+    int64_t slotb;
+    if (m->fused_experts == 3) {
+        int eb = m->oq.def_bits ? m->oq.def_bits : 4;
+        int eg = m->oq.def_gs ? m->oq.def_gs : 64;
+        slotb = 3*I*D*eb/8 + 3*(I*D/eg)*8;
+    } else {
+        slotb = bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
+    }
     if (cap <= 0) {
         double avail = mem_avail_bytes();
         cap = avail > 0 ? (int)((avail*0.80 - 4e9) / ((double)slotb * (nsp ? nsp : 1))) : 16;
@@ -533,7 +772,9 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
     Slot *s;
     if (lc->n < lc->cap) {
         s = &lc->slots[lc->n++];
-        if (m->quant_bits) {
+        if (m->fused_experts == 3) {
+            /* oQ: nothing to preallocate, oq_load sizes the buffers itself */
+        } else if (m->quant_bits) {
             s->qg = malloc((size_t)I*D); s->qu = malloc((size_t)I*D); s->qd = malloc((size_t)D*I);
             if (!s->qg || !s->qu || !s->qd) { fprintf(stderr,"OOM expert slot\n"); exit(1); }
             s->sg = falloc(I); s->su = falloc(I); s->sd = falloc(D);
@@ -554,6 +795,25 @@ static void slot_fill(Model *m, int layer, Slot *s) {
     Cfg *c = &m->c;
     int64_t D = c->hidden, I = c->moe_inter;
     char nm[352];
+    if (m->fused_experts == 3) {
+        /* oQ switch_mlp: slice this expert out of the leading [E, ...] axis and
+         * keep the codes PACKED. Reusing the slot means freeing the previous
+         * expert's buffers first (oq_load allocates fresh ones). */
+        oq_free(&s->og); oq_free(&s->ou); oq_free(&s->od);
+        char stem[352];
+        const char *pfx = "";
+        char probe[384];
+        snprintf(probe,sizeof(probe),"model.layers.%d.mlp.switch_mlp.gate_proj.weight",layer);
+        if (!st_find(&m->S, probe)) pfx = "language_model.";
+        snprintf(stem,sizeof(stem),"%smodel.layers.%d.mlp.switch_mlp.gate_proj",pfx,layer);
+        if (!oq_load(m, stem, &s->og, s->eid)) { fprintf(stderr,"oQ: %s missing\n",stem); exit(1); }
+        snprintf(stem,sizeof(stem),"%smodel.layers.%d.mlp.switch_mlp.up_proj",pfx,layer);
+        if (!oq_load(m, stem, &s->ou, s->eid)) { fprintf(stderr,"oQ: %s missing\n",stem); exit(1); }
+        snprintf(stem,sizeof(stem),"%smodel.layers.%d.mlp.switch_mlp.down_proj",pfx,layer);
+        if (!oq_load(m, stem, &s->od, s->eid)) { fprintf(stderr,"oQ: %s missing\n",stem); exit(1); }
+        s->filled = 1;
+        return;
+    }
     float *tmp = falloc(2*I*D > D*I ? 2*I*D : D*I);
     float *gp, *up, *dp;                       /* f32 views of this expert */
     if (m->fused_experts) {
@@ -772,7 +1032,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             Slot *e = use[t - base];
             const float *xs = x + (int64_t)s*D;
             float *os = out + (int64_t)s*D;
-            if (m->quant_bits) {
+            if (m->fused_experts == 3) {
+                oq_matvec(g, xs, &e->og);
+                oq_matvec(u, xs, &e->ou);
+                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                oq_matvec(hh, g, &e->od);
+            } else if (m->quant_bits) {
                 matmul_q(g, xs, e->qg, e->sg, D, I);
                 matmul_q(u, xs, e->qu, e->su, D, I);
                 for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
@@ -1134,6 +1399,10 @@ static void print_cfg(Model *m) {
                t == LG_FULL ? "full   " : "sliding", r->yarn ? "yarn   " : "default",
                r->theta, r->rot_dim, r->factor, r->attn_factor, r->beta_fast, r->beta_slow, r->orig_max);
     }
+    if (m->oq.is_oq)
+        printf("     oQ: default %d-bit gs%d, %d per-tensor overrides%s\n",
+               m->oq.def_bits, m->oq.def_gs, m->oq.n,
+               m->fused_experts == 3 ? ", experts packed (switch_mlp)" : "");
 }
 
 int main(int argc, char **argv) {
@@ -1169,7 +1438,15 @@ int main(int argc, char **argv) {
         prompt = chat_buf;
     }
     if (cap < 0) cap = prompt ? 0 : 16;
-    if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
+    if (bits && bits != 8) {
+        fprintf(stderr,
+            "BITS must be 0 (f32 experts) or 8 (runtime int8).\n"
+            "  Sub-byte values are rejected on purpose: the runtime quantizer stores one\n"
+            "  code per byte, so BITS=%d would use the SAME memory as BITS=8 and be less\n"
+            "  accurate. For real sub-byte weights use an oQ checkpoint (docs/oq-format.md),\n"
+            "  which is bit-packed and picks a width per tensor.\n", bits);
+        return 1;
+    }
 
     /* SERVE=1: the openai_server.py gateway drives the engine over stdin/stdout
      * (READY handshake, SUBMIT/CANCEL, DATA/DONE frames) — the same protocol
@@ -1187,7 +1464,7 @@ int main(int argc, char **argv) {
      * whether a config drifted from what this engine expects. */
     if (cfg_only) {
         Model m; memset(&m, 0, sizeof(m));
-        load_cfg(&m.c, snap);
+        load_cfg(&m.c, snap, &m.oq);
         printf("== " LAGUNA_NAME " C engine, config only ==\n");
         print_cfg(&m);
         return 0;

@@ -85,6 +85,10 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "F32"))  return 2;
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
+    /* LAGUNA-FORK: U32 is the packed-code container for oMLX oQ affine quants
+     * (see docs/oq-format.md). Indexed and read through the RAW byte path like
+     * the fp8 types below; the float readers refuse it by name. */
+    if (!strcmp(s, "U32") || !strcmp(s, "I32")) return 7;
     /* --- tipi dei checkpoint nativi fp8 (DeepSeek-V4, GLM-5.2-FP8 non ripacchettati) ---
      * PRIMA di questi, st_init faceva exit(1) su un checkpoint DeepSeek-V4 al primo
      * tensore I64, senza arrivare ai pesi. Sono INDICIZZATI qui e letti dal percorso
@@ -106,6 +110,7 @@ static inline int st_dtype_esz(int dtype) {
         case 2: return 4;                 /* F32 */
         case 3: case 4: case 5: return 1; /* U8/I8, F8_E4M3, F8_E8M0 */
         case 6: return 8;                 /* I64/U64 */
+        case 7: return 4;                 /* U32/I32 (oQ packed codes) */
         default: return 2;                /* BF16, F16 */
     }
 }
@@ -115,7 +120,7 @@ static inline const char *st_dtype_name(int dtype) {
     switch (dtype) {
         case 0: return "BF16"; case 1: return "F16"; case 2: return "F32";
         case 3: return "U8/I8"; case 4: return "F8_E4M3"; case 5: return "F8_E8M0";
-        case 6: return "I64"; default: return "?";
+        case 6: return "I64"; case 7: return "U32/I32"; default: return "?";
     }
 }
 
