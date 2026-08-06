@@ -1109,15 +1109,40 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     int64_t npair = (int64_t)S*K;
+
+    /* ROUND 8 (docs/oq-optimization-rounds.md): walk the pairs in EXPERT order.
+     *
+     * The pair list is naturally in token order, so a chunk of `cap` pairs holds
+     * up to `cap` DIFFERENT experts; the next chunk needs a different set, evicts
+     * them, and the one after reloads what the first already had. At 6K tokens
+     * with cap=48 that produced a 57% hit rate and made slot_fill (disk IO) a
+     * top phase, even though only 256 distinct experts exist in the whole layer.
+     *
+     * Sorting the visit order by expert id means each expert is loaded at most
+     * once per layer per call: all of its tokens are consumed while it is
+     * resident. Pure scheduling change -- the arithmetic per pair, and the
+     * `cap`-sized eviction safety property, are untouched. */
+    int64_t *visit = malloc((size_t)npair * sizeof(int64_t));
+    if (!visit) { fprintf(stderr, "OOM moe visit order\n"); exit(1); }
+    {   /* counting sort over expert id: O(npair + E), no comparator */
+        int *cnt = calloc((size_t)E + 1, sizeof(int));
+        if (!cnt) { fprintf(stderr, "OOM moe counting sort\n"); exit(1); }
+        for (int64_t t = 0; t < npair; t++) cnt[idx[t] + 1]++;
+        for (int e = 0; e < E; e++) cnt[e+1] += cnt[e];
+        for (int64_t t = 0; t < npair; t++) visit[cnt[idx[t]]++] = t;
+        free(cnt);
+    }
+
     for (int64_t base = 0; base < npair; base += cap) {
         int64_t end = base + cap < npair ? base + cap : npair;
         int nfill = 0;
-        for (int64_t t = base; t < end; t++) {
+        for (int64_t vi = base; vi < end; vi++) {
+            int64_t t = visit[vi];
             int eid = idx[t];
             Slot *e = slot_find(m, layer, eid);
             if (e) m->hits++;
             else { m->miss++; e = slot_acquire(m, layer, eid); fill[nfill++] = e; }
-            use[t - base] = e;
+            use[vi - base] = e;
         }
         if (nfill) {
             double tf = now_s();
@@ -1125,10 +1150,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int j = 0; j < nfill; j++) slot_fill(m, layer, fill[j]);
             m->t_fill += now_s() - tf;
         }
-        for (int64_t t = base; t < end; t++) {
-            if (use[t - base]->eid != idx[t]) {
+        for (int64_t vi = base; vi < end; vi++) {
+            if (use[vi - base]->eid != idx[visit[vi]]) {
                 fprintf(stderr, "layer %d: cache served expert %d for requested expert %d\n",
-                        layer, use[t - base]->eid, (int)idx[t]);
+                        layer, use[vi - base]->eid, (int)idx[visit[vi]]);
                 exit(1);
             }
         }
@@ -1195,7 +1220,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                     ub = falloc(rcap*I); hb = falloc(rcap*D);
                 }
                 for (int r = 0; r < nr; r++) {
-                    int64_t t = base + ord[g0 + r];
+                    int64_t t = visit[base + ord[g0 + r]];
                     memcpy(xb + (int64_t)r*D, x + (t / K)*D, (size_t)D*sizeof(float));
                 }
                 /* down_proj also goes through the batched kernel: writing into a
@@ -1229,7 +1254,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         /* serial weighted scatter: cheap next to the matmuls and collision-free */
         for (int i = 0; i < npair_c; i++) {
-            int64_t t = base + i;
+            int64_t t = visit[base + i];
             int s = (int)(t / K), kk = (int)(t % K);
             float sc = wgt[(int64_t)s*K + kk];
             float *os = out + (int64_t)s*D, *hr = res + (int64_t)i*D;
@@ -1252,6 +1277,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     free(sg); free(su); free(sd);
     m->t_shared += now_s() - ts;
 
+    free(visit);
     free(logits); free(idx); free(wgt); free(choice); free(use); free(fill);
 }
 
