@@ -64,6 +64,15 @@
 #define LG_FULL 0                 /* layer_types[i] == "full_attention"    */
 #define LG_SLIDE 1                /* layer_types[i] == "sliding_attention" */
 
+/* Routed-expert tensor layout, probed at load — all four exist in the wild and
+ * none is guessed. */
+enum {
+    EXP_PER   = 0,   /* mlp.experts.<e>.{gate,up,down}_proj.weight (released HF) */
+    EXP_FUSED = 1,   /* mlp.experts.{gate_up_proj,down_proj}, no .weight suffix  */
+    EXP_FUSEDW= 2,   /* same, with .weight (what save_pretrained writes)         */
+    EXP_OQ    = 3,   /* mlp.switch_mlp.*, oQ-packed [E, ...] (MLX)               */
+};
+
 /* ---------- config ---------- */
 typedef struct {
     double theta, factor, attn_factor, beta_fast, beta_slow;
@@ -83,12 +92,14 @@ typedef struct {
 } Cfg;
 
 /* ---------- weights ---------- */
-/* ---------- weights ----------
- * A resident weight is f32, raw bf16, or oQ-packed. The oQ case keeps the codes
- * packed and dequantizes inside the matmul (c/oq.h), which is the only shape
- * that actually saves memory -- dequantizing on load would spend the savings
- * immediately. */
-typedef struct { float *f; uint16_t *h; OQTensor q; } Wt;
+/* f32, raw bf16, or oQ-packed (qbits>0). Same shape as inkling.c's Wt: the
+ * quantized fields live inline rather than in a nested struct. */
+typedef struct { float *f; uint16_t *h;
+                 uint32_t *q32;      /* oQ codes, [rows * I*qbits/32]        */
+                 float *qs, *qb;     /* per-group scale and bias, [rows*ng]  */
+                 int gs, qbits;      /* 0 = not quantized                    */
+                 int rows, in;       /* O and I, for the kernel call         */
+} Wt;
 
 typedef struct {
     float *in_ln, *post_ln;
@@ -99,15 +110,14 @@ typedef struct {
     Wt sh_g, sh_u, sh_d;                   /* shared expert               */
 } Layer;
 
-/* ---------- oQ per-tensor quantization map (populated from config.json) ----
- * Declared before Model because Model holds one. The loader that fills it lives
- * further down, next to the other weight-loading code. */
-typedef struct { char *name; int bits, gs; } OQEntry;
+/* config.json "quantization": scalar bits/group_size are the default, object
+ * values override per tensor stem. Declared here because Model holds one. */
+typedef struct { char *name; int bits, gs; } OQOverride;
 
 typedef struct {
-    int      is_oq;                /* checkpoint carries a "quantization" block */
-    int      def_bits, def_gs;
-    OQEntry *e; int n, cap;
+    int on;                        /* checkpoint is oQ-quantized              */
+    int bits, gs;                  /* defaults for anything unlisted          */
+    OQOverride *ov; int n, cap;
 } OQMap;
 
 /* ---------- routed-expert LRU cache ---------- */
@@ -115,7 +125,7 @@ typedef struct {
     int eid; uint64_t used; int filled;
     float *fg, *fu, *fd;                   /* bits == 0: f32 (oracle)     */
     int8_t *qg, *qu, *qd; float *sg, *su, *sd;   /* bits > 0: int8 + row scales */
-    OQTensor og, ou, od;                   /* oQ: packed codes, kept packed */
+    Wt wg, wu, wd;                         /* oQ: codes stay packed       */
 } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
@@ -123,14 +133,9 @@ typedef struct {
     Cfg c;
     shards S;
     int quant_bits;
-    /* Expert-tensor layout, detected at load: 0 = per-expert tensors
-     * (mlp.experts.<e>.{gate,up,down}_proj.weight — what the released
-     * checkpoints ship), 1 = fused (mlp.experts.{gate_up_proj,down_proj},
-     * [E,2I,D] / [E,D,I] — what transformers holds in memory, so what a
-     * save_pretrained fixture writes). Both are read; neither is guessed. */
-    int fused_experts;
-    OQMap oq;                      /* oQ per-tensor bits/group_size map */
-    int   oq_tensors;              /* how many weights were read oQ-packed */
+    int experts;                   /* EXP_* : routed-expert tensor layout    */
+    OQMap oq;                      /* per-tensor bits/group_size from config */
+    int   oq_tensors;              /* weights read oQ-packed                 */
     Wt embed, lm_head;
     float *final_norm;
     Layer *L;
@@ -204,12 +209,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 }
 
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
-    if (oq_valid(&W.q)) {
-        /* S==1 is the decode path and by far the hottest; it skips the
-         * per-group activation-sum scratch that the batched kernel needs. */
-        if (S == 1) oq_matvec(y, x, &W.q);
-        else        oq_matmul(y, x, &W.q, S);
-    }
+    if (W.qbits) matmul_oq(y, x, W.q32, W.qs, W.qb, S, I, O, W.qbits, W.gs);
     else if (W.f) matmul(y, x, W.f, S, I, O);
     else          matmul_h(y, x, W.h, S, I, O);
 }
@@ -368,20 +368,15 @@ static void load_rope(RopeCfg *r, jval *o, int head_dim, double dflt_theta, doub
     else                           r->attn_factor = 1.0;
 }
 
-/* ---------- oQ: per-tensor quantization map from config.json ----------
- * The map lives under "quantization": scalar bits/group_size/mode are the
- * default, and any key whose value is an object overrides them for that tensor
- * stem (see docs/oq-format.md). Names in the map are MLX's, i.e. prefixed
- * "language_model.", so lookups go through oq_lookup() which tries both.
- * (OQEntry / OQMap are declared above, next to Model.) */
+/* ---- oQ quantization map (config.json) ------------------------------------ */
 static void oq_map_add(OQMap *m, const char *name, int bits, int gs) {
     if (m->n == m->cap) {
         m->cap = m->cap ? m->cap*2 : 256;
-        m->e = realloc(m->e, (size_t)m->cap * sizeof(OQEntry));
-        if (!m->e) { fprintf(stderr, "OOM oq map\n"); exit(1); }
+        m->ov = realloc(m->ov, (size_t)m->cap * sizeof(OQOverride));
+        if (!m->ov) { fprintf(stderr, "OOM oq map\n"); exit(1); }
     }
-    m->e[m->n].name = strdup(name);
-    m->e[m->n].bits = bits; m->e[m->n].gs = gs; m->n++;
+    m->ov[m->n].name = strdup(name);
+    m->ov[m->n].bits = bits; m->ov[m->n].gs = gs; m->n++;
 }
 
 static void oq_map_load(OQMap *m, jval *root) {
@@ -389,39 +384,35 @@ static void oq_map_load(OQMap *m, jval *root) {
     jval *q = json_get(root, "quantization");
     if (!q) q = json_get(root, "quantization_config");
     if (!q || q->t != J_OBJ) return;
-    m->is_oq = 1;
-    m->def_bits = (int)jnum(q, "bits", 4);
-    m->def_gs   = (int)jnum(q, "group_size", 64);
+    m->on   = 1;
+    m->bits = (int)jnum(q, "bits", 4);
+    m->gs   = (int)jnum(q, "group_size", 64);
     for (int i = 0; i < q->len; i++) {
         jval *v = q->kids[i];
         if (!v || v->t != J_OBJ) continue;          /* scalars = the defaults */
-        const char *mode = NULL;
         jval *md = json_get(v, "mode");
-        if (md && md->t == J_STR) mode = md->str;
+        const char *mode = (md && md->t == J_STR) ? md->str : NULL;
+        /* w = c*s + b is affine-only; a future mode would need its own kernel */
         if (mode && strcmp(mode, "affine")) {
-            fprintf(stderr, "oQ: tensor '%s' uses mode '%s'; only 'affine' is implemented\n",
+            fprintf(stderr, "oQ: '%s' has mode '%s', only 'affine' is implemented\n",
                     q->keys[i], mode);
             exit(1);
         }
-        oq_map_add(m, q->keys[i], (int)jnum(v, "bits", m->def_bits),
-                                 (int)jnum(v, "group_size", m->def_gs));
+        oq_map_add(m, q->keys[i], (int)jnum(v, "bits", m->bits),
+                                 (int)jnum(v, "group_size", m->gs));
     }
 }
 
-/* Resolve (bits, gs) for a tensor stem. `stem` is in HF naming; the map may be
- * in MLX naming, so try the prefixed form too. Unlisted tensors get the global
- * default -- that is how the routed experts of an oQ<N>e checkpoint are
- * described, and they are the bulk of the weights. */
+/* MLX prefixes stems with "language_model."; try both spellings. Unlisted =
+ * defaults, which is how routed experts are described in every oQ<N>e. */
 static void oq_lookup(const OQMap *m, const char *stem, int *bits, int *gs) {
-    *bits = m->def_bits; *gs = m->def_gs;
-    if (!m->n) return;
+    *bits = m->bits; *gs = m->gs;
     char alt[352];
     snprintf(alt, sizeof(alt), "language_model.%s", stem);
-    for (int i = 0; i < m->n; i++) {
-        if (!strcmp(m->e[i].name, stem) || !strcmp(m->e[i].name, alt)) {
-            *bits = m->e[i].bits; *gs = m->e[i].gs; return;
+    for (int i = 0; i < m->n; i++)
+        if (!strcmp(m->ov[i].name, stem) || !strcmp(m->ov[i].name, alt)) {
+            *bits = m->ov[i].bits; *gs = m->ov[i].gs; return;
         }
-    }
 }
 
 static void load_cfg(Cfg *c, const char *snap, OQMap *oq) {
@@ -485,11 +476,10 @@ static void load_cfg(Cfg *c, const char *snap, OQMap *oq) {
     free(buf); free(arena);
 }
 
-/* Load one oQ tensor triple. `stem` is the HF-style stem WITHOUT ".weight".
- * Returns 0 when the tensor is not oQ-packed (caller falls back to load_w).
- * expert < 0 = whole tensor; expert >= 0 slices a routed expert out of the
- * leading [E, N, ...] axis. */
-static int oq_load(Model *m, const char *stem, OQTensor *out, int expert) {
+/* Read the oQ triple at `stem` into `w`. Returns 0 if not oQ-packed, so callers
+ * fall through to the plain float path. expert>=0 slices one routed expert out
+ * of the leading [E, ...] axis. */
+static int oq_load(Model *m, const char *stem, Wt *w, int expert) {
     char nm[384];
     snprintf(nm, sizeof(nm), "%s.weight", stem);
     st_tensor *tw = st_find(&m->S, nm);
@@ -498,56 +488,44 @@ static int oq_load(Model *m, const char *stem, OQTensor *out, int expert) {
     st_tensor *ts = st_find(&m->S, nm);
     snprintf(nm, sizeof(nm), "%s.biases", stem);
     st_tensor *tb = st_find(&m->S, nm);
-    if (!ts || !tb) {
-        fprintf(stderr, "oQ: %s has packed codes but no scales/biases\n", stem); exit(1); }
+    if (!ts || !tb) { fprintf(stderr, "oQ: %s: codes without scales/biases\n", stem); exit(1); }
 
     int bits, gs;
     oq_lookup(&m->oq, stem, &bits, &gs);
-    /* Trust the FILE over the config for K: scales' last axis times gs is the
-     * real input dim, and it is what the packed width must agree with. A config
-     * whose group_size disagrees would otherwise mis-stride every row. */
-    int ngroups = (int)ts->shape[ts->rank-1];
-    int K = ngroups * gs;
-    int words = (int)tw->shape[tw->rank-1];
-    if ((int64_t)K * bits != (int64_t)words * 32) {
-        fprintf(stderr, "oQ: %s inconsistent: bits=%d gs=%d ngroups=%d -> K=%d, "
-                        "but %d packed words (expected %d).\n"
-                        "  The config's bits/group_size disagree with the tensor shapes.\n",
-                stem, bits, gs, ngroups, K, words, (int)((int64_t)K*bits/32));
-        exit(1);
-    }
-    if ((gs * bits) % 32) {
-        fprintf(stderr, "oQ: %s has group_size*bits = %d, not a whole number of 32-bit "
-                        "words; the unpacker assumes group alignment\n", stem, gs*bits);
-        exit(1);
-    }
-    if (gs > 512) { fprintf(stderr, "oQ: %s group_size %d exceeds the 512 unpack buffer\n", stem, gs); exit(1); }
+    /* I comes from the scales shape, not the config: those are two independent
+     * fields and a disagreeing group_size would mis-stride every row. */
+    int ng = (int)ts->shape[ts->rank-1], I = ng * gs;
+    int words = (int)tw->shape[tw->rank-1], rows = (int)tw->shape[tw->rank-2];
+    if ((int64_t)I*bits != (int64_t)words*32) {
+        fprintf(stderr, "oQ: %s: bits=%d gs=%d ng=%d -> I=%d wants %lld words, file has %d\n",
+                stem, bits, gs, ng, I, (long long)oq_words(I,bits), words); exit(1); }
+    if ((gs*bits) % 32) {
+        fprintf(stderr, "oQ: %s: gs*bits=%d is not whole words; unpack assumes group alignment\n",
+                stem, gs*bits); exit(1); }
+    if (gs > OQ_MAX_GROUP) {
+        fprintf(stderr, "oQ: %s: gs=%d over OQ_MAX_GROUP\n", stem, gs); exit(1); }
 
-    int rows = (int)tw->shape[tw->rank-2];
-    memset(out, 0, sizeof(*out));
-    out->rows = rows; out->K = K; out->bits = bits; out->gs = gs;
-    out->words = words; out->ngroups = ngroups;
-
-    int64_t ncode = (int64_t)rows * words, nsb = (int64_t)rows * ngroups;
-    out->code  = malloc((size_t)ncode * 4);
-    out->scale = falloc(nsb);
-    out->bias  = falloc(nsb);
-    if (!out->code) { fprintf(stderr, "OOM oQ codes for %s\n", stem); exit(1); }
-
-    int64_t coff = expert >= 0 ? (int64_t)expert * ncode : 0;
-    int64_t soff = expert >= 0 ? (int64_t)expert * nsb  : 0;
-    snprintf(nm, sizeof(nm), "%s.weight", stem);
-    pread_all(tw->fd, out->code, ncode*4, tw->off + coff*4);
-    /* scales/biases are BF16 on disk; widen once here so the matmul inner loop
-     * never converts (they are read once per group, not once per weight) */
-    uint16_t *tmp = malloc((size_t)nsb * 2);
-    if (!tmp) { fprintf(stderr, "OOM oQ scale scratch\n"); exit(1); }
-    pread_all(ts->fd, tmp, nsb*2, ts->off + soff*2);
-    for (int64_t i = 0; i < nsb; i++) out->scale[i] = bf16_to_f32(tmp[i]);
-    pread_all(tb->fd, tmp, nsb*2, tb->off + soff*2);
-    for (int64_t i = 0; i < nsb; i++) out->bias[i] = bf16_to_f32(tmp[i]);
-    free(tmp);
+    w->qbits = bits; w->gs = gs; w->rows = rows; w->in = I;
+    int64_t nc = (int64_t)rows*words, nsb = (int64_t)rows*ng;
+    w->q32 = malloc((size_t)nc*4);
+    if (!w->q32) { fprintf(stderr, "OOM oQ codes %s\n", stem); exit(1); }
+    w->qs = falloc(nsb); w->qb = falloc(nsb);
+    pread_all(tw->fd, w->q32, nc*4, tw->off + (expert>=0 ? (int64_t)expert*nc : 0)*4);
+    /* widen scale/bias to f32 once: read per group, not per weight */
+    int64_t soff = (expert>=0 ? (int64_t)expert*nsb : 0)*2;
+    uint16_t *t16 = malloc((size_t)nsb*2);
+    if (!t16) { fprintf(stderr, "OOM oQ scales %s\n", stem); exit(1); }
+    pread_all(ts->fd, t16, nsb*2, ts->off + soff);
+    for (int64_t i = 0; i < nsb; i++) w->qs[i] = bf16_to_f32(t16[i]);
+    pread_all(tb->fd, t16, nsb*2, tb->off + soff);
+    for (int64_t i = 0; i < nsb; i++) w->qb[i] = bf16_to_f32(t16[i]);
+    free(t16);
     return 1;
+}
+
+static void wt_free_oq(Wt *w) {
+    free(w->q32); free(w->qs); free(w->qb);
+    w->q32 = NULL; w->qs = w->qb = NULL; w->qbits = 0;
 }
 
 /* ---------- weight loading ---------- */
@@ -591,21 +569,12 @@ static Wt load_w(Model *m, const char *name) {
     snprintf(stem, sizeof(stem), "%s", name);
     size_t sl = strlen(stem);
     if (sl > 7 && !strcmp(stem + sl - 7, ".weight")) stem[sl-7] = 0;
-    if (m->oq.is_oq) {
-        char probe[384];
-        /* try both HF and MLX naming for the packed form */
-        const char *cands[2] = { stem, NULL };
+    if (m->oq.on) {
         char mlx[384];
         snprintf(mlx, sizeof(mlx), "language_model.%s", stem);
-        cands[1] = mlx;
-        for (int i = 0; i < 2; i++) {
-            snprintf(probe, sizeof(probe), "%s.weight", cands[i]);
-            st_tensor *t = st_find(&m->S, probe);
-            if (t && t->dtype == 7 && oq_load(m, cands[i], &w.q, -1)) {
-                m->oq_tensors++;
-                return w;
-            }
-        }
+        const char *cand[2] = { stem, mlx };
+        for (int i = 0; i < 2; i++)
+            if (oq_load(m, cand[i], &w, -1)) { m->oq_tensors++; return w; }
     }
     char resolved[384];
     lg_name(m, resolved, sizeof(resolved), stem, ".weight");
@@ -714,30 +683,24 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         /* MLX packs routed experts as switch_mlp with a leading [E, ...] axis;
          * probe that first since an oQ checkpoint has no per-expert tensors. */
         snprintf(nm,sizeof(nm),"language_model.model.layers.%d.mlp.switch_mlp.gate_proj.weight",i);
-        if (st_find(&m->S, nm)) { m->fused_experts = 3; break; }
+        if (st_find(&m->S, nm)) { m->experts = EXP_OQ; break; }
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.switch_mlp.gate_proj.weight",i);
-        if (st_find(&m->S, nm)) { m->fused_experts = 3; break; }
+        if (st_find(&m->S, nm)) { m->experts = EXP_OQ; break; }
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
-        if (st_has(&m->S, nm)) m->fused_experts = 1;
+        if (st_has(&m->S, nm)) m->experts = EXP_FUSED;
         else {
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj.weight",i);
-            if (st_has(&m->S, nm)) m->fused_experts = 2;
+            if (st_has(&m->S, nm)) m->experts = EXP_FUSEDW;
         }
         break;
     }
     int64_t I = c->moe_inter;
-    /* Bytes per cached expert. oQ keeps codes packed, so a slot costs
-     * bits/8 per weight plus the f32 group scale+bias pair -- for 2-bit gs128
-     * that is ~13x smaller than the f32 slot, which is what lets a useful cache
-     * fit at all on Laguna-S. */
-    int64_t slotb;
-    if (m->fused_experts == 3) {
-        int eb = m->oq.def_bits ? m->oq.def_bits : 4;
-        int eg = m->oq.def_gs ? m->oq.def_gs : 64;
-        slotb = 3*I*D*eb/8 + 3*(I*D/eg)*8;
-    } else {
-        slotb = bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
-    }
+    /* bytes per cached expert: 3 matrices of I rows. oQ rows are packed, so an
+     * oQ slot is bits/8 per weight plus the group scale/bias pair -- ~13x under
+     * the f32 slot at 2-bit gs128, which is what lets a useful cache fit on S. */
+    int64_t slotb = (m->experts == EXP_OQ)
+        ? 3 * I * oq_rowbytes((int)D, m->oq.bits, m->oq.gs)
+        : (bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4);
     if (cap <= 0) {
         double avail = mem_avail_bytes();
         cap = avail > 0 ? (int)((avail*0.80 - 4e9) / ((double)slotb * (nsp ? nsp : 1))) : 16;
@@ -772,8 +735,8 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
     Slot *s;
     if (lc->n < lc->cap) {
         s = &lc->slots[lc->n++];
-        if (m->fused_experts == 3) {
-            /* oQ: nothing to preallocate, oq_load sizes the buffers itself */
+        if (m->experts == EXP_OQ) {
+            /* oq_load sizes its own buffers */
         } else if (m->quant_bits) {
             s->qg = malloc((size_t)I*D); s->qu = malloc((size_t)I*D); s->qd = malloc((size_t)D*I);
             if (!s->qg || !s->qu || !s->qd) { fprintf(stderr,"OOM expert slot\n"); exit(1); }
@@ -795,30 +758,27 @@ static void slot_fill(Model *m, int layer, Slot *s) {
     Cfg *c = &m->c;
     int64_t D = c->hidden, I = c->moe_inter;
     char nm[352];
-    if (m->fused_experts == 3) {
-        /* oQ switch_mlp: slice this expert out of the leading [E, ...] axis and
-         * keep the codes PACKED. Reusing the slot means freeing the previous
-         * expert's buffers first (oq_load allocates fresh ones). */
-        oq_free(&s->og); oq_free(&s->ou); oq_free(&s->od);
-        char stem[352];
+    if (m->experts == EXP_OQ) {
+        /* slice this expert out of switch_mlp's [E, ...] axis, codes stay packed.
+         * A reused slot still holds the previous expert's buffers. */
+        wt_free_oq(&s->wg); wt_free_oq(&s->wu); wt_free_oq(&s->wd);
+        char stem[352], probe[384];
         const char *pfx = "";
-        char probe[384];
         snprintf(probe,sizeof(probe),"model.layers.%d.mlp.switch_mlp.gate_proj.weight",layer);
         if (!st_find(&m->S, probe)) pfx = "language_model.";
-        snprintf(stem,sizeof(stem),"%smodel.layers.%d.mlp.switch_mlp.gate_proj",pfx,layer);
-        if (!oq_load(m, stem, &s->og, s->eid)) { fprintf(stderr,"oQ: %s missing\n",stem); exit(1); }
-        snprintf(stem,sizeof(stem),"%smodel.layers.%d.mlp.switch_mlp.up_proj",pfx,layer);
-        if (!oq_load(m, stem, &s->ou, s->eid)) { fprintf(stderr,"oQ: %s missing\n",stem); exit(1); }
-        snprintf(stem,sizeof(stem),"%smodel.layers.%d.mlp.switch_mlp.down_proj",pfx,layer);
-        if (!oq_load(m, stem, &s->od, s->eid)) { fprintf(stderr,"oQ: %s missing\n",stem); exit(1); }
+        #define OQEXP(field, which) \
+            snprintf(stem,sizeof(stem),"%smodel.layers.%d.mlp.switch_mlp." which "_proj",pfx,layer); \
+            if (!oq_load(m, stem, &s->field, s->eid)) { fprintf(stderr,"oQ: %s missing\n",stem); exit(1); }
+        OQEXP(wg, "gate"); OQEXP(wu, "up"); OQEXP(wd, "down");
+        #undef OQEXP
         s->filled = 1;
         return;
     }
     float *tmp = falloc(2*I*D > D*I ? 2*I*D : D*I);
     float *gp, *up, *dp;                       /* f32 views of this expert */
-    if (m->fused_experts) {
+    if (m->experts != EXP_PER) {
         /* fused [E,2I,D] gate_up (gate rows then up rows) and [E,D,I] down */
-        const char *sfx = m->fused_experts == 2 ? ".weight" : "";
+        const char *sfx = m->experts == EXP_FUSEDW ? ".weight" : "";
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj%s",layer,sfx);
         st_read_slice_f32(&m->S, nm, (int64_t)s->eid*2*I*D, 2*I*D, tmp, 1);
         gp = tmp; up = tmp + I*D;
@@ -842,7 +802,7 @@ static void slot_fill(Model *m, int layer, Slot *s) {
         memcpy(s->fu, up, (size_t)I*D*sizeof(float));
         memcpy(s->fd, dp, (size_t)D*I*sizeof(float));
     }
-    if (!m->fused_experts) free(up);
+    if (m->experts == EXP_PER) free(up);
     free(dp); free(tmp);
     s->filled = 1;
 }
@@ -1032,11 +992,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             Slot *e = use[t - base];
             const float *xs = x + (int64_t)s*D;
             float *os = out + (int64_t)s*D;
-            if (m->fused_experts == 3) {
-                oq_matvec(g, xs, &e->og);
-                oq_matvec(u, xs, &e->ou);
+            if (m->experts == EXP_OQ) {
+                matmul_w(g,  xs, e->wg, 1, D, I);
+                matmul_w(u,  xs, e->wu, 1, D, I);
                 for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                oq_matvec(hh, g, &e->od);
+                matmul_w(hh, g,  e->wd, 1, I, D);
             } else if (m->quant_bits) {
                 matmul_q(g, xs, e->qg, e->sg, D, I);
                 matmul_q(u, xs, e->qu, e->su, D, I);
@@ -1399,10 +1359,10 @@ static void print_cfg(Model *m) {
                t == LG_FULL ? "full   " : "sliding", r->yarn ? "yarn   " : "default",
                r->theta, r->rot_dim, r->factor, r->attn_factor, r->beta_fast, r->beta_slow, r->orig_max);
     }
-    if (m->oq.is_oq)
+    if (m->oq.on)
         printf("     oQ: default %d-bit gs%d, %d per-tensor overrides%s\n",
-               m->oq.def_bits, m->oq.def_gs, m->oq.n,
-               m->fused_experts == 3 ? ", experts packed (switch_mlp)" : "");
+               m->oq.bits, m->oq.gs, m->oq.n,
+               m->experts == EXP_OQ ? ", experts packed (switch_mlp)" : "");
 }
 
 int main(int argc, char **argv) {

@@ -5,6 +5,10 @@ Decoded from a real checkpoint, not from documentation. Source of truth:
 verified against that repo's `config.json` and safetensors headers; the
 verification is reproducible with `c/tools/probe_oq.py`.
 
+Implemented as **fmt=101**, a private ordinal: `colibri.c` reserves 0-8 for
+maintainer-assigned public formats (8 is already native FP8-e4m3) and keeps
+100+ as the experimental block for in-flight proposals.
+
 oQ is MLX's `affine` quantization with a **per-tensor** bits/group_size choice
 driven by an importance matrix. That is exactly the "lots of models at 3, 3.5, 4,
 5, 6 bits" surface — one loader covers all of them, because the bit width is data
@@ -179,12 +183,10 @@ Two things worth knowing from it:
 - **Routed experts stay streamable.** The `[E, N, K/gs]` layout keeps each
   expert's slice contiguous, so the existing LRU + per-expert read design holds.
 
-## Measured: oQ buys memory, NOT arithmetic speed
+## Measured: oQ buys memory, not arithmetic speed
 
-This is the finding that matters most, and it goes against the intuition that
-"bf16 is slow so a smaller quant will be faster". Measured with
-`c/oq.h`'s kernel on an M-series CPU, K=3072 N=12288 (a `down_proj` shape, 75 MB
-at bf16 so it does not fit in cache), single-token matvec, best of repeated runs:
+`c/oq.h` on an M-series CPU, K=3072 N=12288 (`down_proj` shape, 75 MB at bf16 so
+it misses cache), single-token matvec:
 
 | weights | ms/matvec | resident MB | vs bf16 size |
 |---|---|---|---|
@@ -195,49 +197,25 @@ at bf16 so it does not fit in cache), single-token matvec, best of repeated runs
 | oQ 3-bit | 4.00 | 18.9 | 4.00x smaller |
 | oQ 2-bit | 4.29 | 14.2 | 5.33x smaller |
 
-So per-matvec, oQ at 2-6 bits is **1.2-1.4x SLOWER** than bf16, not faster. Only
-8-bit edges ahead. The unpack is compute-bound: the arithmetic saved by touching
-fewer bytes is smaller than the arithmetic added to unpack them.
+oQ at 2-6 bits is 1.2-1.4x SLOWER per matvec than bf16; only 8-bit edges ahead.
+The unpack costs more arithmetic than the reduced byte traffic saves. So oQ is
+for fitting a model, not for tok/s -- except in the regime this engine runs in,
+where Laguna-S (235 GB bf16 on a 32 GB box) streams every expert from disk on a
+cache miss, and 5.33x less data per expert is a 5.33x smaller read on the
+critical path against a device orders of magnitude slower than the unpack.
 
-Two consequences that should shape expectations:
+3-bit and 6-bit hit the generic bit cursor (32 % bits != 0) and measured 2.4x
+slower than the power-of-two widths, 1.92 vs 0.80 ms at 3072x3072. Both are now
+specialized on 3 words holding exactly 32 resp. 16 values, which makes the shifts
+constant and leaves one straddling value per window: 3-bit 1.92 -> 1.08 ms,
+6-bit 1.93 -> 0.97 ms, still bit-exact. 3-bit is the dominant width in oQ3e.
 
-1. **For a model that already fits in RAM, oQ will not speed up decode.** Choose
-   it to fit a bigger model, or to leave RAM for something else, not for tok/s.
-2. **For a model that does NOT fit, oQ is the only thing that matters.** Laguna-S
-   is 235 GB at bf16 against a 32 GB box, so every routed expert is read from
-   disk on a cache miss. There, 5.33x less data per expert is a 5.33x smaller
-   disk read on the critical path, and disk is orders of magnitude slower than
-   the unpack. That is the regime this engine actually runs in.
+Separate bottleneck this exposed: bf16 moves half of f32's bytes for the same
+time (23.9 vs 47.5 GB/s effective). The per-element `bf16_to_f32` shift+memcpy
+eats the bandwidth advantage, so vectorizing it is an independent win for every
+bf16 checkpoint. Not done.
 
-### 3-bit and 6-bit needed specializing
-
-The generic bit-cursor loop (needed because 32 % bits != 0) measured **2.4x
-slower** than the power-of-two widths: 1.92 ms vs 0.80 ms on the smaller
-3072x3072 shape. Every value cost a division-shaped index computation plus a
-straddle branch.
-
-Both are now specialized on the observation that 3 words hold exactly 32 values
-at 3-bit and exactly 16 at 6-bit, so shifts become compile-time constants and
-only one value per window straddles. That took 3-bit from 1.92 to 1.08 ms
-(1.8x) and 6-bit from 1.93 to 0.97 ms (2.0x), verified still bit-exact against
-`mlx.core.dequantize`. Worth doing because 3-bit is the dominant width in an
-oQ3e checkpoint.
-
-### A separate bottleneck this exposed: the bf16 path itself
-
-bf16 moves half the bytes of f32 but takes the same time (3.10 vs 3.18 ms), i.e.
-23.9 GB/s vs 47.5 GB/s of effective bandwidth. The per-element
-`bf16_to_f32` (shift into a `uint32_t`, `memcpy` into a float) is eating the
-entire bandwidth advantage. Vectorizing that conversion is a real, independent
-speedup for every bf16 checkpoint, worth more than further oQ tuning for anyone
-running the original release. Not done yet.
-
-### Dequant-on-load was rejected
-
-Dequantizing to f32 at load would make the matmul as fast as the f32 row above
-and throw away 100% of the memory saving, which is the only reason to use oQ.
-The kernel therefore keeps codes packed and unpacks per group inside the dot
-product. The affine form factors out per group,
-`sum_i x_i*(c_i*s + b) = s*sum_i x_i*c_i + b*sum_i x_i`, so the scale/bias
-multiply happens once per group rather than once per weight, and the activation
-sum is hoisted out of the output-row loop.
+Dequant-on-load was rejected: it would match the f32 row above and forfeit the
+entire memory saving. The kernel unpacks per group inside the dot product, where
+the affine form factors as `s*sum(x_i*c_i) + b*sum(x_i)` so scale/bias apply once
+per group, not once per weight.
