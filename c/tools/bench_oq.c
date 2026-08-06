@@ -41,19 +41,18 @@ int main(void){
     int bl[]={2,3,4,6,8};
     for(int bi=0;bi<5;bi++){
         int bits=bl[bi], gs=64;
-        OQTensor t={0}; t.rows=N;t.K=K;t.bits=bits;t.gs=gs;
-        t.ngroups=K/gs; t.words=K*bits/32;
-        t.code=malloc((size_t)N*t.words*4);
-        t.scale=malloc((size_t)N*t.ngroups*4); t.bias=malloc((size_t)N*t.ngroups*4);
-        for(int64_t i=0;i<(int64_t)N*t.words;i++) t.code[i]=(uint32_t)(i*2654435761u);
-        for(int64_t i=0;i<(int64_t)N*t.ngroups;i++){t.scale[i]=0.01f;t.bias[i]=-0.1f;}
+        int ng=K/gs, words=K*bits/32;
+        uint32_t *code=malloc((size_t)N*words*4);
+        float *sc=malloc((size_t)N*ng*4), *bs=malloc((size_t)N*ng*4);
+        for(int64_t i=0;i<(int64_t)N*words;i++) code[i]=(uint32_t)(i*2654435761u);
+        for(int64_t i=0;i<(int64_t)N*ng;i++){sc[i]=0.01f;bs[i]=-0.1f;}
         t0=now();
-        for(int it=0;it<iters;it++) oq_matvec(y,x,&t);
+        for(int it=0;it<iters;it++) matmul_oq(y,x,code,sc,bs,1,K,N,bits,gs);
         dt=now()-t0;
-        double bytes=(double)oq_bytes(&t);
+        double bytes=(double)N*(oq_rowbytes(K,bits,gs));
         printf("oQ %d-bit %7.2f ms/matvec   %6.1f GB/s   weights %5.1f MB (%.2fx vs bf16)\n",
                bits, dt/iters*1e3, bytes*iters/dt/1e9, bytes/1e6, (double)K*N*2/bytes);
-        oq_free(&t);
+        free(code);free(sc);free(bs);
     }
     return 0;
 }

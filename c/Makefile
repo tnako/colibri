@@ -690,11 +690,24 @@ inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 
 # LAGUNA-FORK: Laguna-XS / Laguna-S. Both are the same engine at two scales,
 # so both rules compile laguna_common.h through a one-line size wrapper.
-laguna_xs$(EXE): laguna_xs.c laguna_common.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
-	$(CC) $(CFLAGS) laguna_xs.c -o laguna_xs$(EXE) $(LDFLAGS)
+#
+# LG_ARCH: on Apple silicon the shared CFLAGS deliberately pass no -mcpu (see the
+# Darwin block above), which leaves the NEON kernels in laguna_common.h/oq.h at
+# baseline armv8. -mcpu=native additionally enables FEAT_BF16 and I8MM on M2+.
+# Measured on an M5: the bf16 dot goes 19.7 -> 102.6 GB/s from the NEON rewrite
+# alone, and -mcpu=native is what lets clang pick the wider forms on top. Opt out
+# with `make laguna_xs LG_ARCH=` if cross-compiling or on an older toolchain.
+ifneq (,$(DARWIN))
+ifneq (,$(AARCH64))
+LG_ARCH ?= -mcpu=native
+endif
+endif
 
-laguna_s$(EXE): laguna_s.c laguna_common.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
-	$(CC) $(CFLAGS) laguna_s.c -o laguna_s$(EXE) $(LDFLAGS)
+laguna_xs$(EXE): laguna_xs.c laguna_common.h oq.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
+	$(CC) $(CFLAGS) $(LG_ARCH) laguna_xs.c -o laguna_xs$(EXE) $(LDFLAGS)
+
+laguna_s$(EXE): laguna_s.c laguna_common.h oq.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
+	$(CC) $(CFLAGS) $(LG_ARCH) laguna_s.c -o laguna_s$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
 # kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But

@@ -183,39 +183,102 @@ Two things worth knowing from it:
 - **Routed experts stay streamable.** The `[E, N, K/gs]` layout keeps each
   expert's slice contiguous, so the existing LRU + per-expert read design holds.
 
-## Measured: oQ buys memory, not arithmetic speed
+## Measured: oQ is smaller AND faster, once the kernels are vectorized
 
-`c/oq.h` on an M-series CPU, K=3072 N=12288 (`down_proj` shape, 75 MB at bf16 so
-it misses cache), single-token matvec:
+M5 (4P+6E, 32 GB), K=3072 N=12288 (`down_proj` shape, 75 MB at bf16 so it misses
+cache), single-token matvec. The "scalar" column is the first working version,
+"NEON" is what ships:
 
-| weights | ms/matvec | resident MB | vs bf16 size |
-|---|---|---|---|
-| f32 | 3.18 | 151 | 0.5x |
-| **bf16 (today's engine)** | **3.10** | **75** | **1.0x** |
-| oQ 8-bit | 2.85 | 42.5 | 1.78x smaller |
-| oQ 6-bit | 3.68 | 33.0 | 2.29x smaller |
-| oQ 3-bit | 4.00 | 18.9 | 4.00x smaller |
-| oQ 2-bit | 4.29 | 14.2 | 5.33x smaller |
+| weights | scalar ms | NEON ms | speedup | resident MB | vs bf16 size |
+|---|---|---|---|---|---|
+| f32 | 3.18 | 3.06 | 1.0x | 151 | 0.5x |
+| bf16 | 3.10 | 3.05 | 1.0x | 75 | 1.0x |
+| oQ 8-bit | 2.85 | **0.95** | 3.0x | 42.5 | 1.78x smaller |
+| oQ 6-bit | 3.68 | **1.48** | 2.5x | 33.0 | 2.29x smaller |
+| oQ 4-bit | 5.03 | **1.14** | 4.4x | 23.6 | 3.20x smaller |
+| oQ 3-bit | 4.00 | **1.36** | 2.9x | 18.9 | 4.00x smaller |
+| oQ 2-bit | 4.29 | **1.02** | 4.2x | 14.2 | 5.33x smaller |
 
-oQ at 2-6 bits is 1.2-1.4x SLOWER per matvec than bf16; only 8-bit edges ahead.
-The unpack costs more arithmetic than the reduced byte traffic saves. So oQ is
-for fitting a model, not for tok/s -- except in the regime this engine runs in,
-where Laguna-S (235 GB bf16 on a 32 GB box) streams every expert from disk on a
-cache miss, and 5.33x less data per expert is a 5.33x smaller read on the
-critical path against a device orders of magnitude slower than the unpack.
+**This reverses the earlier conclusion in this file.** Before vectorizing, oQ at
+2-6 bits was 1.2-1.4x slower than bf16 and the honest advice was "oQ buys memory,
+not speed". Vectorized, every width is 2.0-3.3x FASTER than bf16 as well as
+smaller, because the unpack was never memory-bound -- it was scalar-code-bound.
 
-3-bit and 6-bit hit the generic bit cursor (32 % bits != 0) and measured 2.4x
-slower than the power-of-two widths, 1.92 vs 0.80 ms at 3072x3072. Both are now
-specialized on 3 words holding exactly 32 resp. 16 values, which makes the shifts
-constant and leaves one straddling value per window: 3-bit 1.92 -> 1.08 ms,
-6-bit 1.93 -> 0.97 ms, still bit-exact. 3-bit is the dominant width in oQ3e.
+Two things did the work, both in the code that touches every weight:
 
-Separate bottleneck this exposed: bf16 moves half of f32's bytes for the same
-time (23.9 vs 47.5 GB/s effective). The per-element `bf16_to_f32` shift+memcpy
-eats the bandwidth advantage, so vectorizing it is an independent win for every
-bf16 checkpoint. Not done.
+1. `oq_group_dot` widens the uint8 codes with `vmovl` and accumulates with f32
+   FMA, computing `dot(x,c)` and `sum(x)` in one pass over the group.
+2. `-mcpu=native` for the Laguna targets (`LG_ARCH` in the Makefile). The shared
+   Darwin CFLAGS pass no `-mcpu` on purpose, which left everything at baseline
+   armv8.
 
-Dequant-on-load was rejected: it would match the f32 row above and forfeit the
-entire memory saving. The kernel unpacks per group inside the dot product, where
-the affine form factors as `s*sum(x_i*c_i) + b*sum(x_i)` so scale/bias apply once
-per group, not once per weight.
+### bf16 was the worse bottleneck: 5.2x
+
+`bf16 -> f32` is exactly a 16-bit left shift, so `vshll_n_u16(v, 16)` IS the
+conversion. The old per-element shift-into-`uint32_t`-then-`memcpy` measured
+**19.7 GB/s; the NEON form measures 102.6 GB/s, a 5.2x speedup** on the same
+data. That was pure conversion overhead, not memory.
+
+`FEAT_BF16`'s BFDOT is available on M5 and reached 132 GB/s, but it is **not
+used**: BFDOT needs both operands in bf16, so the f32 activations would be
+rounded first, and the result changed (1024.91 vs 1024.62 on the bench). The
+fixtures are token-exact against a transformers oracle; an f32-accurate
+accumulation is worth more than the last 30%.
+
+### 3-bit and 6-bit needed specializing first
+
+They hit the generic bit cursor (32 % bits != 0) and measured 2.4x slower than
+the power-of-two widths, 1.92 vs 0.80 ms at 3072x3072. Both are now specialized
+on 3 words holding exactly 32 resp. 16 values, which makes the shifts constant
+and leaves one straddling value per window: 3-bit 1.92 -> 1.08 ms, 6-bit
+1.93 -> 0.97 ms. 3-bit is the dominant width in oQ3e.
+
+### Still true regardless of speed
+
+For Laguna-S (235 GB bf16 against 32 GB) every routed expert is read from disk on
+a cache miss, so 5.33x less data per expert is a 5.33x smaller read on the
+critical path against a device orders of magnitude slower than any of this.
+Fitting remains the main reason to pick oQ; being faster is a bonus.
+
+Dequant-on-load stays rejected: it would forfeit the entire memory saving to land
+on the f32 row above, which is now the SLOWEST row in the table.
+
+Every number here is reproducible with `c/tools/bench_oq.c` and
+`c/tools/bench_bf16.c`.
+
+## Metal: measured, then deliberately not used for oQ decode
+
+Asked for, benchmarked, rejected on evidence. `c/backend_metal.mm` already has an
+`mm_gemv` shader handling fmt 1-8, so adding fmt=101 would be a shader plus
+dispatch plumbing. The reason not to, on this M5:
+
+| | measured |
+|---|---|
+| Metal round-trip (encode + commit + wait, trivial kernel) | **0.327 ms** |
+| CPU oQ 2-bit matvec, K=3072 N=12288 | **1.02 ms** |
+| matmuls per Laguna-S decode token (48 layers x ~7) | ~336 |
+| floor per token if each one round-trips | **~110 ms** |
+
+A GPU dispatch costs a third of what the whole CPU kernel now costs, so a
+per-matmul offload cannot win at decode (S=1) — and 336 sequential round-trips
+per token is 110 ms of pure latency before any arithmetic. This is exactly why
+`colibri.c` gates its own Metal GEMM at `S >= g_metal_gemm_min` (default 16,
+`COLI_METAL_GEMM_MIN`): the GPU is for batched prefill, not token-by-token decode.
+
+Where Metal would genuinely pay for this engine, in order:
+
+1. **Batched prefill** (S >= 16), following upstream's existing gate. One
+   dispatch amortizes over many rows.
+2. **A resident expert tier**, like `coli_metal_moe_gemv` does for other formats:
+   keep hot experts in GPU-visible memory and batch the routed GEMVs for all
+   selected experts into one dispatch, instead of one per expert per token.
+
+Both are real work and neither is done. The honest current state is that the
+NEON CPU path is fast enough that Metal has to clear a much higher bar than it
+did before this optimization pass — the 4.2x CPU speedup moved the goalposts.
+
+M5 hardware notes gathered while measuring (`sysctl hw.optional.arm.*`):
+`FEAT_BF16`, `FEAT_EBF16`, `FEAT_I8MM`, `FEAT_DotProd`, `FEAT_SME`/`SME2` all
+present, 4 performance + 6 efficiency cores, unified memory. BFDOT and I8MM are
+reachable but unused for the accuracy reason above; SME is untouched (it needs
+streaming-mode setup that only pays off on much larger tiles than a decode GEMV).

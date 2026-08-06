@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #define OQ_MAX_GROUP 512                 /* unpack scratch bound; gs is 64/128 */
 static inline int64_t oq_words(int I, int bits){ return (int64_t)I*bits/32; }
@@ -77,6 +80,32 @@ static inline void oq_unpack(const uint32_t *w, int bits, int gs, uint8_t *out){
     }
 }
 
+/* one group: dot(x, codes) and sum(x) in a single pass. The codes are uint8, so
+ * widening is two vmovl steps and the multiply is plain f32 FMA. */
+static inline void oq_group_dot(const uint8_t *c, const float *x, int gs,
+                                float *dot_out, float *sum_out) {
+#ifdef __ARM_NEON
+    float32x4_t d0=vdupq_n_f32(0), d1=vdupq_n_f32(0);
+    float32x4_t s0=vdupq_n_f32(0), s1=vdupq_n_f32(0);
+    int i = 0;
+    for (; i + 8 <= gs; i += 8) {
+        uint16x8_t c16 = vmovl_u8(vld1_u8(c + i));
+        float32x4_t cl = vcvtq_f32_u32(vmovl_u16(vget_low_u16(c16)));
+        float32x4_t ch = vcvtq_f32_u32(vmovl_u16(vget_high_u16(c16)));
+        float32x4_t x0 = vld1q_f32(x + i), x1 = vld1q_f32(x + i + 4);
+        d0 = vfmaq_f32(d0, x0, cl); d1 = vfmaq_f32(d1, x1, ch);
+        s0 = vaddq_f32(s0, x0);     s1 = vaddq_f32(s1, x1);
+    }
+    float dot = vaddvq_f32(vaddq_f32(d0, d1)), sum = vaddvq_f32(vaddq_f32(s0, s1));
+    for (; i < gs; i++) { dot += x[i]*(float)c[i]; sum += x[i]; }
+    *dot_out = dot; *sum_out = sum;
+#else
+    float dot = 0, sum = 0;
+    for (int i = 0; i < gs; i++) { dot += x[i]*(float)c[i]; sum += x[i]; }
+    *dot_out = dot; *sum_out = sum;
+#endif
+}
+
 /* y[S,O] = x[S,I] @ dequant(W)^T, W packed [O, I*bits/32].
  * Dequantizes inside the loop: materializing f32 would spend the whole point of
  * the format. Per group the affine form factors,
@@ -98,9 +127,8 @@ static void matmul_oq(float *y, const float *x, const uint32_t *q,
                 const float *xs=x+(int64_t)s*I; float a=0;
                 for(int g=0;g<ng;g++){
                     oq_unpack(w+(int64_t)g*wpg,bits,gs,c);
-                    const float *xp=xs+(int64_t)g*gs;
-                    float dot=0,xsum=0;
-                    for(int i=0;i<gs;i++){ dot+=xp[i]*(float)c[i]; xsum+=xp[i]; }
+                    float dot, xsum;
+                    oq_group_dot(c, xs+(int64_t)g*gs, gs, &dot, &xsum);
                     a+=scl[g]*dot+bi[g]*xsum;
                 }
                 y[(int64_t)s*O+o]=a;

@@ -52,6 +52,9 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #ifndef LAGUNA_NAME
 #define LAGUNA_NAME "Laguna"
@@ -188,23 +191,63 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
         const float *w = W + (int64_t)o * I;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
+#ifdef __ARM_NEON
+            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+            int i = 0;
+            for (; i + 8 <= I; i += 8) {
+                a0 = vfmaq_f32(a0, vld1q_f32(xs + i),     vld1q_f32(w + i));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs + i + 4), vld1q_f32(w + i + 4));
+            }
+            float acc = vaddvq_f32(vaddq_f32(a0, a1));
+            for (; i < I; i++) acc += xs[i] * w[i];
+#else
             float acc = 0.f;
             for (int i = 0; i < I; i++) acc += xs[i] * w[i];
+#endif
             y[(int64_t)s * O + o] = acc;
         }
     }
 }
 
+/* bf16 x f32 dot. bf16->f32 IS a 16-bit left shift, so vshll_n_u16(...,16) is
+ * the whole conversion -- no BF16 extension needed, works on any NEON. The
+ * per-element shift+memcpy this replaced measured 19.7 GB/s vs 102.6 GB/s here
+ * (5.2x) on an M5; the conversion, not memory, was the limit.
+ *
+ * Deliberately NOT BFDOT (FEAT_BF16): that needs BOTH operands bf16, so the f32
+ * activations would be rounded to bf16 first. Measured 132 GB/s but changed the
+ * result (1024.91 vs 1024.62 on the bench), and the tiny fixtures are
+ * token-exact against a transformers oracle -- an f32-accurate accumulation is
+ * worth more than the remaining 30%. */
+#ifdef __ARM_NEON
+static inline float dot_bf16_f32(const uint16_t *w, const float *x, int n) {
+    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint16x8_t v = vld1q_u16(w + i);
+        a0 = vfmaq_f32(a0, vld1q_f32(x + i),
+                       vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16)));
+        a1 = vfmaq_f32(a1, vld1q_f32(x + i + 4),
+                       vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(v), 16)));
+    }
+    float a = vaddvq_f32(vaddq_f32(a0, a1));
+    for (; i < n; i++) a += x[i] * bf16_to_f32(w[i]);
+    return a;
+}
+#else
+static inline float dot_bf16_f32(const uint16_t *w, const float *x, int n) {
+    float a = 0;
+    for (int i = 0; i < n; i++) a += x[i] * bf16_to_f32(w[i]);
+    return a;
+}
+#endif
+
 static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, int O) {
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const uint16_t *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * bf16_to_f32(w[i]);
-            y[(int64_t)s * O + o] = acc;
-        }
+        for (int s = 0; s < S; s++)
+            y[(int64_t)s * O + o] = dot_bf16_f32(w, x + (int64_t)s * I, I);
     }
 }
 
