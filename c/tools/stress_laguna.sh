@@ -64,12 +64,15 @@ echo "==> stress $TAG: $MODEL, ~$PTOK tokens ($WORDS words), $NGEN generated, ca
 
 # Run the engine in the background so `sample` can attach to a live pid, and let
 # the profiler cover the whole run rather than a fixed slice.
-SNAP="$MODEL" "$ENGINE" "$CAP" 0 --chat -n "$NGEN" -f "$D/prompt.txt" \
+# /usr/bin/time -l gives peak RSS + page-in/fault counters on macOS; the engine's
+# own RSS line only samples at the end, which misses the peak during prefill.
+/usr/bin/time -l env SNAP="$MODEL" "$ENGINE" "$CAP" 0 --chat -n "$NGEN" -f "$D/prompt.txt" \
      > "$D/engine.log" 2> "$D/engine.err" &
 PID=$!
 
-# 1 ms sampling interval for the whole run. sample exits when the target does.
-sample "$PID" 600 1 -file "$D/sample.txt" >/dev/null 2>&1 &
+# 1 ms sampling for up to an hour: a 16K-token prefill runs many minutes and the
+# old 600s cap silently ended the profile (and this script) mid-run.
+sample "$PID" "${SAMPLE_SECS:-3600}" 1 -file "$D/sample.txt" >/dev/null 2>&1 &
 SPID=$!
 
 wait "$PID" 2>/dev/null || { echo "!! engine exited nonzero"; tail -20 "$D/engine.err"; }
@@ -80,6 +83,28 @@ echo "--- engine ---"
 # The engine echoes the whole prompt; cut it to the counters we care about.
 grep -hoE "\[[0-9]+ prompt tokens\]|prefill [0-9.]+s.*|\[phases\].*|oQ: .*" \
   "$D/engine.log" "$D/engine.err" 2>/dev/null | sort -u || true
+
+echo
+echo "--- memory / IO ---"
+# /usr/bin/time -l writes to stderr alongside the engine's own output
+grep -E "maximum resident set size|page reclaims|page faults|voluntary context switches|involuntary context switches|real[ ]|user[ ]|sys[ ]" \
+  "$D/engine.err" 2>/dev/null | sed 's/^[[:space:]]*/  /' || true
+python3 - "$D/engine.err" <<'PY'
+import re,sys
+t=open(sys.argv[1],errors="ignore").read()
+def g(pat):
+    m=re.search(pat,t)
+    return int(m.group(1)) if m else None
+peak=g(r'(\d+)\s+maximum resident set size')
+if peak: print(f"  peak RSS: {peak/2**30:.2f} GiB")
+mf=g(r'(\d+)\s+page faults')          # major faults = real disk IO
+if mf is not None: print(f"  major page faults (disk-backed): {mf}")
+real=re.search(r'([\d.]+)\s+real\s+([\d.]+)\s+user\s+([\d.]+)\s+sys',t)
+if real:
+    r_,u,s=(float(x) for x in real.groups())
+    # user+sys across 10 cores vs wall: how much of wall was NOT cpu work
+    print(f"  wall {r_:.1f}s  user {u:.1f}s  sys {s:.1f}s  (cpu/wall = {(u+s)/r_:.1f}x, 10 cores available)")
+PY
 
 echo
 echo "--- self time by symbol (sampled) ---"

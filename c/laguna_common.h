@@ -939,43 +939,105 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * hazard and same resolution as upstream PR #830 for inkling.c. */
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*qdim);
+    /* ROUND 6+7 (docs/oq-optimization-rounds.md): tile the score loop over a
+     * block of QUERIES per KV head, with a CHUNKED online softmax.
+     *
+     * Round 6 - reuse. The old shape was one query-head x one query at a time,
+     * re-walking the whole K/V history for each. With group = H/KV = 6 query
+     * heads sharing a KV head, every K row was read 6 times per query and
+     * re-read for all S queries. Tiling loads each K/V row once per
+     * (KV head, query block) and reuses it across LG_QB queries.
+     *
+     * Round 7 - rescale frequency. A naive online softmax renormalizes whenever
+     * the running max grows, and each renormalize is O(hd) over the accumulator.
+     * Early in a row the max grows constantly, so round 6 paid that O(hd) on a
+     * large fraction of keys and only bought 1.10x. Processing keys in chunks of
+     * LG_KC and taking the chunk max first drops it to at most ONE rescale per
+     * chunk per query: the exp() count is unchanged, the rescales fall by ~LG_KC.
+     *
+     * The score row is never materialized for the whole context, so the
+     * per-thread scratch is O(LG_QB*LG_KC) instead of O(context) -- attention
+     * scratch stops growing with prompt length. */
+    #define LG_QB 8
+    #define LG_KC 64
     #pragma omp parallel
     {
-        float *sc = malloc((size_t)(pos0 + S + 1) * sizeof(float));
+        float mx[LG_QB], den[LG_QB];
+        float *accum = falloc((int64_t)LG_QB * hd);
+        float *sbuf  = falloc((int64_t)LG_QB * LG_KC);
         #pragma omp for collapse(2) schedule(static)
-        for (int h = 0; h < H; h++) {
-            for (int s = 0; s < S; s++) {
-                int qpos = pos0 + s, kh = h/group;
-                int t0 = 0;
-                if (c->slide[li]) { t0 = qpos - c->window + 1; if (t0 < 0) t0 = 0; }
-                const float *qv = q + (int64_t)s*qdim + h*hd;
+        for (int kh = 0; kh < KV; kh++) {
+            for (int sb = 0; sb < S; sb += LG_QB) {
+                int nb = S - sb < LG_QB ? S - sb : LG_QB;
                 const float *Kh = m->K[li] + (int64_t)kh*kvcap*hd;
                 const float *Vh = m->V[li] + (int64_t)kh*kvcap*hd;
                 #define LG_KROW(t) ((t) >= pos0 ? k  + (int64_t)((t)-pos0)*kvdim + kh*hd \
                                                 : Kh + (int64_t)(c->slide[li] ? (t) % kvcap : (t))*hd)
                 #define LG_VROW(t) ((t) >= pos0 ? vv + (int64_t)((t)-pos0)*kvdim + kh*hd \
                                                 : Vh + (int64_t)(c->slide[li] ? (t) % kvcap : (t))*hd)
-                for (int t = t0; t <= qpos; t++) {
-                    const float *kv = LG_KROW(t);
-                    sc[t - t0] = dot_f32(qv, kv, hd) * scale;
-                }
-                int n = qpos - t0 + 1;
-                softmax_row(sc, n);
-                float *cx = ctx + (int64_t)s*qdim + h*hd;
-                for (int d = 0; d < hd; d++) cx[d] = 0.f;
-                for (int t = t0; t <= qpos; t++) {
-                    const float *vrow = LG_VROW(t);
-                    axpy_f32(cx, sc[t - t0], vrow, hd);
+                for (int hq = kh*group; hq < (kh+1)*group; hq++) {
+                    int hi = pos0 + sb + nb - 1;
+                    int t0 = 0;
+                    if (c->slide[li]) { t0 = pos0 + sb - c->window + 1; if (t0 < 0) t0 = 0; }
+                    for (int b = 0; b < nb; b++) {
+                        mx[b] = -INFINITY; den[b] = 0.f;
+                        memset(accum + (int64_t)b*hd, 0, (size_t)hd*sizeof(float));
+                    }
+                    for (int tc = t0; tc <= hi; tc += LG_KC) {
+                        int tn = hi - tc + 1; if (tn > LG_KC) tn = LG_KC;
+                        /* score the chunk: each K row loaded once, used by all nb */
+                        for (int j = 0; j < tn; j++) {
+                            const float *kv = LG_KROW(tc + j);
+                            for (int b = 0; b < nb; b++) {
+                                int qpos = pos0 + sb + b;
+                                int t = tc + j;
+                                float v = -INFINITY;
+                                if (t <= qpos && !(c->slide[li] && t < qpos - c->window + 1))
+                                    v = dot_f32(q + (int64_t)(sb+b)*qdim + hq*hd, kv, hd) * scale;
+                                sbuf[(int64_t)b*LG_KC + j] = v;
+                            }
+                        }
+                        /* one rescale per query per chunk, then accumulate V */
+                        for (int b = 0; b < nb; b++) {
+                            float *row = sbuf + (int64_t)b*LG_KC;
+                            float cmax = -INFINITY;
+                            for (int j = 0; j < tn; j++) if (row[j] > cmax) cmax = row[j];
+                            if (cmax == -INFINITY) continue;      /* nothing in range */
+                            float nmax = mx[b] > cmax ? mx[b] : cmax;
+                            if (nmax != mx[b]) {
+                                float r = (mx[b] == -INFINITY) ? 0.f : expf(mx[b] - nmax);
+                                den[b] *= r;
+                                float *ac = accum + (int64_t)b*hd;
+                                if (r == 0.f) memset(ac, 0, (size_t)hd*sizeof(float));
+                                else for (int d = 0; d < hd; d++) ac[d] *= r;
+                                mx[b] = nmax;
+                            }
+                            float *ac = accum + (int64_t)b*hd;
+                            for (int j = 0; j < tn; j++) {
+                                if (row[j] == -INFINITY) continue;
+                                float w = expf(row[j] - mx[b]);
+                                den[b] += w;
+                                axpy_f32(ac, w, LG_VROW(tc + j), hd);
+                            }
+                        }
+                    }
+                    for (int b = 0; b < nb; b++) {
+                        float *cx = ctx + (int64_t)(sb+b)*qdim + hq*hd;
+                        float *ac = accum + (int64_t)b*hd;
+                        /* per-head output gate: softplus of g_proj, one per head */
+                        float gate = softplusf(gt[(int64_t)(sb+b)*H + hq]);
+                        float inv = den[b] > 0.f ? gate / den[b] : 0.f;
+                        for (int d = 0; d < hd; d++) cx[d] = ac[d] * inv;
+                    }
                 }
                 #undef LG_KROW
                 #undef LG_VROW
-                /* per-head output gate: softplus of g_proj, one scalar per head */
-                float gate = softplusf(gt[(int64_t)s*H + h]);
-                for (int d = 0; d < hd; d++) cx[d] *= gate;
             }
         }
-        free(sc);
+        free(accum); free(sbuf);
     }
+    #undef LG_QB
+    #undef LG_KC
     /* Append now that every query has been scored. Sliding layers skip the rows
      * this same batch would immediately overwrite: a skipped row is at position
      * < (pos0+S) - window, and no later query ever attends earlier than
