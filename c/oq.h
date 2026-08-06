@@ -28,6 +28,10 @@
 #endif
 
 #define OQ_MAX_GROUP 512                 /* unpack scratch bound; gs is 64/128 */
+/* Rows processed per unpack. The batch accumulator is stack-resident and the
+ * activations for these rows want to stay in L1 alongside the unpacked codes;
+ * 32 keeps both true while still amortizing the unpack ~32x. */
+#define OQ_MAX_BATCH 32
 static inline int64_t oq_words(int I, int bits){ return (int64_t)I*bits/32; }
 static inline int64_t oq_groups(int I, int gs){ return (int64_t)I/gs; }
 static inline int64_t oq_rowbytes(int I, int bits, int gs){
@@ -110,7 +114,13 @@ static inline void oq_group_dot(const uint8_t *c, const float *x, int gs,
  * Dequantizes inside the loop: materializing f32 would spend the whole point of
  * the format. Per group the affine form factors,
  *   sum x_i*(c_i*s + b) = s*sum(x_i*c_i) + b*sum(x_i)
- * so scale/bias apply once per group, not once per weight. */
+ * so scale/bias apply once per group, not once per weight.
+ *
+ * The group loop is OUTSIDE the batch loop on purpose: a row's codes are the
+ * same for every token, so unpacking once and reusing it across all S rows is
+ * the difference between O(S*ng) and O(ng) unpacks. With the batched MoE path
+ * feeding S=59 rows per expert, hoisting this took oq_unpack from 29% of total
+ * runtime to noise (docs/oq-format.md, round 4). */
 static void matmul_oq(float *y, const float *x, const uint32_t *q,
                       const float *scale, const float *bias,
                       int S, int I, int O, int bits, int gs){
@@ -119,19 +129,24 @@ static void matmul_oq(float *y, const float *x, const uint32_t *q,
     #pragma omp parallel
     {
         uint8_t c[OQ_MAX_GROUP];
+        float accs[OQ_MAX_BATCH];
         #pragma omp for schedule(static)
         for(int o=0;o<O;o++){
             const uint32_t *w=q+(int64_t)o*rw;
             const float *scl=scale+(int64_t)o*ng, *bi=bias+(int64_t)o*ng;
-            for(int s=0;s<S;s++){
-                const float *xs=x+(int64_t)s*I; float a=0;
+            for(int s0=0;s0<S;s0+=OQ_MAX_BATCH){
+                int nb = S-s0 < OQ_MAX_BATCH ? S-s0 : OQ_MAX_BATCH;
+                for(int s=0;s<nb;s++) accs[s]=0.f;
                 for(int g=0;g<ng;g++){
-                    oq_unpack(w+(int64_t)g*wpg,bits,gs,c);
-                    float dot, xsum;
-                    oq_group_dot(c, xs+(int64_t)g*gs, gs, &dot, &xsum);
-                    a+=scl[g]*dot+bi[g]*xsum;
+                    oq_unpack(w+(int64_t)g*wpg,bits,gs,c);     /* once per group */
+                    float sc=scl[g], bs=bi[g];
+                    for(int s=0;s<nb;s++){
+                        float dot, xsum;
+                        oq_group_dot(c, x+(int64_t)(s0+s)*I+(int64_t)g*gs, gs, &dot, &xsum);
+                        accs[s]+=sc*dot+bs*xsum;
+                    }
                 }
-                y[(int64_t)s*O+o]=a;
+                for(int s=0;s<nb;s++) y[(int64_t)(s0+s)*O+o]=accs[s];
             }
         }
     }

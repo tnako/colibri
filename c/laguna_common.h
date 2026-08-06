@@ -55,6 +55,11 @@
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
+#ifdef _OPENMP
+#include <omp.h>
+#else
+static inline int omp_in_parallel(void) { return 0; }
+#endif
 
 #ifndef LAGUNA_NAME
 #define LAGUNA_NAME "Laguna"
@@ -183,6 +188,40 @@ static float siluf(float x) { return x / (1.f + expf(-x)); }
  * free: expf overflows to inf above ~88 and log1pf(inf) is inf, so the gate
  * would become inf*0 = NaN on a well-behaved head. */
 static float softplusf(float x) { return x > 20.f ? x : log1pf(expf(x)); }
+
+/* f32 dot and AXPY. Attention calls these once per (query,key) pair with
+ * hd=128, so at long context they run millions of times per layer; leaving them
+ * as scalar loops made attention the largest phase once the MoE path was fixed
+ * (docs/oq-format.md, round 5). */
+#ifdef __ARM_NEON
+static inline float dot_f32(const float *a, const float *b, int n) {
+    float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        s0 = vfmaq_f32(s0, vld1q_f32(a+i),   vld1q_f32(b+i));
+        s1 = vfmaq_f32(s1, vld1q_f32(a+i+4), vld1q_f32(b+i+4));
+    }
+    float r = vaddvq_f32(vaddq_f32(s0, s1));
+    for (; i < n; i++) r += a[i]*b[i];
+    return r;
+}
+static inline void axpy_f32(float *y, float a, const float *x, int n) {
+    float32x4_t va = vdupq_n_f32(a);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(y+i,   vfmaq_f32(vld1q_f32(y+i),   va, vld1q_f32(x+i)));
+        vst1q_f32(y+i+4, vfmaq_f32(vld1q_f32(y+i+4), va, vld1q_f32(x+i+4)));
+    }
+    for (; i < n; i++) y[i] += a*x[i];
+}
+#else
+static inline float dot_f32(const float *a, const float *b, int n) {
+    float r = 0; for (int i = 0; i < n; i++) r += a[i]*b[i]; return r;
+}
+static inline void axpy_f32(float *y, float a, const float *x, int n) {
+    for (int i = 0; i < n; i++) y[i] += a*x[i];
+}
+#endif
 
 /* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -918,9 +957,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                                                 : Vh + (int64_t)(c->slide[li] ? (t) % kvcap : (t))*hd)
                 for (int t = t0; t <= qpos; t++) {
                     const float *kv = LG_KROW(t);
-                    float acc = 0.f;
-                    for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
-                    sc[t - t0] = acc * scale;
+                    sc[t - t0] = dot_f32(qv, kv, hd) * scale;
                 }
                 int n = qpos - t0 + 1;
                 softmax_row(sc, n);
@@ -928,8 +965,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 for (int d = 0; d < hd; d++) cx[d] = 0.f;
                 for (int t = t0; t <= qpos; t++) {
                     const float *vrow = LG_VROW(t);
-                    float a = sc[t - t0];
-                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
+                    axpy_f32(cx, sc[t - t0], vrow, hd);
                 }
                 #undef LG_KROW
                 #undef LG_VROW
@@ -1035,30 +1071,109 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
         double te = now_s();
-        for (int64_t t = base; t < end; t++) {
-            int s = (int)(t / K), kk = (int)(t % K);
-            Slot *e = use[t - base];
-            const float *xs = x + (int64_t)s*D;
-            float *os = out + (int64_t)s*D;
-            if (m->experts == EXP_OQ) {
-                matmul_w(g,  xs, e->wg, 1, D, I);
-                matmul_w(u,  xs, e->wu, 1, D, I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                matmul_w(hh, g,  e->wd, 1, I, D);
-            } else if (m->quant_bits) {
-                matmul_q(g, xs, e->qg, e->sg, D, I);
-                matmul_q(u, xs, e->qu, e->su, D, I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                matmul_q(hh, g, e->qd, e->sd, I, D);
-            } else {
-                matmul(g, xs, e->fg, 1, D, I);
-                matmul(u, xs, e->fu, 1, D, I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-                matmul(hh, g, e->fd, 1, I, D);
-            }
-            float w = wgt[(int64_t)s*K + kk];
-            for (int d = 0; d < D; d++) os[d] += w * hh[d];
+        /* ROUND 1+3 (docs/oq-format.md): batch the pairs BY EXPERT, then run one
+         * matmul per expert over all its tokens.
+         *
+         * Round 1 replaced per-matmul OpenMP regions (52% of time was
+         * __psynch_cvwait: ~1.8M barriers per layer, each guarding I=512 rows)
+         * with one region over the (token,expert) pairs.
+         *
+         * Round 3 fixes the bigger waste that exposed: with S=1 per call, an
+         * expert's packed weights were unpacked once PER TOKEN. At S=1902/K=8
+         * over 256 experts that is ~59 tokens per expert, so oq_unpack ran ~59x
+         * more than necessary (28% of all time). Gathering each expert's tokens
+         * into a contiguous batch turns the GEMV into a GEMM: the unpack cost is
+         * paid once per group and amortizes across the batch, and the inner loop
+         * gets row reuse it never had.
+         *
+         * Same shape as upstream's coli_metal_moe_gemv (packed activations +
+         * per-expert row offsets), so the two stay comparable.
+         *
+         * omp_in_parallel(): nesting is off, so an inner region from an
+         * already-parallel caller would serialize anyway. */
+        int npair_c = (int)(end - base);
+        /* order the pairs by slot so each expert's tokens are contiguous */
+        int *ord = malloc((size_t)npair_c * sizeof(int));
+        int *estart = malloc((size_t)(npair_c + 1) * sizeof(int));
+        if (!ord || !estart) { fprintf(stderr, "OOM moe grouping\n"); exit(1); }
+        for (int i = 0; i < npair_c; i++) ord[i] = i;
+        /* insertion sort by slot pointer: npair_c <= cap (a few hundred) and the
+         * list is already clustered, so this beats pulling in a qsort callback */
+        for (int i = 1; i < npair_c; i++) {
+            int v = ord[i]; Slot *sv = use[v]; int j = i - 1;
+            while (j >= 0 && (uintptr_t)use[ord[j]] > (uintptr_t)sv) { ord[j+1] = ord[j]; j--; }
+            ord[j+1] = v;
         }
+        int ngrp = 0;
+        for (int i = 0; i < npair_c; ) {
+            estart[ngrp++] = i;
+            Slot *e = use[ord[i]];
+            while (i < npair_c && use[ord[i]] == e) i++;
+        }
+        estart[ngrp] = npair_c;
+
+        int par = ngrp > 1 && !omp_in_parallel();
+        /* One result row per pair in this chunk. npair_c <= cap (a few hundred),
+         * so this is ~1 MB and lets the scatter run serially afterwards -- no
+         * atomics and no per-thread copy of out[]. */
+        float *res = falloc((int64_t)npair_c * D);
+        #pragma omp parallel if(par)
+        {
+            /* scratch sized for the largest group seen by this thread */
+            int64_t rcap = 0;
+            float *xb = NULL, *gb = NULL, *ub = NULL, *hb = NULL;
+            #pragma omp for schedule(dynamic,1)
+            for (int gi = 0; gi < ngrp; gi++) {
+                int g0 = estart[gi], g1 = estart[gi+1], nr = g1 - g0;
+                Slot *e = use[ord[g0]];
+                if (nr > rcap) {
+                    rcap = nr;
+                    free(xb); free(gb); free(ub); free(hb);
+                    xb = falloc(rcap*D); gb = falloc(rcap*I);
+                    ub = falloc(rcap*I); hb = falloc(rcap*D);
+                }
+                for (int r = 0; r < nr; r++) {
+                    int64_t t = base + ord[g0 + r];
+                    memcpy(xb + (int64_t)r*D, x + (t / K)*D, (size_t)D*sizeof(float));
+                }
+                /* down_proj also goes through the batched kernel: writing into a
+                 * scratch then permuting is cheaper than S separate GEMVs, each
+                 * of which would re-unpack the whole weight. */
+                if (m->experts == EXP_OQ) {
+                    matmul_w(gb, xb, e->wg, nr, D, I);
+                    matmul_w(ub, xb, e->wu, nr, D, I);
+                    for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
+                    matmul_w(hb, gb, e->wd, nr, I, D);
+                } else if (m->quant_bits) {
+                    for (int r = 0; r < nr; r++) {
+                        matmul_q(gb + (int64_t)r*I, xb + (int64_t)r*D, e->qg, e->sg, D, I);
+                        matmul_q(ub + (int64_t)r*I, xb + (int64_t)r*D, e->qu, e->su, D, I);
+                    }
+                    for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
+                    for (int r = 0; r < nr; r++)
+                        matmul_q(hb + (int64_t)r*D, gb + (int64_t)r*I, e->qd, e->sd, I, D);
+                } else {
+                    matmul(gb, xb, e->fg, nr, D, I);
+                    matmul(ub, xb, e->fu, nr, D, I);
+                    for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
+                    matmul(hb, gb, e->fd, nr, I, D);
+                }
+                /* place each row where the serial scatter expects it */
+                for (int r = 0; r < nr; r++)
+                    memcpy(res + (int64_t)ord[g0+r]*D, hb + (int64_t)r*D,
+                           (size_t)D*sizeof(float));
+            }
+            free(xb); free(gb); free(ub);
+        }
+        /* serial weighted scatter: cheap next to the matmuls and collision-free */
+        for (int i = 0; i < npair_c; i++) {
+            int64_t t = base + i;
+            int s = (int)(t / K), kk = (int)(t % K);
+            float sc = wgt[(int64_t)s*K + kk];
+            float *os = out + (int64_t)s*D, *hr = res + (int64_t)i*D;
+            for (int d = 0; d < D; d++) os[d] += sc * hr[d];
+        }
+        free(res); free(ord); free(estart);
         m->t_expert += now_s() - te;
     }
     free(g); free(u); free(hh);
@@ -1410,7 +1525,8 @@ static void print_cfg(Model *m) {
     if (m->oq.on)
         printf("     oQ: default %d-bit gs%d, %d per-tensor overrides%s\n",
                m->oq.bits, m->oq.gs, m->oq.n,
-               m->experts == EXP_OQ ? ", experts packed (switch_mlp)" : "");
+               m->experts == EXP_OQ ? ", experts packed (switch_mlp)"
+                                    : " (expert layout probed at load)");
 }
 
 int main(int argc, char **argv) {
@@ -1420,6 +1536,21 @@ int main(int argc, char **argv) {
     int cap = -1, bits = 0, n_new = 256, npos = 0, cfg_only = 0, chat = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
+        /* -f reads the prompt from a file: a long-context prompt is tens of KB,
+         * which is awkward on argv and hits ARG_MAX past a few hundred KB. */
+        else if (!strcmp(argv[i], "-f") && i+1 < argc) {
+            const char *pf = argv[++i];
+            FILE *f = fopen(pf, "rb");
+            if (!f) { perror(pf); return 1; }
+            fseek(f, 0, SEEK_END); long fn = ftell(f); fseek(f, 0, SEEK_SET);
+            char *pb = malloc((size_t)fn + 1);
+            if (!pb) { fprintf(stderr, "OOM prompt file\n"); return 1; }
+            if (fread(pb, 1, (size_t)fn, f) != (size_t)fn) { perror(pf); return 1; }
+            pb[fn] = 0;
+            while (fn > 0 && (pb[fn-1] == '\n' || pb[fn-1] == '\r')) pb[--fn] = 0;
+            fclose(f);
+            prompt = pb;
+        }
         else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--chat")) chat = 1;
         else if (!strcmp(argv[i], "--config")) cfg_only = 1;
