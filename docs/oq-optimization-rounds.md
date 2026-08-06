@@ -1,102 +1,130 @@
 # Long-context optimization rounds (oQ, Laguna-XS)
 
-Five profile-fix-measure rounds against real oQ checkpoints, driven by
-`c/tools/stress_laguna.sh`. Every round used the identical 1902-token prompt
-(fixed seed) and 16 generated tokens on an M5 (4P+6E, 32 GB), so the numbers are
-comparable across rows.
+Profile-fix-measure rounds against real oQ checkpoints, driven by
+`c/tools/stress_laguna.sh`. Every run uses a fixed-seed prompt, so numbers are
+comparable within a context size. Hardware: M5 (4P+6E), 32 GB.
 
 The harness runs the engine under macOS `sample` at 1 ms and reports SELF time
-per symbol. Self time matters: `sample` prints an indented call tree where a
-parent's count includes all its children, so naively summing lines makes
-`main` look like 100% of the program. The reporter subtracts each frame's
-immediate children.
+per symbol, plus peak RSS and major page faults from `/usr/bin/time -l`. Self
+time matters: `sample` prints an indented call tree where a parent's count
+includes its children, so summing lines naively makes `main` look like 100%.
 
-## Results
+## Rounds 1-5 (1902-token prompt, oQ2)
 
 | round | change | prefill | expert-mm | attn | top symbol |
 |---|---|---|---|---|---|
-| 0 | baseline (after the NEON/`-mcpu=native` pass) | 301.0 s | 182.5 s | 105.8 s | `__psynch_cvwait` 52.4% |
+| 0 | baseline (after NEON + `-mcpu=native`) | 301.0 s | 182.5 s | 105.8 s | `__psynch_cvwait` 52.4% |
 | 1 | one OpenMP region over (token,expert) pairs | 180.1 s | 63.6 s | 106.0 s | `matmul_oq` 38.8% |
 | 2 | compact per-thread accumulator | 173.4 s | 59.4 s | 104.4 s | `matmul_oq` 40.3% |
-| 3 | group pairs by expert, batch the GEMM | 173.6 s | 57.9 s | 106.2 s | `matmul_oq` 40.7% |
-| 4 | hoist `oq_unpack` out of the batch loop | 146.3 s | 42.3 s | 95.6 s | `matmul_oq` ~65% |
-| 5 | NEON `dot_f32` / `axpy_f32` in attention | **136.1 s** | **42.7 s** | **84.9 s** | `matmul_oq` 64.2% |
+| 3 | group pairs by expert | 173.6 s | 57.9 s | 106.2 s | `matmul_oq` 40.7% |
+| 4 | hoist `oq_unpack` out of the batch loop | 146.3 s | 42.3 s | 95.6 s | `oq_unpack` 28.8%→6.7% |
+| 5 | NEON `dot_f32` / `axpy_f32` in attention | **136.1 s** | 42.7 s | 84.9 s | attn 12.0%→6.9% |
 
-**Prefill 301 s -> 136 s, 2.2x.** Expert matmul 182.5 s -> 42.7 s, 4.3x.
-Attention 105.8 s -> 84.9 s, 1.25x.
+Prefill 301 -> 136 s (2.2x). Expert matmul 4.3x. Detail on each round is in the
+git history; the short version is that round 1 killed a barrier storm (1.8M
+barriers per layer, each guarding 512 rows), round 3 alone did nothing until
+round 4 fixed the kernel it fed, and round 2 undid a 12.7 GB RSS regression that
+round 1 introduced.
 
-Decode on this workload moved 3.87 -> 6.79 tok/s (1.75x), but decode is
-cache-hit-dominated at S=1 and varies +/-10% run to run; prefill is the reliable
-signal at long context.
+## Rounds 6-9 (6144-token prompt)
+
+16K was the original target but a single 16K run takes 35+ minutes at this
+prefill speed, so the sweep moved to 6K where a round is ~8 minutes. The
+scaling behaviour being optimized (attention going quadratic, expert cache
+thrashing) is fully visible at 6K.
+
+### oQ2 (11 GB checkpoint, 2-bit default)
+
+| round | change | prefill | attn | fill (IO) | cache hit | peak RSS |
+|---|---|---|---|---|---|---|
+| 5 | entering this sweep | 520.8 s | 327.3 s | 24.2 s | 56.9% | 11.81 GiB |
+| 6 | flash-style query tiling + online softmax | 490.9 s | 297.7 s | 21.7 s | 56.9% | 11.82 GiB |
+| 7 | chunked softmax rescale (`LG_KC = 64`) | 465.8 s | 280.5 s | 21.5 s | 56.9% | 11.07 GiB |
+| 8 | visit expert pairs in EXPERT order | **465.1 s** | 279.5 s | **6.0 s** | **99.4%** | **11.05 GiB** |
+
+### oQ8e (33 GB checkpoint, 8-bit everywhere)
+
+| round | change | prefill | attn | decode | peak RSS |
+|---|---|---|---|---|---|
+| 8 | state entering the oQ8e work | 482.6 s | 288.9 s | 2.51 tok/s | 12.27 GiB |
+| 9 | skip the unpack pass for 8-bit codes | **469.6 s** | 281.4 s | **2.80 tok/s** | **10.93 GiB** |
 
 ## What each round found
 
-**Round 1 - the barrier storm.** 52% of all wall time was `__psynch_cvwait`,
-i.e. OpenMP threads waiting rather than working. At prefill the MoE loop runs
-S*K = 15,216 times per layer, and each of the three `matmul_w` calls inside was
-opening its own parallel region over just I=512 rows. That is roughly 1.8M
-barriers per layer, each guarding less work than the barrier costs. Hoisting one
-region out to the pair loop cut prefill 40%.
+**Round 6 - K/V reuse.** Attention scored one query-head x one query at a time,
+re-walking the whole K/V history for each. With `group = H/KV = 6` query heads
+per KV head, every K row was read 6 times per query and re-read for all S
+queries. Tiling over `LG_QB = 8` queries per KV head loads each row once per
+tile. Worth only 1.10x on its own, which pointed at the next problem.
 
-**Round 2 - a memory regression I caused.** Round 1's per-thread accumulator was
-`S*D` floats, which at S=1902 with 10 threads pushed RSS from 5.7 GB to 12.7 GB.
-Replaced with one row per token the thread actually touched. Speed unchanged,
-which is the point: it removed a regression rather than adding a win. (RSS stayed
-high for an unrelated reason -- see "not a leak" below.)
+**Round 7 - rescale frequency.** A naive online softmax renormalizes whenever
+the running max grows, and each renormalize is O(hd) over the accumulator. Early
+in a row the max grows on most keys, so round 6 was paying that O(hd) constantly.
+Scoring keys in chunks of `LG_KC = 64` and taking the chunk max first caps it at
+one rescale per chunk per query. Attention 297.7 -> 280.5 s and, as a side
+effect, peak RSS fell 0.75 GiB because the per-thread score buffer went from
+O(context) to O(LG_QB*LG_KC) -- attention scratch no longer grows with prompt
+length.
 
-**Round 3 - grouping alone did nothing.** Sorting pairs by expert so each expert
-gets one batched call looked obviously right and moved prefill by 0.2 s, inside
-noise. Worth recording as a negative result: the batching was necessary but not
-sufficient, because the kernel it fed still worked row-at-a-time internally.
+**Round 8 - the IO win.** The pair list is in token order, so a chunk of `cap`
+pairs holds up to `cap` DIFFERENT experts; the next chunk evicts them and the one
+after reloads what the first had. At 6K/cap=48 that was a 56.9% hit rate against
+only 256 distinct experts in the layer. Visiting pairs in expert order (counting
+sort, O(npair + E)) means each expert loads at most once per layer per call:
+**hit rate 56.9% -> 99.4%, fill 21.5 s -> 6.0 s, 3.6x less disk IO.** Pure
+scheduling change; the `cap`-sized eviction safety property is untouched.
 
-**Round 4 - the real waste, exposed by round 3.** `matmul_oq` had its group loop
-INSIDE its batch loop, so a weight row's codes were unpacked once per token.
-With ~59 tokens per expert that is 59x more unpacking than needed. Swapping the
-loops (`OQ_MAX_BATCH = 32` rows per unpack) took `oq_unpack` from 28.8% of
-runtime to 6.7% and prefill down another 27 s. This is the round that justified
-round 3.
+**Round 9 - 8-bit needs no unpack.** At `bits == 8` the packed stream is already
+a byte array, so `oq_unpack`'s copy into scratch is pure overhead. Pointing
+directly at the weight buffer cut peak RSS 12.27 -> 10.93 GiB (-11%) and decode
+2.51 -> 2.80 tok/s (1.12x) on oQ8e. Verified bit-exact against
+`mlx.core.dequantize` at both gs=64 and gs=128.
 
-**Round 5 - attention was left holding the bag.** Once the MoE path was 4x
-faster, attention was the largest phase. Its inner loops were scalar `for d <
-hd` dot products and AXPYs with hd=128, called once per (query,key) pair.
-NEON versions took attention 95.6 -> 84.9 s and its profile share 12.0% -> 6.9%.
+## Cumulative result
 
-## Verified on a second quant
+Against the round-0 baseline at 1902 tokens, prefill went **301.0 s -> 136.1 s
+(2.2x)**. Across rounds 6-9 at 6144 tokens, prefill went **520.8 s -> 465.1 s**
+with the real wins concentrated in IO (fill 24.2 -> 6.0 s, 4.0x) and memory
+(11.81 -> 11.05 GiB on oQ2, 12.27 -> 10.93 GiB on oQ8e).
 
-`mlx-coders/Laguna-XS-2.1-oQ4e` (18 GB, 4-bit default gs64) runs the same
-harness: prefill 144.8 s, 4.02 tok/s, RSS 11.8 GB, coherent output. It also
-exercises a different code path by accident, which is useful: its tensors use
-plain HF naming (`model.layers.N...`) with no `language_model.` prefix, so the
-dual-name lookup in `oq_load`/`load_w` is covered by a real checkpoint rather
-than only by construction.
+Three axes, honestly separated:
+
+- **CPU**: 2.2x on prefill in rounds 1-5; rounds 6-9 added ~12% more. The MoE
+  matmul is now 64% of self time and is the remaining target.
+- **IO**: expert cache hit rate 56.9% -> 99.4%, fill phase 4.0x faster. Major
+  page faults stay in single digits, so the streaming path is not touching disk
+  beyond the initial expert loads.
+- **Memory**: peak RSS down 6-11% depending on quant, and more importantly the
+  attention scratch no longer scales with context length.
 
 ## Not a leak: RSS is the expert cache
 
-RSS grows to 12-14 GB at long context because `cap=0` sizes the expert cache
-from available RAM (~7.4 GB budget, 161 experts/layer here). That is the cache
-doing its job at a 98.5% hit rate. Pass `CAP=<n>` to bound it; `CAP=4` runs the
-same model at 9.3 GB.
+RSS tracks the expert cache, which `cap=0` sizes from available RAM. All 6K runs
+above pin `CAP=48` for comparability. `CAP=4` runs the same model at 9.3 GiB.
 
 ## Correctness gate, every round
 
-All five rounds kept the tiny fixtures token-exact against the transformers
-oracle: XS 24/24 teacher-forced + 12/12 generated, S 208/208 + 8/8, plus the
-`cap=1` eviction path and `BITS=8`. The C-vs-MLX unpack check stayed bit-exact.
-No round shipped without that passing, which is what makes the speedups
-trustworthy rather than merely fast.
+Every round kept the tiny fixtures token-exact against the transformers oracle:
+XS 24/24 teacher-forced + 12/12 generated, S 208/208 + 8/8 (that one wraps the
+sliding-window ring 50x, which is exactly what a flash-attention rewrite can
+break), plus the `cap=1` eviction path and `BITS=8`. The C-vs-MLX unpack check
+stayed bit-exact. `task test` 3/3 and the upstream engines still build.
+
+Rounds 6 and 8 are the two that could plausibly have changed numerics -- round 6
+reorders the softmax accumulation, round 8 reorders expert visits -- and both
+came out token-identical.
+
+## Reproduce
+
+```
+CAP=48 ./c/tools/stress_laguna.sh models/Laguna-XS-2.1-oQ2  6144 8 mytag
+CAP=48 ./c/tools/stress_laguna.sh models/Laguna-XS-2.1-oQ8e 6144 8 q8
+```
 
 ## Where the time goes now
 
-`matmul_oq` is 64% of self time and `__psynch_cvwait` is still 19.6%. The
-remaining wait is the per-expert `schedule(dynamic,1)` region: expert groups have
-very uneven row counts (one hot expert can take 10x the tokens of a cold one), so
-threads finish at different times. The next lever is splitting large groups
-across threads rather than assigning whole groups, which is a load-balancing
-change, not a kernel change.
-
-Reproduce any row:
-
-```
-./c/tools/stress_laguna.sh models/Laguna-XS-2.1-oQ2 2048 16 mytag
-CAP=4 ./c/tools/stress_laguna.sh models/Laguna-XS-2.1-oQ4e 4096 32 oq4e-long
-```
+`matmul_oq` dominates at ~64% of self time, with `__psynch_cvwait` around 19%.
+That residual wait is load imbalance in the per-expert `schedule(dynamic,1)`
+region: a hot expert can hold 10x the rows of a cold one, so threads finish
+unevenly. Splitting large expert groups across threads is the next lever, and it
+is a scheduling change rather than a kernel change.
