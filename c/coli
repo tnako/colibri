@@ -151,6 +151,7 @@ _BANNER_MODELS = (
     ("inkling",     "Inkling",           "975B"),
     ("kimi",        "Kimi K3",           "2.8T"),
     ("olmoe",       "OLMoE",             "7B"),
+    ("laguna",      "Laguna",            ""),       # LAGUNA-FORK: XS 22B / S 118B, scale read from config
     ("glm",         "GLM-5.2",           "744B"),
 )
 
@@ -229,7 +230,8 @@ def term_w(): return min(shutil.get_terminal_size((80,20)).columns, 100)
 def model_arch(model):
     try:
         with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
-            model_type = (json.load(f).get("model_type") or "").lower()
+            cfg = json.load(f)
+        model_type = (cfg.get("model_type") or "").lower()
     except (OSError, ValueError, TypeError):
         return "glm"
     if "inkling" in model_type:
@@ -238,14 +240,27 @@ def model_arch(model):
         return "kimi"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
+    # LAGUNA-FORK: one model_type ("laguna") ships at two scales that are two
+    # separate binaries, so the arch is resolved by geometry rather than by name.
+    # hidden_size is the discriminator (XS 2048, S 3072) because it is present in
+    # every Laguna config and cannot be confused between the two; the threshold
+    # sits between them so a future size lands on the nearer engine instead of
+    # failing. Both binaries read all their geometry from config.json anyway.
+    if "laguna" in model_type:
+        return "laguna_s" if int(cfg.get("hidden_size") or 0) > 2560 else "laguna_xs"
     return "glm"
+
+# LAGUNA-FORK: served/reported model id per Laguna arch, in one place so the
+# chat and serve subcommands cannot drift apart.
+_LAGUNA_MODEL_ID = {"laguna_xs": "laguna-xs-colibri", "laguna_s": "laguna-s-colibri"}
 
 def engine_for(model):
     arch = model_arch(model)
     if arch == "glm" or os.environ.get("COLI_ENGINE"):
         return GLM
     name = {"inkling": "inkling", "kimi": "kimi_k3",
-            "deepseek_v4": "deepseek_v4"}[arch]
+            "deepseek_v4": "deepseek_v4",
+            "laguna_xs": "laguna_xs", "laguna_s": "laguna_s"}[arch]
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
 
@@ -260,7 +275,9 @@ def need_model(model, engine=None):
     if not os.path.exists(engine):
         arch = model_arch(model)
         target = ("kimi_k3" if arch == "kimi" else "inkling" if arch == "inkling" else
-                  "deepseek-v4" if arch == "deepseek_v4" else "colibri")
+                  "deepseek-v4" if arch == "deepseek_v4" else
+                  "laguna_xs" if arch == "laguna_xs" else
+                  "laguna_s" if arch == "laguna_s" else "colibri")
         sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
 
 def env_for_engine(a, arch):
@@ -974,7 +991,8 @@ def cmd_chat(a):
         engine=engine_for(a.model)
         need_model(a.model,engine)
         model_id=("kimi-k3-colibri" if arch=="kimi" else
-                  "inkling-colibri" if arch=="inkling" else "deepseek-v4-colibri")
+                  "inkling-colibri" if arch=="inkling" else
+                  _LAGUNA_MODEL_ID.get(arch) or "deepseek-v4-colibri")   # LAGUNA-FORK
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
@@ -1157,6 +1175,7 @@ def cmd_serve(a):
     model_id=a.model_id or ("kimi-k3-colibri" if arch=="kimi" else
                             "inkling-colibri" if arch=="inkling" else
                             "deepseek-v4-colibri" if arch=="deepseek_v4" else
+                            _LAGUNA_MODEL_ID.get(arch) or   # LAGUNA-FORK
                             "glm-5.2-colibri")
     try:
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
@@ -1189,7 +1208,8 @@ def cmd_stop(a):
             if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
                 if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
             comm=open(f"/proc/{pd}/comm").read().strip()
-            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","deepseek_v4"):
+            if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","deepseek_v4",
+                        "laguna_xs","laguna_s"):   # LAGUNA-FORK
                 env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
                 if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
         except (OSError,PermissionError): continue

@@ -775,6 +775,57 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     return "".join(prompt)
 
 
+def render_chat_laguna(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                       tool_choice=None):
+    """Laguna's native multi-turn chat template (LAGUNA-FORK).
+
+    The text subset of the checkpoint's own tokenizer_config.json
+    chat_template: a leading EOS marker, an optional <system> block (the
+    checkpoint ships a default system message, and a caller-supplied system
+    message with empty content deliberately opts out of it), each user turn as
+    <user>...</user>, and each assistant turn as <assistant> followed by either
+    <think>reasoning</think> or a bare </think> when thinking is off.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for Laguna yet.",
+                       "tools", "unsupported_parameter")
+    eos = "\u3008|EOS|\u3009"
+    default_system = ("You are a helpful, conversationally-fluent assistant made by "
+                      "Poolside. You are here to be helpful to users through natural "
+                      "language conversations.")
+    body, system_message = [], default_system
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            if index == 0:
+                system_message = text          # empty string = no <system> block
+            continue
+        if role == "user":
+            body.append(f"<user>{text}</user>\n")
+        else:
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            think = f"<think>{reasoning or ''}</think>" if enable_thinking else "</think>"
+            body.append(f"<assistant>{think}{text}</assistant>\n")
+    parts = [eos]
+    if system_message and system_message.strip():
+        parts.append(f"<system>{system_message.rstrip()}</system>\n")
+    parts.extend(body)
+    parts.append("<assistant>")
+    parts.append("<think>" if enable_thinking else "</think>")
+    return "".join(parts)
+
+
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                 tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
@@ -1378,7 +1429,8 @@ def model_arch(model):
     (including an unreadable config) is glm."""
     try:
         with open(Path(model) / "config.json", encoding="utf-8") as fh:
-            model_type = (json.load(fh).get("model_type") or "").lower()
+            cfg = json.load(fh)
+        model_type = (cfg.get("model_type") or "").lower()
     except (OSError, ValueError, TypeError):
         return "glm"
     if "inkling" in model_type:
@@ -1387,6 +1439,11 @@ def model_arch(model):
         return "kimi"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
+    # LAGUNA-FORK: two binaries behind one model_type, split on hidden_size --
+    # must stay identical to coli's model_arch() or --arch auto and the engine
+    # coli picked would disagree.
+    if "laguna" in model_type:
+        return "laguna_s" if int(cfg.get("hidden_size") or 0) > 2560 else "laguna_xs"
     return "glm"
 
 
@@ -2504,7 +2561,9 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_choice = body.get("tool_choice")
         renderer = (render_chat_inkling if ARCH == "inkling" else
                     render_chat_kimi if ARCH == "kimi" else
-                    render_chat_v4 if ARCH == "deepseek_v4" else render_chat)
+                    render_chat_v4 if ARCH == "deepseek_v4" else
+                    render_chat_laguna if ARCH in ("laguna_xs", "laguna_s") else   # LAGUNA-FORK
+                    render_chat)
         audio_clips = [] if ARCH == "inkling" else None
         if audio_clips is not None:
             prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
@@ -2782,7 +2841,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi", "deepseek_v4") and kv_slots != 1:
+    # LAGUNA-FORK: the Laguna engines re-prefill every request like inkling/kimi
+    # do, so they share the single-KV-slot restriction.
+    if ARCH in ("inkling", "kimi", "deepseek_v4", "laguna_xs", "laguna_s") and kv_slots != 1:
         raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
@@ -2819,7 +2880,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4",
+                                           "laguna_xs", "laguna_s"),   # LAGUNA-FORK
+                        default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2850,6 +2913,8 @@ def main():
         args.model_id = ("inkling-colibri" if ARCH == "inkling" else
                          "kimi-k3-colibri" if ARCH == "kimi" else
                          "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
+                         "laguna-xs-colibri" if ARCH == "laguna_xs" else   # LAGUNA-FORK
+                         "laguna-s-colibri" if ARCH == "laguna_s" else
                          "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,

@@ -63,6 +63,7 @@
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
+#include "coli_moe_route.h"                        /* LAGUNA-FORK: shared sigmoid+bias top-k router */
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -3956,12 +3957,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->route_kl_sum+=kl; m->route_kl_n++;
             }
         } else {
-            for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
-                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                    if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
-                best=router_best_or_fallback(best,kk,E,layer);
-                idx[kk]=best; w[kk]=logit[best];
-            }
+            /* LAGUNA-FORK: same selection, now in c/coli_moe_route.h so the
+             * Laguna engines call the identical code instead of copying it. */
+            coli_moe_pick_topk(choice,logit,E,Ksel,idx,w,router_best_or_fallback,layer);
             if(g_route_agree){
                 m->route_agree_hit+=(uint64_t)Ksel;
                 m->route_agree_tot+=(uint64_t)Ksel;
@@ -4008,6 +4006,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
+        /* LAGUNA-FORK: the two lines above are what coli_moe_norm_scale holds;
+         * kept inline here so the ablation/top-p bookkeeping around them is
+         * untouched, and diffed against the header on every upstream sync. */
         rt_trace(layer,s,idx,w,Ke);           /* ROUTE_TRACE: one line per (position, layer) */
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
     }

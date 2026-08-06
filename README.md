@@ -375,6 +375,8 @@ the model's `config.json`):
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
 > | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 22 GB comfortable | not needed |
+> | **Laguna-XS** (Poolside) | ~44 GB bf16 | 12 GB | not needed |
+> | **Laguna-S** (Poolside) | ~235 GB bf16 | 24 GB | not needed |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
 > are streamed from it — expect a fraction of a token per second on a slow drive
@@ -386,6 +388,9 @@ the model's `config.json`):
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
+<!-- LAGUNA-FORK -->
+| **Laguna-XS** (Poolside) | 22B / 2B | [`poolside/Laguna-XS-2.1`](https://huggingface.co/poolside/Laguna-XS-2.1) — original bf16 checkpoint | `make -C c laguna_xs` | [laguna.md](docs/laguna.md) |
+| **Laguna-S** (Poolside) | 118B / 8B | [`poolside/Laguna-S-2.1`](https://huggingface.co/poolside/Laguna-S-2.1) — original bf16 checkpoint | `make -C c laguna_s` | [laguna.md](docs/laguna.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from

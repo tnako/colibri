@@ -1,0 +1,1255 @@
+/* Laguna (poolside Laguna-XS / Laguna-S) forward pass, shared by both sizes.
+ *
+ * The two checkpoints are ONE architecture at two scales: every code path here
+ * is identical, only config numbers differ (D 2048/3072, L 40/48, topk 8/10,
+ * moe_inter 512/1024, sliding-layer head count 64/72, YaRN factor 32/128). So
+ * the engine is written once and c/laguna_xs.c / c/laguna_s.c include it; see
+ * docs/laguna.md.
+ *
+ * What is genuinely new versus every existing Colibri engine:
+ *  - PER-HEAD ATTENTION OUTPUT GATE. g_proj is Linear(D, n_heads) and the
+ *    attention context is multiplied by softplus(g) per head before o_proj.
+ *    No other engine gates attention output this way.
+ *  - HALF-SPLIT (HF `rotate_half`) ROPE, not the interleaved scheme colibri.c
+ *    and deepseek_v4.c implement. The reference says so explicitly: "Removes
+ *    the interleaving of cos and sin from GLM".
+ *  - PARTIAL ROTARY: full_attention layers rotate only the first
+ *    head_dim * 0.5 dims and pass the rest through; sliding_attention layers
+ *    rotate all of them. Two rope tables, one per layer type, with different
+ *    theta (500000 vs 10000) and different rope_type (yarn vs default).
+ *  - PER-LAYER ATTENTION HEAD COUNT from num_attention_heads_per_layer, with
+ *    KV heads fixed at 8 (so the GQA group size differs per layer).
+ *
+ * What is shared rather than copied:
+ *  - the MoE router (sigmoid + e_score_correction_bias top-k, renormalize,
+ *    routed_scaling_factor) comes from coli_moe_route.h, the same header
+ *    colibri.c's GLM-5.2 router calls.
+ *
+ * Weights: dense parts (attention, norms, router, shared expert, layer-0 dense
+ * MLP) resident, keeping their on-disk dtype where it is bf16. Routed experts
+ * are streamed per-expert from the separate
+ * model.layers.N.mlp.experts.<e>.{gate,up,down}_proj.weight tensors and held in
+ * an LRU cache, optionally runtime-quantized to int8 (bits=0 keeps f32 for
+ * bit-exact oracle validation).
+ */
+#ifndef LAGUNA_COMMON_H
+#define LAGUNA_COMMON_H
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <sys/resource.h>
+#endif
+#include "st.h"
+#include "tok.h"
+#include "route_trace.h"
+#include "coli_moe_route.h"
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+
+#ifndef LAGUNA_NAME
+#define LAGUNA_NAME "Laguna"
+#endif
+#ifndef LAGUNA_REF_DEFAULT
+#define LAGUNA_REF_DEFAULT "ref_laguna.json"
+#endif
+
+#define LG_MAXL 128
+#define LG_FULL 0                 /* layer_types[i] == "full_attention"    */
+#define LG_SLIDE 1                /* layer_types[i] == "sliding_attention" */
+
+/* ---------- config ---------- */
+typedef struct {
+    double theta, factor, attn_factor, beta_fast, beta_slow;
+    int    orig_max, yarn, rot_dim;        /* rot_dim = head_dim * partial_rotary_factor */
+} RopeCfg;
+
+typedef struct {
+    int hidden, n_layers, vocab;
+    int n_kv, head_dim, window;
+    int n_experts, topk, moe_inter, shared_inter, dense_inter;
+    int n_eos, eos[8];
+    float eps, routed_scale, softcap;
+    int heads[LG_MAXL];                    /* num_attention_heads_per_layer */
+    unsigned char slide[LG_MAXL];          /* 1 = sliding_attention layer   */
+    unsigned char sparse[LG_MAXL];         /* 1 = MoE layer, 0 = dense MLP  */
+    RopeCfg rope[2];                       /* [LG_FULL], [LG_SLIDE]         */
+} Cfg;
+
+/* ---------- weights ---------- */
+typedef struct { float *f; uint16_t *h; } Wt;   /* resident: f32 or raw bf16 */
+
+typedef struct {
+    float *in_ln, *post_ln;
+    Wt q, k, v, g, o;
+    float *qn, *kn;                        /* per-head rmsnorm [head_dim] */
+    Wt dg, du, dd;                         /* dense layer: gate/up/down   */
+    float *router, *rbias;                 /* [E,D], [E]                  */
+    Wt sh_g, sh_u, sh_d;                   /* shared expert               */
+} Layer;
+
+/* ---------- routed-expert LRU cache ---------- */
+typedef struct {
+    int eid; uint64_t used; int filled;
+    float *fg, *fu, *fd;                   /* bits == 0: f32 (oracle)     */
+    int8_t *qg, *qu, *qd; float *sg, *su, *sd;   /* bits > 0: int8 + row scales */
+} Slot;
+typedef struct { Slot *slots; int n, cap; } LCache;
+
+typedef struct {
+    Cfg c;
+    shards S;
+    int quant_bits;
+    /* Expert-tensor layout, detected at load: 0 = per-expert tensors
+     * (mlp.experts.<e>.{gate,up,down}_proj.weight — what the released
+     * checkpoints ship), 1 = fused (mlp.experts.{gate_up_proj,down_proj},
+     * [E,2I,D] / [E,D,I] — what transformers holds in memory, so what a
+     * save_pretrained fixture writes). Both are read; neither is guessed. */
+    int fused_experts;
+    Wt embed, lm_head;
+    float *final_norm;
+    Layer *L;
+    LCache *cache;
+    uint32_t **eusage;
+    uint64_t clock, hits, miss;
+    double t_attn, t_fill, t_expert, t_shared, dense_load_s;
+    /* rope tables, [pos][rot_dim], grown on demand, one pair per layer type */
+    float *cos_t[2], *sin_t[2]; int rope_pos[2];
+    /* KV cache: sliding layers keep only `window` slots (ring), full layers
+     * keep max_t. Laid out [kv_head][kvcap][head_dim]. */
+    float **K, **V; int *kvcap; int kv_len, max_t;
+} Model;
+
+/* ---------- utility ---------- */
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
+#if defined(__APPLE__)
+static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
+#else
+static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
+#endif
+static float *falloc(int64_t n) {
+    float *p = malloc((size_t)n*sizeof(float));
+    if (!p) { fprintf(stderr, "OOM %lld floats\n", (long long)n); exit(1); }
+    return p;
+}
+static float sigmoidf_(float x) { return 1.f / (1.f + expf(-x)); }
+static float siluf(float x) { return x / (1.f + expf(-x)); }
+/* softplus in f32 with the large-x guard the reference's float() path gets for
+ * free: expf overflows to inf above ~88 and log1pf(inf) is inf, so the gate
+ * would become inf*0 = NaN on a well-behaved head. */
+static float softplusf(float x) { return x > 20.f ? x : log1pf(expf(x)); }
+
+/* y[S,O] = x[S,I] @ W^T, W row-major [O,I] */
+static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const float *w = W + (int64_t)o * I;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
+            y[(int64_t)s * O + o] = acc;
+        }
+    }
+}
+
+static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint16_t *w = W + (int64_t)o * I;
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) acc += xs[i] * bf16_to_f32(w[i]);
+            y[(int64_t)s * O + o] = acc;
+        }
+    }
+}
+
+static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
+    if (W.f) matmul(y, x, W.f, S, I, O);
+    else     matmul_h(y, x, W.h, S, I, O);
+}
+
+/* y[1,O] = x @ q^T, int8 rows + per-row scale */
+static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const int8_t *w = q + (int64_t)o * I;
+        float acc = 0.f;
+        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
+        y[o] = acc * scale[o];
+    }
+}
+
+static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
+    int qmax = (1 << (bits - 1)) - 1;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const float *wr = w + (int64_t)o * I;
+        float amax = 0.f;
+        for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
+        float s = amax / qmax; if (s < 1e-8f) s = 1e-8f;
+        scale[o] = s;
+        int8_t *qr = q + (int64_t)o * I;
+        for (int i = 0; i < I; i++) {
+            int v = (int)lrintf(wr[i] / s);
+            if (v >  qmax)   v =  qmax;
+            if (v < -qmax-1) v = -qmax-1;
+            qr[i] = (int8_t)v;
+        }
+    }
+}
+
+static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
+    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
+    float r = 1.f / sqrtf((float)(ms / D) + eps);
+    for (int i = 0; i < D; i++) out[i] = x[i] * r * w[i];
+}
+
+static void softmax_row(float *x, int n) {
+    float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
+    float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
+    for (int i = 0; i < n; i++) x[i] /= s;
+}
+
+/* ---------- rope: YaRN / default inverse frequencies, half-split apply ----------
+ * Transcribed from the reference this fork was validated against:
+ * transformers' _compute_yarn_parameters (modeling_rope_utils.py) and Laguna's
+ * own compute_default_rope_parameters override, which differs from Gemma3's
+ * only by taking `dim` from head_dim * partial_rotary_factor. Both branches are
+ * here rather than reused from deepseek_v4.c's precompute: that one is written
+ * against an interleaved apply step and a single layer type, and confirming the
+ * formulas matched cost more than transcribing the 20 lines that do. */
+static double yarn_correction_dim(double rot, int dim, double base, int max_pos) {
+    return (dim * log(max_pos / (rot * 2 * M_PI))) / (2 * log(base));
+}
+
+static void rope_inv_freq(const RopeCfg *r, double *inv) {
+    int dim = r->rot_dim, half = dim / 2;
+    for (int i = 0; i < half; i++)
+        inv[i] = 1.0 / pow(r->theta, (double)(2*i) / dim);
+    if (!r->yarn) return;
+    /* interpolation = divide the frequency by `factor`; extrapolation keeps it.
+     * The ramp between low/high mixes the two per dimension. `truncate` is the
+     * reference's default (true), hence floor/ceil here. */
+    double low  = floor(yarn_correction_dim(r->beta_fast, dim, r->theta, r->orig_max));
+    double high = ceil (yarn_correction_dim(r->beta_slow, dim, r->theta, r->orig_max));
+    if (low < 0) low = 0;
+    if (high > dim - 1) high = dim - 1;
+    if (low == high) high += 0.001;
+    for (int i = 0; i < half; i++) {
+        double ramp = ((double)i - low) / (high - low);
+        if (ramp < 0) ramp = 0;
+        if (ramp > 1) ramp = 1;
+        double extrap_f = 1.0 - ramp;              /* 1 - linear_ramp_factor */
+        inv[i] = (inv[i] / r->factor) * (1.0 - extrap_f) + inv[i] * extrap_f;
+    }
+}
+
+/* Grow cos/sin tables for layer type `lt` to cover positions [0, npos).
+ * emb = cat(freqs, freqs) so cos has rot_dim entries per position, the second
+ * half repeating the first — that is what makes rotate_half work. */
+static void rope_grow(Model *m, int lt, int npos) {
+    if (npos <= m->rope_pos[lt]) return;
+    const RopeCfg *r = &m->c.rope[lt];
+    int dim = r->rot_dim, half = dim / 2;
+    double *inv = malloc((size_t)half * sizeof(double));
+    rope_inv_freq(r, inv);
+    m->cos_t[lt] = realloc(m->cos_t[lt], (size_t)npos * dim * sizeof(float));
+    m->sin_t[lt] = realloc(m->sin_t[lt], (size_t)npos * dim * sizeof(float));
+    if (!m->cos_t[lt] || !m->sin_t[lt]) { fprintf(stderr, "OOM rope tables\n"); exit(1); }
+    for (int p = m->rope_pos[lt]; p < npos; p++) {
+        float *cp = m->cos_t[lt] + (int64_t)p*dim, *sp = m->sin_t[lt] + (int64_t)p*dim;
+        for (int i = 0; i < half; i++) {
+            double a = (double)p * inv[i];
+            float c = (float)(cos(a) * r->attn_factor), s = (float)(sin(a) * r->attn_factor);
+            cp[i] = cp[i+half] = c;
+            sp[i] = sp[i+half] = s;
+        }
+    }
+    m->rope_pos[lt] = npos;
+    free(inv);
+}
+
+/* in-place half-split rope on one head vector of length head_dim; only the
+ * first rot_dim entries rotate, the tail passes through untouched */
+static void rope_apply(float *v, const float *cs, const float *sn, int rot_dim) {
+    int half = rot_dim / 2;
+    for (int i = 0; i < half; i++) {
+        float a = v[i], b = v[i+half];
+        v[i]      = a * cs[i]      - b * sn[i];
+        v[i+half] = b * cs[i+half] + a * sn[i+half];
+    }
+}
+
+/* ---------- config loading ---------- */
+static double jnum(jval *o, const char *k, double dflt) {
+    jval *v = json_get(o, k);
+    return (v && v->t == J_NUM) ? v->num : dflt;
+}
+
+static const char *jstr_at(jval *arr, int i) {
+    if (!arr || arr->t != J_ARR || i >= arr->len) return NULL;
+    return (arr->kids[i] && arr->kids[i]->t == J_STR) ? arr->kids[i]->str : NULL;
+}
+
+static void load_rope(RopeCfg *r, jval *o, int head_dim, double dflt_theta, double dflt_prf) {
+    const char *ty = NULL;
+    if (o) { jval *t = json_get(o, "rope_type"); if (t && t->t == J_STR) ty = t->str; }
+    r->theta       = o ? jnum(o, "rope_theta", dflt_theta) : dflt_theta;
+    double prf     = o ? jnum(o, "partial_rotary_factor", dflt_prf) : dflt_prf;
+    r->rot_dim     = (int)(head_dim * prf);
+    if (r->rot_dim % 2) r->rot_dim--;              /* rotate_half needs an even split */
+    r->yarn        = ty && !strcmp(ty, "yarn");
+    r->factor      = o ? jnum(o, "factor", 1.0) : 1.0;
+    r->orig_max    = o ? (int)jnum(o, "original_max_position_embeddings", 8192) : 8192;
+    r->beta_fast   = o ? jnum(o, "beta_fast", 32.0) : 32.0;
+    r->beta_slow   = o ? jnum(o, "beta_slow", 1.0)  : 1.0;
+    /* attention_factor: the checkpoints ship the computed value; when absent
+     * the reference infers 0.1*log(factor)+1 from `factor` (get_mscale). */
+    jval *af = o ? json_get(o, "attention_factor") : NULL;
+    if (af && af->t == J_NUM)      r->attn_factor = af->num;
+    else if (r->yarn && r->factor > 1) r->attn_factor = 0.1 * log(r->factor) + 1.0;
+    else                           r->attn_factor = 1.0;
+}
+
+static void load_cfg(Cfg *c, const char *snap) {
+    char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
+    FILE *f = fopen(path, "rb"); if (!f) { perror(path); exit(1); }
+    fseek(f,0,SEEK_END); long n = ftell(f); fseek(f,0,SEEK_SET);
+    char *buf = malloc((size_t)n+1);
+    if (fread(buf,1,(size_t)n,f) != (size_t)n) { fprintf(stderr,"%s: short read\n",path); exit(1); }
+    buf[n] = 0; fclose(f);
+    char *arena = NULL; jval *r = json_parse(buf, &arena);
+
+    c->hidden       = (int)jnum(r,"hidden_size",2048);
+    c->n_layers     = (int)jnum(r,"num_hidden_layers",40);
+    c->vocab        = (int)jnum(r,"vocab_size",100352);
+    c->n_kv         = (int)jnum(r,"num_key_value_heads",8);
+    c->head_dim     = (int)jnum(r,"head_dim",128);
+    c->window       = (int)jnum(r,"sliding_window",512);
+    c->n_experts    = (int)jnum(r,"num_experts",256);
+    c->topk         = (int)jnum(r,"num_experts_per_tok",8);
+    c->moe_inter    = (int)jnum(r,"moe_intermediate_size",512);
+    c->shared_inter = (int)jnum(r,"shared_expert_intermediate_size",c->moe_inter);
+    c->dense_inter  = (int)jnum(r,"intermediate_size",8192);
+    c->eps          = (float)jnum(r,"rms_norm_eps",1e-6);
+    c->routed_scale = (float)jnum(r,"moe_routed_scaling_factor",1.0);
+    c->softcap      = (float)jnum(r,"moe_router_logit_softcapping",0.0);
+    if (c->n_layers > LG_MAXL) { fprintf(stderr,"num_hidden_layers %d > %d\n", c->n_layers, LG_MAXL); exit(1); }
+
+    /* eos_token_id is a LIST in both released checkpoints ([2, 24]); a tiny
+     * fixture may write a scalar. Both are accepted, and generation stops on
+     * any of them. */
+    c->n_eos = 0;
+    jval *eo = json_get(r,"eos_token_id");
+    if (eo && eo->t == J_NUM) c->eos[c->n_eos++] = (int)eo->num;
+    else if (eo && eo->t == J_ARR)
+        for (int i = 0; i < eo->len && c->n_eos < 8; i++)
+            if (eo->kids[i] && eo->kids[i]->t == J_NUM) c->eos[c->n_eos++] = (int)eo->kids[i]->num;
+
+    int default_heads = (int)jnum(r,"num_attention_heads",48);
+    jval *lt  = json_get(r,"layer_types");
+    jval *mt  = json_get(r,"mlp_layer_types");
+    jval *hpl = json_get(r,"num_attention_heads_per_layer");
+    for (int i = 0; i < c->n_layers; i++) {
+        const char *s = jstr_at(lt, i);
+        c->slide[i] = s ? (strcmp(s,"sliding_attention") == 0) : 0;
+        const char *mp = jstr_at(mt, i);
+        /* config default (LagunaConfig.__post_init__): layer 0 dense, rest sparse */
+        c->sparse[i] = mp ? (strcmp(mp,"sparse") == 0) : (i > 0);
+        int h = default_heads;
+        if (hpl && hpl->t == J_ARR && i < hpl->len && hpl->kids[i] && hpl->kids[i]->t == J_NUM)
+            h = (int)hpl->kids[i]->num;
+        if (h % c->n_kv) { fprintf(stderr,"layer %d: %d heads is not a multiple of %d kv heads\n", i, h, c->n_kv); exit(1); }
+        c->heads[i] = h;
+    }
+
+    jval *rp = json_get(r,"rope_parameters");
+    load_rope(&c->rope[LG_FULL],  rp ? json_get(rp,"full_attention")    : NULL, c->head_dim, 500000.0, 0.5);
+    load_rope(&c->rope[LG_SLIDE], rp ? json_get(rp,"sliding_attention") : NULL, c->head_dim,  10000.0, 1.0);
+    free(buf); free(arena);
+}
+
+/* ---------- weight loading ---------- */
+static float *load_t(Model *m, const char *name) {
+    int64_t n = st_numel(&m->S, name);
+    if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    float *p = falloc(n);
+    st_read_f32(&m->S, name, p, 0);
+    return p;
+}
+
+static void pread_all(int fd, void *buf, int64_t nb, int64_t off) {
+    char *p = buf;
+    while (nb > 0) {
+        int64_t chunk = nb < (1<<30) ? nb : (1<<30);
+        ssize_t got = pread(fd, p, (size_t)chunk, off);
+        if (got <= 0) { perror("pread chunk"); exit(1); }
+        p += got; off += got; nb -= got;
+    }
+}
+
+/* bf16 tensors stay bf16 in RAM (Laguna S's dense set is ~10 GB at bf16 and
+ * would double as f32); anything else is expanded to f32, which is what the
+ * tiny oracle fixtures ship so parity checks stay bit-exact. */
+static Wt load_w(Model *m, const char *name) {
+    Wt w = {0};
+    st_tensor *t = st_find(&m->S, name);
+    if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (t->dtype == 0) {
+        w.h = malloc(t->nbytes);
+        if (!w.h) { fprintf(stderr,"OOM %s\n",name); exit(1); }
+        pread_all(t->fd, w.h, t->nbytes, t->off);
+    } else {
+        w.f = falloc(t->numel);
+        st_read_f32(&m->S, name, w.f, 0);
+    }
+    return w;
+}
+
+static void wt_row_f32(Wt w, int64_t off, float *out, int n) {
+    if (w.f) memcpy(out, w.f + off, (size_t)n * sizeof(float));
+    else for (int i = 0; i < n; i++) out[i] = bf16_to_f32(w.h[off + i]);
+}
+
+static double mem_avail_bytes(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char ln[256]; double kb = 0;
+    while (fgets(ln, sizeof(ln), f)) if (sscanf(ln, "MemAvailable: %lf", &kb) == 1) break;
+    fclose(f);
+    return kb * 1024.0;
+#elif defined(__APPLE__)
+    vm_size_t page = 0; host_page_size(mach_host_self(), &page);
+    vm_statistics64_data_t vs; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &n) != KERN_SUCCESS)
+        return 0;
+    return (double)(vs.free_count + vs.inactive_count + vs.purgeable_count) * page;
+#else
+    return 0;
+#endif
+}
+
+static void model_init(Model *m, const char *snap, int cap, int bits) {
+    memset(m, 0, sizeof(*m));
+    m->quant_bits = bits;
+    load_cfg(&m->c, snap);
+    st_init(&m->S, snap);
+    Cfg *c = &m->c;
+    int D = c->hidden;
+    double t0 = now_s();
+
+    m->embed      = load_w(m, "model.embed_tokens.weight");
+    m->final_norm = load_t(m, "model.norm.weight");
+    m->lm_head    = load_w(m, "lm_head.weight");
+    m->L = calloc(c->n_layers, sizeof(Layer));
+    char nm[352];
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
+        #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm)
+        LD(in_ln,   "input_layernorm.weight");
+        LD(post_ln, "post_attention_layernorm.weight");
+        LDW(q, "self_attn.q_proj.weight"); LDW(k, "self_attn.k_proj.weight");
+        LDW(v, "self_attn.v_proj.weight"); LDW(o, "self_attn.o_proj.weight");
+        LDW(g, "self_attn.g_proj.weight");
+        LD(qn, "self_attn.q_norm.weight"); LD(kn, "self_attn.k_norm.weight");
+        if (!c->sparse[i]) {
+            LDW(dg, "mlp.gate_proj.weight"); LDW(du, "mlp.up_proj.weight"); LDW(dd, "mlp.down_proj.weight");
+        } else {
+            LD(router, "mlp.gate.weight");
+            /* The bias hangs off the router module in transformers
+             * (mlp.gate.e_score_correction_bias) but off the expert block in
+             * the released checkpoints (mlp.experts.e_score_correction_bias).
+             * Same tensor, two homes. */
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.e_score_correction_bias",i);
+            if (!st_has(&m->S, nm))
+                snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias",i);
+            l->rbias = load_t(m, nm);
+            /* Released checkpoints name it shared_expert (singular); the HF
+             * module is shared_experts. Accept both instead of guessing. */
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert.gate_proj.weight",i);
+            const char *sh = st_has(&m->S, nm) ? "shared_expert" : "shared_experts";
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.%s.gate_proj.weight",i,sh); l->sh_g = load_w(m,nm);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.%s.up_proj.weight",  i,sh); l->sh_u = load_w(m,nm);
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.%s.down_proj.weight",i,sh); l->sh_d = load_w(m,nm);
+        }
+        #undef LD
+        #undef LDW
+    }
+
+    int nsp = 0; for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
+    /* expert layout probe: look for the fused tensor on the first sparse layer */
+    for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) {
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
+        if (st_has(&m->S, nm)) m->fused_experts = 1;
+        else {
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj.weight",i);
+            if (st_has(&m->S, nm)) m->fused_experts = 2;
+        }
+        break;
+    }
+    int64_t I = c->moe_inter;
+    int64_t slotb = bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
+    if (cap <= 0) {
+        double avail = mem_avail_bytes();
+        cap = avail > 0 ? (int)((avail*0.80 - 4e9) / ((double)slotb * (nsp ? nsp : 1))) : 16;
+        if (cap < 4) cap = 4;
+        if (cap > c->n_experts) cap = c->n_experts;
+        fprintf(stderr, "[cap auto] %d experts/layer (%.1f GB cache budget)\n",
+                cap, (double)cap*slotb*nsp/1e9);
+    }
+    m->cache = calloc(c->n_layers, sizeof(LCache));
+    for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+
+    rt_init(LAGUNA_NAME, c->n_layers, c->n_experts);
+    for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
+    rt_drop_row(c->n_layers);                     /* no MTP row */
+    m->eusage = rt_counts_all();
+    m->dense_load_s = now_s() - t0;
+}
+
+/* ---------- routed-expert slots ---------- */
+static Slot *slot_find(Model *m, int layer, int eid) {
+    LCache *lc = &m->cache[layer];
+    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
+        lc->slots[i].used = ++m->clock;
+        return &lc->slots[i];
+    }
+    return NULL;
+}
+
+static Slot *slot_acquire(Model *m, int layer, int eid) {
+    LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
+    int64_t D = c->hidden, I = c->moe_inter;
+    Slot *s;
+    if (lc->n < lc->cap) {
+        s = &lc->slots[lc->n++];
+        if (m->quant_bits) {
+            s->qg = malloc((size_t)I*D); s->qu = malloc((size_t)I*D); s->qd = malloc((size_t)D*I);
+            if (!s->qg || !s->qu || !s->qd) { fprintf(stderr,"OOM expert slot\n"); exit(1); }
+            s->sg = falloc(I); s->su = falloc(I); s->sd = falloc(D);
+        } else {
+            s->fg = falloc(I*D); s->fu = falloc(I*D); s->fd = falloc(D*I);
+        }
+    } else {
+        int lru = 0;
+        for (int i = 1; i < lc->n; i++) if (lc->slots[i].used < lc->slots[lru].used) lru = i;
+        s = &lc->slots[lru];
+    }
+    s->eid = eid; s->used = ++m->clock; s->filled = 0;
+    return s;
+}
+
+/* pure I/O (+ optional requant): safe to run in parallel across slots */
+static void slot_fill(Model *m, int layer, Slot *s) {
+    Cfg *c = &m->c;
+    int64_t D = c->hidden, I = c->moe_inter;
+    char nm[352];
+    float *tmp = falloc(2*I*D > D*I ? 2*I*D : D*I);
+    float *gp, *up, *dp;                       /* f32 views of this expert */
+    if (m->fused_experts) {
+        /* fused [E,2I,D] gate_up (gate rows then up rows) and [E,D,I] down */
+        const char *sfx = m->fused_experts == 2 ? ".weight" : "";
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj%s",layer,sfx);
+        st_read_slice_f32(&m->S, nm, (int64_t)s->eid*2*I*D, 2*I*D, tmp, 1);
+        gp = tmp; up = tmp + I*D;
+        dp = falloc(D*I);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj%s",layer,sfx);
+        st_read_slice_f32(&m->S, nm, (int64_t)s->eid*D*I, D*I, dp, 1);
+    } else {
+        gp = tmp; up = falloc(I*D); dp = falloc(D*I);
+        #define EXP(which, dst) \
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d." which "_proj.weight",layer,s->eid); \
+            st_read_f32(&m->S, nm, dst, 1)
+        EXP("gate", gp); EXP("up", up); EXP("down", dp);
+        #undef EXP
+    }
+    if (m->quant_bits) {
+        quantize_rows(gp, s->qg, s->sg, I, D, m->quant_bits);
+        quantize_rows(up, s->qu, s->su, I, D, m->quant_bits);
+        quantize_rows(dp, s->qd, s->sd, D, I, m->quant_bits);
+    } else {
+        memcpy(s->fg, gp, (size_t)I*D*sizeof(float));
+        memcpy(s->fu, up, (size_t)I*D*sizeof(float));
+        memcpy(s->fd, dp, (size_t)D*I*sizeof(float));
+    }
+    if (!m->fused_experts) free(up);
+    free(dp); free(tmp);
+    s->filled = 1;
+}
+
+/* ---------- attention ----------
+ * GQA over a per-layer head count, q/k per-head RMSNorm, partial half-split
+ * rope from the layer type's table, sliding window on sliding layers, and the
+ * per-head softplus output gate before o_proj. */
+static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, float *out) {
+    Cfg *c = &m->c;
+    int D = c->hidden, H = c->heads[li], KV = c->n_kv, hd = c->head_dim;
+    int lt = c->slide[li] ? LG_SLIDE : LG_FULL, rot = c->rope[lt].rot_dim;
+    int qdim = H*hd, kvdim = KV*hd, group = H/KV;
+    int kvcap = m->kvcap[li];
+    float *q  = falloc((int64_t)S*qdim);
+    float *k  = falloc((int64_t)S*kvdim);
+    float *vv = falloc((int64_t)S*kvdim);
+    float *gt = falloc((int64_t)S*H);
+    matmul_w(q,  x, l->q, S, D, qdim);
+    matmul_w(k,  x, l->k, S, D, kvdim);
+    matmul_w(vv, x, l->v, S, D, kvdim);
+    matmul_w(gt, x, l->g, S, D, H);
+    rope_grow(m, lt, pos0 + S);
+    for (int s = 0; s < S; s++) {
+        int pos = pos0 + s;
+        const float *cs = m->cos_t[lt] + (int64_t)pos*rot, *sn = m->sin_t[lt] + (int64_t)pos*rot;
+        for (int h = 0; h < H; h++) {
+            float *qh = q + (int64_t)s*qdim + h*hd;
+            rmsnorm_row(qh, qh, l->qn, hd, c->eps);
+            rope_apply(qh, cs, sn, rot);
+        }
+        for (int h = 0; h < KV; h++) {
+            float *kh = k + (int64_t)s*kvdim + h*hd;
+            rmsnorm_row(kh, kh, l->kn, hd, c->eps);
+            rope_apply(kh, cs, sn, rot);
+        }
+    }
+    /* Scoring reads this batch's own rows (t >= pos0) straight out of the k/vv
+     * scratch and older history out of the cache. The scratch holds exactly the
+     * bytes the cache would hold (post-rmsnorm, post-rope), so the arithmetic is
+     * unchanged — and it is what lets the append happen AFTER this loop.
+     *
+     * That ordering is required, not stylistic: with a `window`-row ring,
+     * appending the whole batch up front overwrites history rows that earlier
+     * queries in the SAME batch still need, for any prefill with S > window.
+     * Silent, too — no crash, just attention built from future keys. Same
+     * hazard and same resolution as upstream PR #830 for inkling.c. */
+    float scale = 1.f / sqrtf((float)hd);
+    float *ctx = falloc((int64_t)S*qdim);
+    #pragma omp parallel
+    {
+        float *sc = malloc((size_t)(pos0 + S + 1) * sizeof(float));
+        #pragma omp for collapse(2) schedule(static)
+        for (int h = 0; h < H; h++) {
+            for (int s = 0; s < S; s++) {
+                int qpos = pos0 + s, kh = h/group;
+                int t0 = 0;
+                if (c->slide[li]) { t0 = qpos - c->window + 1; if (t0 < 0) t0 = 0; }
+                const float *qv = q + (int64_t)s*qdim + h*hd;
+                const float *Kh = m->K[li] + (int64_t)kh*kvcap*hd;
+                const float *Vh = m->V[li] + (int64_t)kh*kvcap*hd;
+                #define LG_KROW(t) ((t) >= pos0 ? k  + (int64_t)((t)-pos0)*kvdim + kh*hd \
+                                                : Kh + (int64_t)(c->slide[li] ? (t) % kvcap : (t))*hd)
+                #define LG_VROW(t) ((t) >= pos0 ? vv + (int64_t)((t)-pos0)*kvdim + kh*hd \
+                                                : Vh + (int64_t)(c->slide[li] ? (t) % kvcap : (t))*hd)
+                for (int t = t0; t <= qpos; t++) {
+                    const float *kv = LG_KROW(t);
+                    float acc = 0.f;
+                    for (int d = 0; d < hd; d++) acc += qv[d]*kv[d];
+                    sc[t - t0] = acc * scale;
+                }
+                int n = qpos - t0 + 1;
+                softmax_row(sc, n);
+                float *cx = ctx + (int64_t)s*qdim + h*hd;
+                for (int d = 0; d < hd; d++) cx[d] = 0.f;
+                for (int t = t0; t <= qpos; t++) {
+                    const float *vrow = LG_VROW(t);
+                    float a = sc[t - t0];
+                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
+                }
+                #undef LG_KROW
+                #undef LG_VROW
+                /* per-head output gate: softplus of g_proj, one scalar per head */
+                float gate = softplusf(gt[(int64_t)s*H + h]);
+                for (int d = 0; d < hd; d++) cx[d] *= gate;
+            }
+        }
+        free(sc);
+    }
+    /* Append now that every query has been scored. Sliding layers skip the rows
+     * this same batch would immediately overwrite: a skipped row is at position
+     * < (pos0+S) - window, and no later query ever attends earlier than
+     * (pos0+S) - window + 1, so it is dead on arrival. */
+    int s0 = 0;
+    if (c->slide[li] && S > kvcap) s0 = S - kvcap;
+    for (int s = s0; s < S; s++) {
+        int pos = pos0 + s, slot = c->slide[li] ? pos % kvcap : pos;
+        for (int h = 0; h < KV; h++) {
+            memcpy(m->K[li] + ((int64_t)h*kvcap + slot)*hd, k  + (int64_t)s*kvdim + h*hd, (size_t)hd*sizeof(float));
+            memcpy(m->V[li] + ((int64_t)h*kvcap + slot)*hd, vv + (int64_t)s*kvdim + h*hd, (size_t)hd*sizeof(float));
+        }
+    }
+    matmul_w(out, ctx, l->o, S, qdim, D);
+    free(q); free(k); free(vv); free(gt); free(ctx);
+}
+
+/* ---------- dense MLP (layer 0) ---------- */
+static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
+    Cfg *c = &m->c; int D = c->hidden, I = c->dense_inter;
+    float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
+    matmul_w(g, x, l->dg, S, D, I);
+    matmul_w(u, x, l->du, S, D, I);
+    for (int64_t i = 0; i < (int64_t)S*I; i++) g[i] = siluf(g[i]) * u[i];
+    matmul_w(out, g, l->dd, S, I, D);
+    free(g); free(u);
+}
+
+/* ---------- MoE ----------
+ * Router selection and weighting come from coli_moe_route.h (shared with
+ * colibri.c's GLM-5.2 router — same sigmoid + e_score_correction_bias top-k,
+ * same renormalize-then-scale). Laguna always renormalizes, so norm_topk is 1.
+ *
+ * Order matters and follows LagunaSparseMoeBlock.forward: the ROUTED sum is
+ * multiplied by moe_routed_scaling_factor, and the shared expert is added
+ * AFTERWARDS, unscaled.
+ *
+ * Expert compute runs in rounds of at most `cap` (token, expert) pairs, so a
+ * slot cannot be evicted while it is still needed — with a cache smaller than
+ * the batch's distinct expert count, acquiring everything up front would hand
+ * out slots that later hold a different expert's weights, silently.
+ */
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter;
+    float *logits = falloc((int64_t)S*E);
+    matmul(logits, x, l->router, S, D, E);
+    memset(out, 0, (size_t)S*D*sizeof(float));
+    int   *idx = malloc((size_t)S*K*sizeof(int));
+    float *wgt = malloc((size_t)S*K*sizeof(float));
+    float *choice = falloc(E);
+    Slot **use  = malloc((size_t)S*K*sizeof(Slot*));
+    Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
+
+    for (int s = 0; s < S; s++) {
+        float *lg = logits + (int64_t)s*E;
+        for (int e = 0; e < E; e++) {
+            float z = lg[e];
+            if (c->softcap > 0.f) z = tanhf(z / c->softcap) * c->softcap;
+            lg[e] = sigmoidf_(z);                  /* unbiased score: the WEIGHT */
+            choice[e] = lg[e] + l->rbias[e];       /* biased score: the SELECTOR */
+        }
+        int *si = idx + (int64_t)s*K; float *w = wgt + (int64_t)s*K;
+        coli_moe_pick_topk(choice, lg, E, K, si, w, rt_router_pick, layer);
+        coli_moe_norm_scale(w, K, 1, c->routed_scale);
+        for (int kk = 0; kk < K; kk++) if (m->eusage[layer]) m->eusage[layer][si[kk]]++;
+    }
+
+    int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
+    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+    int64_t npair = (int64_t)S*K;
+    for (int64_t base = 0; base < npair; base += cap) {
+        int64_t end = base + cap < npair ? base + cap : npair;
+        int nfill = 0;
+        for (int64_t t = base; t < end; t++) {
+            int eid = idx[t];
+            Slot *e = slot_find(m, layer, eid);
+            if (e) m->hits++;
+            else { m->miss++; e = slot_acquire(m, layer, eid); fill[nfill++] = e; }
+            use[t - base] = e;
+        }
+        if (nfill) {
+            double tf = now_s();
+            #pragma omp parallel for schedule(dynamic,1)
+            for (int j = 0; j < nfill; j++) slot_fill(m, layer, fill[j]);
+            m->t_fill += now_s() - tf;
+        }
+        for (int64_t t = base; t < end; t++) {
+            if (use[t - base]->eid != idx[t]) {
+                fprintf(stderr, "layer %d: cache served expert %d for requested expert %d\n",
+                        layer, use[t - base]->eid, (int)idx[t]);
+                exit(1);
+            }
+        }
+        double te = now_s();
+        for (int64_t t = base; t < end; t++) {
+            int s = (int)(t / K), kk = (int)(t % K);
+            Slot *e = use[t - base];
+            const float *xs = x + (int64_t)s*D;
+            float *os = out + (int64_t)s*D;
+            if (m->quant_bits) {
+                matmul_q(g, xs, e->qg, e->sg, D, I);
+                matmul_q(u, xs, e->qu, e->su, D, I);
+                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                matmul_q(hh, g, e->qd, e->sd, I, D);
+            } else {
+                matmul(g, xs, e->fg, 1, D, I);
+                matmul(u, xs, e->fu, 1, D, I);
+                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                matmul(hh, g, e->fd, 1, I, D);
+            }
+            float w = wgt[(int64_t)s*K + kk];
+            for (int d = 0; d < D; d++) os[d] += w * hh[d];
+        }
+        m->t_expert += now_s() - te;
+    }
+    free(g); free(u); free(hh);
+
+    /* shared expert: every token, unscaled, added on top of the routed sum */
+    double ts = now_s();
+    int SI = c->shared_inter;
+    float *sg = falloc((int64_t)S*SI), *su = falloc((int64_t)S*SI), *sd = falloc((int64_t)S*D);
+    matmul_w(sg, x, l->sh_g, S, D, SI);
+    matmul_w(su, x, l->sh_u, S, D, SI);
+    for (int64_t i = 0; i < (int64_t)S*SI; i++) sg[i] = siluf(sg[i]) * su[i];
+    matmul_w(sd, sg, l->sh_d, S, SI, D);
+    for (int64_t i = 0; i < (int64_t)S*D; i++) out[i] += sd[i];
+    free(sg); free(su); free(sd);
+    m->t_shared += now_s() - ts;
+
+    free(logits); free(idx); free(wgt); free(choice); free(use); free(fill);
+}
+
+/* ---------- one forward pass over S new tokens ----------
+ * Returns malloc'd logits for the last position. tf_out, when non-NULL, also
+ * receives the per-position argmax (teacher-forcing parity check). */
+static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
+    Cfg *c = &m->c; int D = c->hidden;
+    float *x = falloc((int64_t)S*D);
+    /* SEC: ids come from tok_encode, i.e. from tokenizer.json, while the row
+     * count of embed_tokens comes from config.json. Those are two files and
+     * nothing makes them agree — a tokenizer paired with the wrong checkpoint
+     * (or a snapshot assembled by hand) yields ids past the table and this
+     * reads off the end of the embedding allocation. Refuse by name instead. */
+    for (int s = 0; s < S; s++) {
+        if (ids[s] < 0 || ids[s] >= c->vocab) {
+            fprintf(stderr, "token id %d at position %d is outside vocab_size %d "
+                            "(tokenizer.json and config.json disagree)\n",
+                    ids[s], pos0 + s, c->vocab);
+            exit(1);
+        }
+    }
+    for (int s = 0; s < S; s++) wt_row_f32(m->embed, (int64_t)ids[s]*D, x + (int64_t)s*D, D);
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        double ta = now_s();
+        attention(m, l, i, nrm, S, pos0, tmp);
+        m->t_attn += now_s() - ta;
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
+        else              dense_mlp(m, l, nrm, S, tmp);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+    }
+    m->kv_len = pos0 + S;
+    float *last = falloc(D);
+    float *logit = falloc(c->vocab);
+    if (tf_out) {
+        for (int s = 0; s < S; s++) {
+            rmsnorm_row(last, x + (int64_t)s*D, m->final_norm, D, c->eps);
+            matmul_w(logit, last, m->lm_head, 1, D, c->vocab);
+            int best = 0; for (int i = 1; i < c->vocab; i++) if (logit[i] > logit[best]) best = i;
+            tf_out[pos0 + s] = best;
+        }
+    }
+    rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
+    matmul_w(logit, last, m->lm_head, 1, D, c->vocab);
+    free(x); free(nrm); free(tmp); free(last);
+    return logit;
+}
+
+/* Feed an arbitrary number of positions in one pass. Sliding layers stay correct
+ * for any S because attention() appends after scoring (see there); no chunking
+ * is needed and none is done, so prefill is one batched call. */
+static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
+    return step_raw(m, ids, S, pos0, tf_out);
+}
+
+static void kv_alloc(Model *m, int max_t) {
+    Cfg *c = &m->c;
+    if (m->K && max_t <= m->max_t) return;
+    if (m->K) {
+        for (int i = 0; i < c->n_layers; i++) { free(m->K[i]); free(m->V[i]); }
+        free(m->K); free(m->V); free(m->kvcap);
+    }
+    m->max_t = max_t; m->kv_len = 0;
+    m->K = calloc(c->n_layers, sizeof(float*));
+    m->V = calloc(c->n_layers, sizeof(float*));
+    m->kvcap = calloc(c->n_layers, sizeof(int));
+    for (int i = 0; i < c->n_layers; i++) {
+        /* sliding layers only ever read the last `window` positions, so the
+         * ring is exactly `window` rows — the post-scoring append in
+         * attention() is what makes that safe during prefill (PR #830). */
+        int cap = (c->slide[i] && c->window > 0 && c->window < max_t) ? c->window : max_t;
+        m->kvcap[i] = cap;
+        m->K[i] = falloc((int64_t)c->n_kv * cap * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_kv * cap * c->head_dim);
+    }
+}
+
+static int is_eos(Cfg *c, int tok) {
+    for (int i = 0; i < c->n_eos; i++) if (c->eos[i] == tok) return 1;
+    return 0;
+}
+
+/* greedy generation into out[] (prompt copied in first) */
+static void generate(Model *m, const int *prompt, int np, int n_new, int *out, int *n_out) {
+    for (int i = 0; i < np; i++) out[i] = prompt[i];
+    float *logit = step(m, prompt, np, 0, NULL);
+    int len = np;
+    Cfg *c = &m->c;
+    for (int s = 0; s < n_new; s++) {
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        free(logit);
+        out[len++] = best;
+        if (s == n_new - 1) break;
+        int one = best;
+        logit = step(m, &one, 1, len - 1, NULL);
+    }
+    *n_out = len;
+}
+
+/* ---------- interactive prompt: greedy, streaming, stop on eos ---------- */
+static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
+    Cfg *c = &m->c;
+    int cap = (int)strlen(prompt) + 16;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
+    if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); free(ids); return; }
+    kv_alloc(m, np + n_new + 8);
+    printf("[%d prompt tokens] %s", np, prompt);
+    fflush(stdout);
+    double t0 = now_s(), t1 = 0;
+    float *logit = step(m, ids, np, 0, NULL);
+    int len = np;
+    char buf[512];
+    for (int s = 0; s < n_new; s++) {
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        free(logit);
+        if (s == 0) t1 = now_s();
+        if (is_eos(c, best)) { printf("\n[eos after %d tokens]", s); break; }
+        int nb = tok_decode(T, &best, 1, buf, sizeof(buf)-1);
+        buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
+        len++;
+        if (s == n_new - 1) break;
+        int one = best;
+        logit = step(m, &one, 1, len - 1, NULL);
+    }
+    double dt = now_s() - t1;
+    int gen = len - np;
+    printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
+           t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());
+    double tot = m->hits + m->miss;
+    printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | expert cache hit %.1f%%\n",
+           m->t_fill, m->t_expert, m->t_shared, m->t_attn, tot ? 100.0*m->hits/tot : 0.0);
+    free(ids);
+}
+
+/* ---------- serve mode: openai_server.py engine protocol ----------
+ * Byte-identical to colibri.c's and inkling.c's protocol so the shared gateway
+ * drives these engines unchanged:
+ *   stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n
+ *           CANCEL <id>\n
+ *   stdout: READY sentinel, then DATA <id> <size>\n<bytes>\n frames and a final
+ *           DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <len_limited>\n
+ * One request at a time; the KV slot argument is accepted and ignored, which is
+ * why openai_server pins these arches to kv_slots == 1. */
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+static double rng_next(void) {
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+    return (double)(g_rng >> 11) / 9007199254740992.0;
+}
+
+typedef struct { float p; int i; } PI;
+static int pi_desc(const void *a, const void *b) {
+    float d = ((const PI*)b)->p - ((const PI*)a)->p;
+    return d > 0 ? 1 : d < 0 ? -1 : 0;
+}
+
+/* temperature + top-p nucleus sampling; temp <= 0 = greedy (the oracle path) */
+static int sample_logits(const float *logit, int n, float temp, float top_p) {
+    int best = 0;
+    for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
+    if (temp <= 0.f) return best;
+    PI *c = malloc((size_t)n * sizeof(PI));
+    double sum = 0;
+    for (int i = 0; i < n; i++) {
+        c[i].p = expf((logit[i] - logit[best]) / temp);
+        c[i].i = i; sum += c[i].p;
+    }
+    qsort(c, n, sizeof(PI), pi_desc);
+    double cut = (top_p > 0.f && top_p < 1.f) ? top_p * sum : sum;
+    double acc = 0; int k = 0;
+    while (k < n && acc < cut) acc += c[k++].p;
+    double r = rng_next() * acc, run = 0;
+    int pick = c[0].i;
+    for (int i = 0; i < k; i++) { run += c[i].p; if (run >= r) { pick = c[i].i; break; } }
+    free(c);
+    return pick;
+}
+
+static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, float pen) {
+    if (pen <= 1.f) return;
+    for (int i = 0; i < nhist; i++) {
+        int t = hist[i];
+        if (t < 0 || t >= n) continue;
+        logit[t] = logit[t] > 0 ? logit[t] / pen : logit[t] * pen;
+    }
+}
+
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+#define LG_SRV_QMAX 16
+static SReq g_q[LG_SRV_QMAX]; static int g_qn = 0;
+
+/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
+static int serve_read_cmd(const char *cur_id) {
+    char ln[512];
+    if (!fgets(ln, sizeof(ln), stdin)) return -1;
+    char cmd[16], id[64];
+    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
+    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
+    if (!strcmp(cmd, "SUBMIT")) {
+        int slot, plen, max_tok; float temp, top_p;
+        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p);
+        /* Validate max_tok as well as plen: kv_alloc is sized on
+         * np + max_tok + 8, so a negative value makes the buffer shorter than
+         * the prompt and prefill writes past the end of the KV cache. The
+         * official gateway always sends a positive integer, but the SERVE
+         * protocol is public and anything bridging it reaches this directly.
+         * Same reasoning, and same check, as inkling.c's serve_read_cmd. */
+        if (nf < 5 || plen < 0 || plen > (1<<22) || max_tok < 1 || max_tok > (1<<20)) {
+            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+        (void)slot;
+        char *pl = malloc((size_t)plen + 1);
+        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
+        pl[plen] = 0;
+        int nl = fgetc(stdin); (void)nl;
+        if (g_qn < LG_SRV_QMAX) {
+            SReq *q = &g_q[g_qn++];
+            snprintf(q->id, sizeof(q->id), "%s", id);
+            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
+            q->payload = pl; q->plen = plen;
+        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+    }
+    return 0;
+}
+
+/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192) */
+static const char *prompt_reject(int np, int want) {
+    const char *cm = getenv("CTX_MAX");
+    int ctx_max = cm ? atoi(cm) : 8192;
+    if (np + want > ctx_max) return "context exceeds CTX_MAX";
+    return NULL;
+}
+
+static void serve_one(Model *m, Tok *T, SReq *q) {
+    Cfg *c = &m->c;
+    int cap = q->plen + 16;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    int np = tok_encode(T, q->payload, q->plen, ids, cap);
+    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    const char *bad = prompt_reject(np, q->max_tok);
+    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    kv_alloc(m, np + q->max_tok + 8);
+    m->kv_len = 0;
+    double t0 = now_s();
+    uint64_t h0 = m->hits, m0 = m->miss;
+    double f0 = m->t_fill, e0 = m->t_expert, s0 = m->t_shared, a0 = m->t_attn;
+    float *logit = step(m, ids, np, 0, NULL);
+    int len = np, gen = 0, limited = 1, cancelled = 0;
+    char buf[512];
+    float rep = getenv("REP_PEN") ? (float)atof(getenv("REP_PEN")) : 1.1f;
+    int hist[128], nhist = 0;
+    for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
+    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+        apply_rep_penalty(logit, c->vocab, hist, nhist, rep);
+        int tk = sample_logits(logit, c->vocab, q->temp, q->top_p);
+        free(logit); logit = NULL;
+        if (is_eos(c, tk)) { limited = 0; break; }
+        if (nhist < 128) hist[nhist++] = tk;
+        else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
+        int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
+        printf("DATA %s %d\n", q->id, nb);
+        fwrite(buf, 1, (size_t)nb, stdout);
+        fputc('\n', stdout); fflush(stdout);
+        gen++; len++;
+        while (coli_stdin_readable()) {
+            int r = serve_read_cmd(q->id);
+            if (r < 0) { free(ids); free(logit); return; }
+            if (r > 0) { cancelled = 1; limited = 0; }
+        }
+        if (cancelled || s == q->max_tok - 1) break;
+        logit = step(m, &tk, 1, len - 1, NULL);
+    }
+    free(logit);
+    double dt = now_s() - t0;
+    double tot = (double)(m->hits - h0 + m->miss - m0);
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
+           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
+           m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
+    fflush(stdout);
+    free(ids);
+}
+
+static void serve_loop(Model *m, Tok *T) {
+    coli_serve_binary_mode();
+    setvbuf(stdin, NULL, _IONBF, 0);
+    const char *sd = getenv("SEED");
+    if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
+    else g_rng ^= (uint64_t)time(NULL) * 2654435761u;
+    fputs("\x01\x01READY\x01\x01\n", stdout);
+    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
+    fflush(stdout);
+    for (;;) {
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        SReq q = g_q[0];
+        memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
+        serve_one(m, T, &q);
+        free(q.payload);
+    }
+}
+
+/* ---------- ref_laguna.json parity harness ---------- */
+static int *read_int_array(jval *o, const char *key, int *n_out) {
+    jval *a = json_get(o, key);
+    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }
+    int *r = malloc((size_t)a->len * sizeof(int));
+    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
+    *n_out = a->len; return r;
+}
+
+static void print_cfg(Model *m) {
+    Cfg *c = &m->c;
+    int nfull = 0, nsp = 0;
+    for (int i = 0; i < c->n_layers; i++) { nfull += !c->slide[i]; nsp += c->sparse[i]; }
+    printf("cfg: D=%d L=%d(%d full/%d sliding, %d MoE) V=%d kv=%d hd=%d heads=%d/%d win=%d\n",
+           c->hidden, c->n_layers, nfull, c->n_layers-nfull, nsp, c->vocab,
+           c->n_kv, c->head_dim, c->heads[0], c->heads[c->n_layers-1], c->window);
+    printf("     E=%d topk=%d moe_inter=%d shared=%d dense=%d scale=%.2f\n",
+           c->n_experts, c->topk, c->moe_inter, c->shared_inter, c->dense_inter, c->routed_scale);
+    for (int t = 0; t < 2; t++) {
+        RopeCfg *r = &c->rope[t];
+        printf("     rope[%s]: %s theta=%.0f rot_dim=%d factor=%.1f attn_factor=%.6f beta=%.0f/%.0f orig_max=%d\n",
+               t == LG_FULL ? "full   " : "sliding", r->yarn ? "yarn   " : "default",
+               r->theta, r->rot_dim, r->factor, r->attn_factor, r->beta_fast, r->beta_slow, r->orig_max);
+    }
+}
+
+int main(int argc, char **argv) {
+    const char *snap = getenv("SNAP");
+    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    const char *prompt = NULL, *refpath = LAGUNA_REF_DEFAULT;
+    int cap = -1, bits = 0, n_new = 256, npos = 0, cfg_only = 0, chat = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-p") && i+1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "-n") && i+1 < argc) n_new = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--chat")) chat = 1;
+        else if (!strcmp(argv[i], "--config")) cfg_only = 1;
+        else if (npos == 0) { cap = atoi(argv[i]); npos++; }
+        else if (npos == 1) { bits = atoi(argv[i]); npos++; }
+        else refpath = argv[i];
+    }
+    /* --chat: wrap the prompt in Laguna's own template (the text subset of
+     * tokenizer_config.json's chat_template, same rendering openai_server.py
+     * does for the served path): leading EOS, optional <system> block, the turn
+     * as <user>…</user>, then <assistant> plus the closing </think> that a
+     * thinking-disabled turn emits. Without the template an instruct model gets
+     * out-of-distribution text. THINK=1 opens a <think> block instead. */
+    char *chat_buf = NULL;
+    if (chat && prompt) {
+        const char *think = getenv("THINK");
+        int thinking = think && *think == '1';
+        size_t need = strlen(prompt) + 320;
+        chat_buf = malloc(need);
+        if (!chat_buf) { fprintf(stderr, "OOM chat template\n"); return 1; }
+        snprintf(chat_buf, need,
+                 "\u3008|EOS|\u3009<user>%s</user>\n<assistant>%s",
+                 prompt, thinking ? "<think>" : "</think>");
+        prompt = chat_buf;
+    }
+    if (cap < 0) cap = prompt ? 0 : 16;
+    if (bits && (bits < 2 || bits > 8)) { fprintf(stderr, "quant_bits must be 0 (f32) or 2..8\n"); return 1; }
+
+    /* SERVE=1: the openai_server.py gateway drives the engine over stdin/stdout
+     * (READY handshake, SUBMIT/CANCEL, DATA/DONE frames) — the same protocol
+     * colibri.c and inkling.c speak, so `coli serve` / `coli chat` work. */
+    if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
+        Model m; model_init(&m, snap, cap, bits);
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        serve_loop(&m, &T);
+        return 0;
+    }
+
+    /* --config: parse and print the checkpoint geometry, load no weights. The
+     * first thing to run against a new checkpoint, and the cheapest way to see
+     * whether a config drifted from what this engine expects. */
+    if (cfg_only) {
+        Model m; memset(&m, 0, sizeof(m));
+        load_cfg(&m.c, snap);
+        printf("== " LAGUNA_NAME " C engine, config only ==\n");
+        print_cfg(&m);
+        return 0;
+    }
+
+    if (prompt) {
+        Model m; model_init(&m, snap, cap, bits);
+        printf("== " LAGUNA_NAME " C engine, %d layers, experts @ %s, cache %d/layer ==\n",
+               m.c.n_layers, bits ? "int" : "f32", m.cache[0].cap);
+        print_cfg(&m);
+        printf("resident weights loaded in %.1fs | RSS %.2f GB\n", m.dense_load_s, rss_gb());
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        generate_stream(&m, &T, prompt, n_new);
+        return 0;
+    }
+
+    FILE *f = fopen(refpath, "rb"); if (!f) { perror(refpath); return 1; }
+    fseek(f,0,SEEK_END); long n = ftell(f); fseek(f,0,SEEK_SET);
+    char *buf = malloc((size_t)n+1);
+    if (fread(buf,1,(size_t)n,f) != (size_t)n) { fprintf(stderr,"%s: short read\n",refpath); return 1; }
+    buf[n] = 0; fclose(f);
+    char *arena = NULL; jval *ref = json_parse(buf, &arena);
+    int np, nfull, ntf;
+    int *pids  = read_int_array(ref,"prompt_ids",&np);
+    int *full  = read_int_array(ref,"full_ids",&nfull);
+    int *tfref = read_int_array(ref,"tf_pred",&ntf);
+    if (!pids || !full) { fprintf(stderr,"%s: needs prompt_ids and full_ids\n",refpath); return 1; }
+    int ngen = nfull - np;
+
+    Model m; model_init(&m, snap, cap, bits);
+    printf("== " LAGUNA_NAME " C engine, cache %d experts/layer, experts @ %s ==\n",
+           m.cache[0].cap, bits ? "int (runtime quant)" : "f32");
+    print_cfg(&m);
+    printf("resident weights loaded in %.1fs | RSS %.2f GB\n", m.dense_load_s, rss_gb());
+    kv_alloc(&m, nfull + 8);
+
+    int tf_ok = 1;
+    if (tfref && ntf == nfull) {
+        int *tf = malloc((size_t)nfull * sizeof(int));
+        free(step(&m, full, nfull, 0, tf));
+        int ok = 0; for (int i = 0; i < nfull; i++) ok += (tf[i] == tfref[i]);
+        printf("teacher-forced argmax: %d/%d match\n", ok, nfull);
+        tf_ok = (ok == nfull);
+        free(tf);
+        kv_alloc(&m, nfull + 8); m.kv_len = 0;
+    }
+
+    int *out = malloc((size_t)nfull * sizeof(int));
+    int nout = 0;
+    double t = now_s();
+    generate(&m, pids, np, ngen, out, &nout);
+    double dt = now_s() - t;
+    int match = 0;
+    printf("Reference: "); for (int i = np; i < nfull; i++) printf("%d ", full[i]);
+    printf("\nC engine : "); for (int i = np; i < nfull; i++) { printf("%d ", out[i]); if (out[i] == full[i]) match++; }
+    printf("\nMatching tokens: %d/%d\n", match, ngen);
+    double tot = m.hits + m.miss;
+    printf("PEAK RSS: %.2f GB | expert cache hit %.1f%% | %.2f tok/s\n",
+           rss_gb(), tot ? 100.0*m.hits/tot : 0.0, ngen/dt);
+    free(buf); free(arena);
+    return (match == ngen && tf_ok) ? 0 : 1;
+}
+
+#endif /* LAGUNA_COMMON_H */

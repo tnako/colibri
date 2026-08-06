@@ -16,6 +16,10 @@ c/glm
 c/glm.exe
 c/olmoe
 c/inkling
+c/laguna_xs
+c/laguna_xs.exe
+c/laguna_s
+c/laguna_s.exe
 c/kimi_k3
 c/kimi_k3.exe
 c/olmoe.exe
@@ -94,3 +98,7 @@ c/tiny_inkling/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
+
+# LAGUNA-FORK: generated test fixture (make_laguna_tiny.py), never committed
+laguna_tiny/
+models/

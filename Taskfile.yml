@@ -1,0 +1,216 @@
+version: '3'
+
+# Laguna on Colibri — long-lived fork of JustVugg/colibri (LAGUNA-FORK).
+#
+# The two commands you want:
+#   task laguna:xs          sync upstream, build, run Laguna-XS
+#   task laguna:s           sync upstream, build, run Laguna-S
+#
+# Both do the same three things in order: rebase this branch's work on the
+# latest upstream/main, rebuild the engine, then run the real checkpoint. Any
+# step that fails stops the chain — a build against a half-merged tree is worse
+# than no build.
+#
+# Pass a prompt:            task laguna:xs -- "write a haiku about ring buffers"
+# Override where models live: LAGUNA_MODELS=/Volumes/ext/models task laguna:xs
+# Skip the upstream sync:     SYNC=0 task laguna:xs
+
+vars:
+  REPO: '{{.ROOT_DIR}}'
+  C: '{{.ROOT_DIR}}/c'
+  WORK_BRANCH: laguna-support
+  # `main` is kept as a clean mirror of upstream/main and never carries our
+  # commits, so it can always fast-forward. All Laguna work lives on WORK_BRANCH.
+  MIRROR_BRANCH: main
+  # Where checkpoints are downloaded to. Each model gets its own subdirectory.
+  MODELS: '{{.LAGUNA_MODELS | default (printf "%s/models" .ROOT_DIR)}}'
+  XS_REPO: poolside/Laguna-XS-2.1
+  S_REPO: poolside/Laguna-S-2.1
+  DEFAULT_PROMPT: 'Explain what a ring buffer is, in two sentences.'
+  # Generated tokens per run; override with NGEN=512.
+  NGEN: '{{.NGEN | default "256"}}'
+  # Expert cache slots per layer. 0 = size it from available RAM at startup.
+  CAP: '{{.CAP | default "0"}}'
+  # Routed-expert precision: 0 keeps f32 (bit-exact), 8 runtime-quantizes to int8
+  # and roughly halves the cache footprint.
+  BITS: '{{.BITS | default "0"}}'
+  SYNC: '{{.SYNC | default "1"}}'
+
+tasks:
+  default:
+    desc: List the Laguna tasks
+    cmds:
+      - task --list
+
+  # ---------------------------------------------------------------- the two commands
+
+  laguna:xs:
+    desc: 'Sync upstream, build, and run Laguna-XS (22B/2B). Prompt: task laguna:xs -- "..."'
+    cmds:
+      - task: sync
+      - task: build
+        vars: {ENGINE: laguna_xs}
+      - task: run
+        vars:
+          ENGINE: laguna_xs
+          MODEL_REPO: '{{.XS_REPO}}'
+          DIR: Laguna-XS-2.1
+          PROMPT: '{{if .CLI_ARGS}}{{.CLI_ARGS}}{{else}}{{.DEFAULT_PROMPT}}{{end}}'
+
+  laguna:s:
+    desc: 'Sync upstream, build, and run Laguna-S (118B/8B). Prompt: task laguna:s -- "..."'
+    cmds:
+      - task: sync
+      - task: build
+        vars: {ENGINE: laguna_s}
+      - task: run
+        vars:
+          ENGINE: laguna_s
+          MODEL_REPO: '{{.S_REPO}}'
+          DIR: Laguna-S-2.1
+          PROMPT: '{{if .CLI_ARGS}}{{.CLI_ARGS}}{{else}}{{.DEFAULT_PROMPT}}{{end}}'
+
+  # ---------------------------------------------------------------- upstream sync
+
+  sync:
+    desc: Rebase the work branch on the latest upstream/main (SYNC=0 to skip)
+    status:
+      - test "{{.SYNC}}" = "0"
+    cmds:
+      - |
+        set -e
+        cd '{{.REPO}}'
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "==> working tree is dirty; refusing to sync"
+          echo "    commit or stash first, then re-run (or pass SYNC=0 to build as-is)"
+          git status --short
+          exit 1
+        fi
+        start_branch=$(git rev-parse --abbrev-ref HEAD)
+        echo "==> fetching upstream"
+        git fetch upstream --prune
+        # The mirror branch never carries our commits, so it must fast-forward.
+        # If it cannot, upstream rewrote published history (which CONTRIBUTING.md
+        # says should not happen) and that is worth stopping for, not forcing past.
+        echo "==> fast-forwarding {{.MIRROR_BRANCH}} to upstream/main"
+        git checkout '{{.MIRROR_BRANCH}}'
+        if ! git merge --ff-only upstream/main; then
+          echo "!! {{.MIRROR_BRANCH}} is not a fast-forward of upstream/main."
+          echo "   Upstream history changed shape. Investigate before forcing."
+          git checkout "$start_branch"
+          exit 1
+        fi
+        echo "==> rebasing {{.WORK_BRANCH}} onto {{.MIRROR_BRANCH}}"
+        git checkout '{{.WORK_BRANCH}}'
+        if ! git rebase '{{.MIRROR_BRANCH}}'; then
+          echo "!! rebase hit conflicts. Resolve them, then:"
+          echo "     git rebase --continue   (or: git rebase --abort)"
+          echo "   Every place this fork touches a shared file is tagged:"
+          echo "     git grep LAGUNA-FORK"
+          exit 1
+        fi
+        echo "==> synced: {{.WORK_BRANCH}} is now on $(git rev-parse --short {{.MIRROR_BRANCH}})"
+
+  # ---------------------------------------------------------------- build
+
+  build:
+    desc: Build one Laguna engine (internal; ENGINE=laguna_xs|laguna_s)
+    internal: true
+    cmds:
+      - echo "==> building {{.ENGINE}}"
+      - make -C '{{.C}}' {{.ENGINE}}
+
+  build:all:
+    desc: Build both Laguna engines
+    cmds:
+      - make -C '{{.C}}' laguna_xs laguna_s
+
+  # ---------------------------------------------------------------- run
+
+  run:
+    desc: Download if needed, then run one engine (internal)
+    internal: true
+    cmds:
+      - task: fetch
+        vars: {MODEL_REPO: '{{.MODEL_REPO}}', DIR: '{{.DIR}}'}
+      - |
+        set -e
+        echo "==> {{.ENGINE}} geometry"
+        SNAP='{{.MODELS}}/{{.DIR}}' '{{.C}}/{{.ENGINE}}' --config
+        echo "==> generating (cap={{.CAP}} bits={{.BITS}} ngen={{.NGEN}})"
+        SNAP='{{.MODELS}}/{{.DIR}}' '{{.C}}/{{.ENGINE}}' {{.CAP}} {{.BITS}} \
+          --chat -n {{.NGEN}} -p {{.PROMPT | quote}}
+
+  fetch:
+    desc: Download a checkpoint if it is not already complete (internal)
+    internal: true
+    # hf download is itself resumable and idempotent, but it still walks the
+    # whole repo listing on every call. Skip it entirely once the marker files
+    # and at least one shard are present.
+    status:
+      - test -f '{{.MODELS}}/{{.DIR}}/config.json'
+      - test -f '{{.MODELS}}/{{.DIR}}/tokenizer.json'
+      - ls '{{.MODELS}}/{{.DIR}}'/*.safetensors >/dev/null 2>&1
+    cmds:
+      - |
+        set -e
+        command -v hf >/dev/null || { echo "hf CLI not found: pip install -U huggingface_hub"; exit 1; }
+        echo "==> downloading {{.MODEL_REPO}} to {{.MODELS}}/{{.DIR}}"
+        echo "    (bf16 weights: XS is ~44 GB, S is ~235 GB)"
+        mkdir -p '{{.MODELS}}'
+        hf download '{{.MODEL_REPO}}' --local-dir '{{.MODELS}}/{{.DIR}}'
+
+  # ---------------------------------------------------------------- serve / chat
+
+  laguna:xs:serve:
+    desc: Serve Laguna-XS on an OpenAI-compatible endpoint (port 8000)
+    deps: [{task: build, vars: {ENGINE: laguna_xs}}]
+    cmds:
+      - task: fetch
+        vars: {MODEL_REPO: '{{.XS_REPO}}', DIR: Laguna-XS-2.1}
+      - '{{.C}}/coli serve --model {{.MODELS}}/Laguna-XS-2.1'
+
+  laguna:s:serve:
+    desc: Serve Laguna-S on an OpenAI-compatible endpoint (port 8000)
+    deps: [{task: build, vars: {ENGINE: laguna_s}}]
+    cmds:
+      - task: fetch
+        vars: {MODEL_REPO: '{{.S_REPO}}', DIR: Laguna-S-2.1}
+      - '{{.C}}/coli serve --model {{.MODELS}}/Laguna-S-2.1'
+
+  # ---------------------------------------------------------------- validation
+
+  fixture:
+    desc: Generate the tiny Laguna fixture + oracle (needs torch + transformers>=5.12)
+    cmds:
+      - '{{.PYTHON | default "python3"}} {{.C}}/tools/make_laguna_tiny.py --output {{.ROOT_DIR}}/laguna_tiny --force'
+
+  test:
+    desc: Token-exact parity for both engines against the tiny fixture
+    deps: [build:all]
+    cmds:
+      - task: fixture
+      - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs --fixture {{.ROOT_DIR}}/laguna_tiny'
+      - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_s  --fixture {{.ROOT_DIR}}/laguna_tiny'
+      - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs --fixture {{.ROOT_DIR}}/laguna_tiny --bits 8'
+      - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs --fixture {{.ROOT_DIR}}/laguna_tiny --cap 1'
+
+  test:baseline:
+    desc: Confirm the upstream engines still build after a sync
+    cmds:
+      - make -C '{{.C}}' olmoe
+      - make -C '{{.C}}' inkling
+      - make -C '{{.C}}' colibri
+
+  # ---------------------------------------------------------------- housekeeping
+
+  diff:upstream:
+    desc: Show every place this fork diverges from upstream in a shared file
+    cmds:
+      - git -C '{{.REPO}}' grep -n LAGUNA-FORK || true
+
+  clean:
+    desc: Remove the Laguna binaries and the tiny fixture
+    cmds:
+      - rm -f '{{.C}}/laguna_xs' '{{.C}}/laguna_s'
+      - rm -rf '{{.ROOT_DIR}}/laguna_tiny'

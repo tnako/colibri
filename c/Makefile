@@ -688,6 +688,14 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
+# LAGUNA-FORK: Laguna-XS / Laguna-S. Both are the same engine at two scales,
+# so both rules compile laguna_common.h through a one-line size wrapper.
+laguna_xs$(EXE): laguna_xs.c laguna_common.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
+	$(CC) $(CFLAGS) laguna_xs.c -o laguna_xs$(EXE) $(LDFLAGS)
+
+laguna_s$(EXE): laguna_s.c laguna_common.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
+	$(CC) $(CFLAGS) laguna_s.c -o laguna_s$(EXE) $(LDFLAGS)
+
 # ENGINES WITHOUT A CUDA BACKEND (#783).
 # kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But
 # CUDA=1 appends -DCOLI_CUDA to the global CFLAGS and the cudart libs to
