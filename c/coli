@@ -261,6 +261,15 @@ def engine_for(model):
     name = {"inkling": "inkling", "kimi": "kimi_k3",
             "deepseek_v4": "deepseek_v4",
             "laguna_xs": "laguna_xs", "laguna_s": "laguna_s"}[arch]
+    # LAGUNA-FORK: prefer the Metal build when it is present. It is the same
+    # engine with GPU flash attention and MPS GEMMs compiled in (measured 3.7x on
+    # the attention phase), and it falls back to the CPU path internally whenever
+    # a device or budget is unavailable, so preferring it is always safe.
+    # COLI_NO_METAL=1 forces the plain build.
+    if not os.environ.get("COLI_NO_METAL"):
+        mt = os.path.join(HERE, name + "_metal" + _EXE)
+        if os.path.exists(mt):
+            return mt
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
 

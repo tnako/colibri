@@ -1393,7 +1393,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     }
     #undef LG_QB
     #undef LG_KC
-attn_out:
+#ifdef LAGUNA_METAL
+attn_out: ;   /* empty statement: a label must precede a statement, not a decl */
+#endif
     /* Append now that every query has been scored. Sliding layers skip the rows
      * this same batch would immediately overwrite: a skipped row is at position
      * < (pos0+S) - window, and no later query ever attends earlier than
@@ -1465,7 +1467,6 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
 
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
-    float *g = afloat(I), *u = afloat(I), *hh = afloat(D);
     int64_t npair = (int64_t)S*K;
     int64_t *visit = NULL;         /* streaming visit order; NULL on the resident path */
 

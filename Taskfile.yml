@@ -38,8 +38,19 @@ vars:
   Q: '{{.Q | default "bf16"}}'
   DEFAULT_PROMPT: 'Explain what a ring buffer is, in two sentences.'
   NGEN: '{{.NGEN | default "256"}}'
-  # Expert cache slots per layer. 0 = size it from available RAM at startup.
+  # Expert cache slots per layer. 0 = derive it from LAGUNA_MEM_GB (the single
+  # memory knob, default 20 GB), which also decides GPU attention and whether the
+  # expert bank is held resident. Leave it at 0 unless pinning a comparison.
   CAP: '{{.CAP | default "0"}}'
+  # Total memory the engine may use, in GB. The one tuning knob: everything else
+  # (GPU attention K/V, resident expert bank, expert cache size) is derived from
+  # it in priority order. See docs/one-knob-and-chunking.md.
+  MEM_GB: '{{.MEM_GB | default "20"}}'
+  # Max context. Sizes the GPU attention K/V, so it is a memory decision too.
+  CTX: '{{.CTX | default "8192"}}'
+  # Engine suffix: '_metal' uses GPU flash attention + MPS GEMMs (3.7x on the
+  # attention phase, measured). Set METAL=0 to force the pure-CPU engines.
+  MSUF: '{{if eq (.METAL | default "1") "0"}}{{else}}_metal{{end}}'
   # Routed-expert precision for a bf16 checkpoint: 0 = f32, 8 = runtime int8.
   # Ignored for oQ, whose widths come from the checkpoint itself.
   BITS: '{{.BITS | default "0"}}'
@@ -203,9 +214,13 @@ tasks:
       - make -C '{{.C}}' {{.ENGINE}}
 
   build:all:
-    desc: Build both Laguna engines
+    desc: Build both Laguna engines (CPU and, on macOS, Metal)
     cmds:
       - make -C '{{.C}}' laguna_xs laguna_s
+      # Metal builds are the primary path on Apple silicon: GPU flash attention
+      # is 3.7x on the attention phase. They need MetalPerformanceShaders, so the
+      # build is best-effort and never fails the task on other platforms.
+      - make -C '{{.C}}' laguna_xs_metal laguna_s_metal || echo "(no Metal toolchain, CPU engines only)"
 
   # ---------------------------------------------------------------- run
 
@@ -216,10 +231,15 @@ tasks:
         vars: {MODEL_REPO: '{{.MODEL_REPO}}', DIR: '{{.DIR}}'}
       - |
         set -e
-        echo "==> {{.ENGINE}} geometry ({{.DIR}})"
-        SNAP='{{.MODELS}}/{{.DIR}}' '{{.C}}/{{.ENGINE}}' --config
-        echo "==> generating (cap={{.CAP}} bits={{.BITS}} ngen={{.NGEN}})"
-        SNAP='{{.MODELS}}/{{.DIR}}' '{{.C}}/{{.ENGINE}}' {{.CAP}} {{.BITS}} \
+        # Use the Metal engine when it was built; fall back to the CPU one so the
+        # task works on machines without a Metal toolchain.
+        ENG='{{.C}}/{{.ENGINE}}{{.MSUF}}'
+        [ -x "$ENG" ] || ENG='{{.C}}/{{.ENGINE}}'
+        echo "==> $(basename "$ENG") geometry ({{.DIR}})"
+        SNAP='{{.MODELS}}/{{.DIR}}' "$ENG" --config
+        echo "==> generating (cap={{.CAP}} bits={{.BITS}} ngen={{.NGEN}} mem={{.MEM_GB}}GB ctx={{.CTX}})"
+        LAGUNA_MEM_GB='{{.MEM_GB}}' CTX_MAX='{{.CTX}}' \
+        SNAP='{{.MODELS}}/{{.DIR}}' "$ENG" {{.CAP}} {{.BITS}} \
           --chat -n {{.NGEN}} -p {{.PROMPT | quote}}
 
   fetch:
@@ -330,6 +350,12 @@ tasks:
       - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs --fixture {{.ROOT_DIR}}/laguna_tiny'
       - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_s  --fixture {{.ROOT_DIR}}/laguna_tiny'
       - '{{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs --fixture {{.ROOT_DIR}}/laguna_tiny --bits 8'
+      # The Metal engines are a DIFFERENT numeric path -- f16 GEMMs and GPU flash
+      # attention -- so passing on the CPU binaries says nothing about them. They
+      # are the default engines on this machine, so they get the same gate.
+      # Skipped silently where they were not built.
+      - test ! -x '{{.C}}/laguna_xs_metal' || {{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_xs_metal --fixture {{.ROOT_DIR}}/laguna_tiny
+      - test ! -x '{{.C}}/laguna_s_metal'  || {{.PYTHON | default "python3"}} {{.C}}/tests/test_laguna_tiny.py --binary {{.C}}/laguna_s_metal  --fixture {{.ROOT_DIR}}/laguna_tiny
 
   test:baseline:
     desc: Confirm the upstream engines still build after a sync
@@ -349,4 +375,6 @@ tasks:
     desc: Remove the Laguna binaries and the tiny fixture
     cmds:
       - rm -f '{{.C}}/laguna_xs' '{{.C}}/laguna_s'
+      - rm -f '{{.C}}/laguna_xs_metal' '{{.C}}/laguna_s_metal'
+      - rm -f '{{.C}}/laguna_metal.o' '{{.C}}/laguna_attn_metal.o'
       - rm -rf '{{.ROOT_DIR}}/laguna_tiny'
