@@ -175,6 +175,57 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 #endif
+/* ---- per-step scratch arena (LAGUNA-FORK) ----------------------------------
+ * attention() and moe() allocate ~26 S-sized buffers per layer with malloc and
+ * free them again. Over 40 layers per pass that churns thousands of large
+ * transient blocks, and the allocator neither coalesces nor returns them: vmmap
+ * on a 6144-token prefill showed MALLOC_SMALL at 7.7 GB virtual across 1976
+ * regions plus 730 MB of MALLOC_LARGE(empty), with 7.4 GB swapped out. The tell
+ * was a contended run finishing the same work in 8.50 GiB where the clean run
+ * reported 18.88 GiB -- a config that fits in 8.5 GiB does not need 19.
+ *
+ * A bump arena, reset once per layer, replaces those transient blocks with one
+ * long-lived region.
+ *
+ * CONTRACT -- read before adding a call:
+ *   1. NOT THREAD SAFE. Only call arena_alloc/afloat from single-threaded code.
+ *      Buffers allocated INSIDE an `omp parallel` region are per-thread and must
+ *      keep using malloc; a first version of this change converted them too and
+ *      concurrent threads got overlapping memory (fixtures fell 24/24 -> 8/24).
+ *   2. Lifetime ends at the next arena_reset(), which runs per layer in
+ *      step_raw(). Anything that must survive the layer boundary (x, nrm, tmp,
+ *      weights, KV) stays malloc'd.
+ */
+typedef struct {
+    char  *base;
+    size_t cap, used, peak;
+} Arena;
+
+static Arena g_arena;
+
+static void arena_reset(void) { g_arena.used = 0; }
+
+static void *arena_alloc(size_t bytes) {
+    bytes = (bytes + 63) & ~(size_t)63;              /* 64B aligned */
+    if (g_arena.used + bytes > g_arena.cap) {
+        /* Grow to cover this layer, then never again for this S. The old region
+         * may still hold live pointers from the current layer, so it is retained
+         * rather than freed; growth happens a handful of times at startup. */
+        size_t want = (g_arena.used + bytes) * 2;
+        char *nb = (char*)malloc(want);
+        if (!nb) { fprintf(stderr, "OOM arena (%.2f GB)\n", want/1e9); exit(1); }
+        g_arena.base = nb; g_arena.cap = want; g_arena.used = 0;
+    }
+    void *p = g_arena.base + g_arena.used;
+    g_arena.used += bytes;
+    if (g_arena.used > g_arena.peak) g_arena.peak = g_arena.used;
+    return p;
+}
+
+static float *afloat(int64_t n) {
+    return (float*)arena_alloc((size_t)n * sizeof(float));
+}
+
 static float *falloc(int64_t n) {
     float *p = malloc((size_t)n*sizeof(float));
     if (!p) { fprintf(stderr, "OOM %lld floats\n", (long long)n); exit(1); }
@@ -1103,10 +1154,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     int lt = c->slide[li] ? LG_SLIDE : LG_FULL, rot = c->rope[lt].rot_dim;
     int qdim = H*hd, kvdim = KV*hd, group = H/KV;
     int kvcap = m->kvcap[li];
-    float *q  = falloc((int64_t)S*qdim);
-    float *k  = falloc((int64_t)S*kvdim);
-    float *vv = falloc((int64_t)S*kvdim);
-    float *gt = falloc((int64_t)S*H);
+    /* arena: single-threaded, dead at this layer's arena_reset() */
+    float *q  = afloat((int64_t)S*qdim);
+    float *k  = afloat((int64_t)S*kvdim);
+    float *vv = afloat((int64_t)S*kvdim);
+    float *gt = afloat((int64_t)S*H);
     matmul_w(q,  x, l->q, S, D, qdim);
     matmul_w(k,  x, l->k, S, D, kvdim);
     matmul_w(vv, x, l->v, S, D, kvdim);
@@ -1137,7 +1189,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * Silent, too — no crash, just attention built from future keys. Same
      * hazard and same resolution as upstream PR #830 for inkling.c. */
     float scale = 1.f / sqrtf((float)hd);
-    float *ctx = falloc((int64_t)S*qdim);
+    float *ctx = afloat((int64_t)S*qdim);
     /* ROUND 6+7 (docs/oq-optimization-rounds.md): tile the score loop over a
      * block of QUERIES per KV head, with a CHUNKED online softmax.
      *
@@ -1260,7 +1312,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         }
     }
     matmul_w(out, ctx, l->o, S, qdim, D);
-    free(q); free(k); free(vv); free(gt); free(ctx);
+    /* q/k/vv/gt/ctx are arena-owned; reclaimed by arena_reset() per layer */
 }
 
 /* ---------- dense MLP (layer 0) ---------- */
@@ -1291,14 +1343,15 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int D = c->hidden, E = c->n_experts, K = c->topk, I = c->moe_inter;
-    float *logits = falloc((int64_t)S*E);
+    /* arena: all single-threaded, all dead at this layer's arena_reset() */
+    float *logits = afloat((int64_t)S*E);
     matmul(logits, x, l->router, S, D, E);
     memset(out, 0, (size_t)S*D*sizeof(float));
-    int   *idx = malloc((size_t)S*K*sizeof(int));
-    float *wgt = malloc((size_t)S*K*sizeof(float));
-    float *choice = falloc(E);
-    Slot **use  = malloc((size_t)S*K*sizeof(Slot*));
-    Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
+    int   *idx = (int*)arena_alloc((size_t)S*K*sizeof(int));
+    float *wgt = afloat((int64_t)S*K);
+    float *choice = afloat(E);
+    Slot **use  = (Slot**)arena_alloc((size_t)S*K*sizeof(Slot*));
+    Slot **fill = (Slot**)arena_alloc((size_t)S*K*sizeof(Slot*));
 
     for (int s = 0; s < S; s++) {
         float *lg = logits + (int64_t)s*E;
@@ -1315,7 +1368,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
 
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
-    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+    float *g = afloat(I), *u = afloat(I), *hh = afloat(D);
     int64_t npair = (int64_t)S*K;
     int64_t *visit = NULL;         /* streaming visit order; NULL on the resident path */
 
@@ -1324,15 +1377,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * and no IO: gather each expert's tokens, run three UDOT GEMMs, scatter.
      * One pass over the experts that this batch actually touched. */
     if (m->resident) {
-        int64_t *vis = malloc((size_t)npair * sizeof(int64_t));
-        int *cnt = calloc((size_t)E + 1, sizeof(int));
-        if (!vis || !cnt) { fprintf(stderr, "OOM moe resident\n"); exit(1); }
+        int64_t *vis = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
+        int *cnt = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
+        memset(cnt, 0, (size_t)(E + 1) * sizeof(int));
         for (int64_t t = 0; t < npair; t++) cnt[idx[t] + 1]++;
         for (int e = 0; e < E; e++) cnt[e+1] += cnt[e];
-        int *estart = malloc((size_t)(E + 1) * sizeof(int));
+        int *estart = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
         memcpy(estart, cnt, (size_t)(E + 1) * sizeof(int));
         for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
-        free(cnt);
 
         double te = now_s();
         #pragma omp parallel
@@ -1384,8 +1436,6 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
         m->t_expert += now_s() - te;
         m->hits += npair;
-        free(vis); free(estart);
-        free(g); free(u); free(hh);
         visit = NULL;              /* streaming path never allocated it here */
         goto moe_shared;
     }
@@ -1403,8 +1453,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * once per layer per call: all of its tokens are consumed while it is
      * resident. Pure scheduling change -- the arithmetic per pair, and the
      * `cap`-sized eviction safety property, are untouched. */
-    visit = malloc((size_t)npair * sizeof(int64_t));
-    if (!visit) { fprintf(stderr, "OOM moe visit order\n"); exit(1); }
+    visit = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
     {   /* counting sort over expert id: O(npair + E), no comparator */
         int *cnt = calloc((size_t)E + 1, sizeof(int));
         if (!cnt) { fprintf(stderr, "OOM moe counting sort\n"); exit(1); }
@@ -1461,9 +1510,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
          * already-parallel caller would serialize anyway. */
         int npair_c = (int)(end - base);
         /* order the pairs by slot so each expert's tokens are contiguous */
-        int *ord = malloc((size_t)npair_c * sizeof(int));
-        int *estart = malloc((size_t)(npair_c + 1) * sizeof(int));
-        if (!ord || !estart) { fprintf(stderr, "OOM moe grouping\n"); exit(1); }
+        int *ord = (int*)arena_alloc((size_t)npair_c * sizeof(int));
+        int *estart = (int*)arena_alloc((size_t)(npair_c + 1) * sizeof(int));
         for (int i = 0; i < npair_c; i++) ord[i] = i;
         /* insertion sort by slot pointer: npair_c <= cap (a few hundred) and the
          * list is already clustered, so this beats pulling in a qsort callback */
@@ -1484,7 +1532,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         /* One result row per pair in this chunk. npair_c <= cap (a few hundred),
          * so this is ~1 MB and lets the scatter run serially afterwards -- no
          * atomics and no per-thread copy of out[]. */
-        float *res = falloc((int64_t)npair_c * D);
+        float *res = afloat((int64_t)npair_c * D);
         #pragma omp parallel if(par)
         {
             /* scratch sized for the largest group seen by this thread */
@@ -1541,26 +1589,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             float *os = out + (int64_t)s*D, *hr = res + (int64_t)i*D;
             for (int d = 0; d < D; d++) os[d] += sc * hr[d];
         }
-        free(res); free(ord); free(estart);
+        /* res/ord/estart are arena-owned */
         m->t_expert += now_s() - te;
     }
-    free(g); free(u); free(hh);
+    /* g/u/hh are arena-owned */
 
 moe_shared:
     /* shared expert: every token, unscaled, added on top of the routed sum */
     { double ts = now_s();
     int SI = c->shared_inter;
-    float *sg = falloc((int64_t)S*SI), *su = falloc((int64_t)S*SI), *sd = falloc((int64_t)S*D);
+    float *sg = afloat((int64_t)S*SI), *su = afloat((int64_t)S*SI), *sd = afloat((int64_t)S*D);
     matmul_w(sg, x, l->sh_g, S, D, SI);
     matmul_w(su, x, l->sh_u, S, D, SI);
     for (int64_t i = 0; i < (int64_t)S*SI; i++) sg[i] = siluf(sg[i]) * su[i];
     matmul_w(sd, sg, l->sh_d, S, SI, D);
     for (int64_t i = 0; i < (int64_t)S*D; i++) out[i] += sd[i];
-    free(sg); free(su); free(sd);
+    /* sg/su/sd are arena-owned */
     m->t_shared += now_s() - ts; }
 
-    free(visit);
-    free(logits); free(idx); free(wgt); free(choice); free(use); free(fill);
+    /* logits/idx/wgt/choice/use/fill/visit are arena-owned (arena_reset per layer) */
 }
 
 /* ---------- one forward pass over S new tokens ----------
@@ -1586,6 +1633,10 @@ static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
+        /* Arena scratch from the previous layer is dead once its residual has
+         * been added, so one reset per layer caps the high-water mark at a single
+         * layer's scratch. x/nrm/tmp outlive the loop and stay malloc'd. */
+        arena_reset();
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         double ta = now_s();
         attention(m, l, i, nrm, S, pos0, tmp);

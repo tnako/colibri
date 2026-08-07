@@ -126,7 +126,7 @@ that none of this work reduced.
 ## Current recommended configurations
 
 ```
-# lowest memory on SHORT prompts (CAP is only effective there -- see above)
+# lowest memory: 10.9 GB at 6144 tokens
 CAP=8 ./c/laguna_xs_metal ...
 
 # fastest prefill, needs ~18 GiB
@@ -136,9 +136,9 @@ LAGUNA_RESIDENT=1 ./c/laguna_xs_metal ...
 ./c/laguna_xs ...
 ```
 
-At 6144 tokens every streaming configuration lands near 19 GiB regardless of
-`CAP`, so there is currently no long-context configuration that fits a ~13 GiB
-budget. That is an open problem, not a solved one.
+At 6144 tokens, before the arena fix below, every streaming configuration landed
+near 19 GiB regardless of `CAP`. After it, CAP works as expected and the default
+long-context config fits in ~13 GiB (CAP=8 -> 10.9 GB, CAP=48 -> 12.9 GB).
 
 ### Diagnosed: most of that footprint is heap fragmentation, not working set
 
@@ -161,12 +161,37 @@ MALLOC_LARGE (empty) 730.6M
 churns thousands of large transient allocations. The allocator neither coalesces
 nor returns them, and 7.4 GB ends up swapped.
 
-The fix is a bump arena reset per layer, replacing the transient mallocs. **A
-first attempt was written and reverted**: converting the allocations mechanically
-broke the fixtures (24/24 -> 8/24) because some buffers stay live across the
-layer boundary the reset assumes. Lifetime analysis has to be done per buffer by
-hand, which is the actual remaining work. Reverting was cheap; shipping a
-plausible-looking wrong answer would not have been.
+### Fixed: bump arena, reset per layer
+
+`arena_alloc`/`afloat` in `laguna_common.h`. The ~26 transient S-sized buffers in
+`attention()` and `moe()` now come from one long-lived region that is reset (not
+freed) at each layer boundary in `step_raw()`.
+
+Result at 6144 tokens, CAP=48, same binary otherwise:
+
+| | before | after |
+|---|---|---|
+| peak RSS | 18.88 GiB | **12.89 GiB** (-32%) |
+| prefill | 249.6 s | 253.1 s (noise) |
+| `swapped_out` | 7.4 GB | **0** |
+| `MALLOC_LARGE (empty)` | 730 MB | **gone** |
+
+**6 GB reclaimed at no cost in speed**, and the process no longer swaps at all,
+which is the more important part: swapping was making long-context runs
+unpredictable. `CAP` also becomes a real lever again now that swap noise is gone
+(CAP=8 -> 10.9 GB, CAP=48 -> 12.9 GB).
+
+The remaining `MALLOC_SMALL` (7.4 GB / 1907 regions) is the f32 expert cache
+itself, not scratch -- it is now fully resident rather than half swapped out.
+
+Two attempts were needed. The first converted the allocations mechanically with a
+regex and broke the fixtures (24/24 -> 8/24), because `accum`/`sbuf`/`qt` in
+`attention()` are allocated INSIDE an `omp parallel` region: they are per-thread,
+and a non-thread-safe bump allocator handed overlapping memory to concurrent
+threads. That attempt was reverted rather than patched over. The second pass
+converted only function-scope, single-threaded buffers, verifying the fixtures
+after attention() and again after moe(), and left the per-thread ones on malloc.
+The arena's doc comment now states both rules so the trap is not re-entered.
 
 ## Correctness
 
