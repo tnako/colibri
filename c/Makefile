@@ -717,11 +717,14 @@ LG_METAL_LD = -framework Metal -framework MetalPerformanceShaders -framework Fou
 laguna_metal.o: laguna_metal.mm laguna_metal.h
 	$(CXX) -x objective-c++ -std=gnu++17 -fobjc-arc -O3 $(LG_ARCH) -c laguna_metal.mm -o laguna_metal.o
 
-laguna_xs_metal$(EXE): laguna_xs.c laguna_common.h oq.h q8r.h laguna_metal.h laguna_metal.o
-	$(CC) $(CFLAGS) $(LG_ARCH) -DLAGUNA_METAL laguna_xs.c laguna_metal.o -o laguna_xs_metal$(EXE) $(LDFLAGS) $(LG_METAL_LD)
+laguna_attn_metal.o: laguna_attn_metal.mm laguna_metal.h
+	$(CXX) -x objective-c++ -std=gnu++17 -fobjc-arc -O3 $(LG_ARCH) -c laguna_attn_metal.mm -o laguna_attn_metal.o
 
-laguna_s_metal$(EXE): laguna_s.c laguna_common.h oq.h q8r.h laguna_metal.h laguna_metal.o
-	$(CC) $(CFLAGS) $(LG_ARCH) -DLAGUNA_METAL laguna_s.c laguna_metal.o -o laguna_s_metal$(EXE) $(LDFLAGS) $(LG_METAL_LD)
+laguna_xs_metal$(EXE): laguna_xs.c laguna_common.h oq.h q8r.h kv_i8.h laguna_metal.h laguna_metal.o laguna_attn_metal.o
+	$(CC) $(CFLAGS) $(LG_ARCH) -DLAGUNA_METAL laguna_xs.c laguna_metal.o laguna_attn_metal.o -o laguna_xs_metal$(EXE) $(LDFLAGS) $(LG_METAL_LD)
+
+laguna_s_metal$(EXE): laguna_s.c laguna_common.h oq.h q8r.h kv_i8.h laguna_metal.h laguna_metal.o laguna_attn_metal.o
+	$(CC) $(CFLAGS) $(LG_ARCH) -DLAGUNA_METAL laguna_s.c laguna_metal.o laguna_attn_metal.o -o laguna_s_metal$(EXE) $(LDFLAGS) $(LG_METAL_LD)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
 # kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But

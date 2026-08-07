@@ -160,6 +160,7 @@ typedef struct {
     int  gpu_experts;
     double mem_budget, mem_used;
     int ctx_hint;                  /* max context, for KV headroom accounting */
+    int gpu_attn, gpu_attn_cap;    /* GPU flash attention for full layers      */
     OQMap oq;                      /* per-tensor bits/group_size from config */
     int   oq_tensors;              /* weights read oQ-packed                 */
     Wt embed, lm_head;
@@ -1119,9 +1120,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      *   2. resident Q8R expert bank  -- removes all expert disk IO
      *   3. GPU f16 expert bank       -- most memory-hungry, takes the remainder
      * Default 20 GB: what a 32 GB machine gives up without swapping. */
-    if (m->experts == EXP_OQ) {
+    {
         const char *mg = getenv("LAGUNA_MEM_GB");
         m->mem_budget = (mg ? atof(mg) : 20.0) * 1e9;
+        const char *cm = getenv("CTX_MAX");
+        m->ctx_hint = cm ? atoi(cm) : 8192;
+    }
+    if (m->experts == EXP_OQ) {
         {
             /* packed codes at the checkpoint's own bit width + f32 scale/bias/rsum
              * per group. Measured, not guessed: one-byte-per-code would be 31 GB. */
@@ -1148,6 +1153,26 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 
 #ifdef LAGUNA_METAL
     load_gpu_weights(m);
+    /* GPU flash attention for the full-attention layers. Sized to the context the
+     * user asked for (CTX_MAX), because the f16 K/V for those layers is the one
+     * GPU allocation that scales with context: 10 full layers x 8 kv x hd=128 is
+     * 0.31 GiB at 8k and 10.0 GiB at 256k. Charged against the same budget as
+     * everything else, and simply not enabled if it does not fit. */
+    if (lg_metal_available()) {
+        int nfull = 0;
+        for (int i = 0; i < c->n_layers; i++) if (!c->slide[i]) nfull++;
+        int cap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
+        double need = (double)nfull * c->n_kv * cap * c->head_dim * 2 * 2;
+        if (need <= m->mem_budget - m->mem_used) {
+            m->gpu_attn = 1; m->gpu_attn_cap = cap;
+            m->mem_used += need;
+            fprintf(stderr, "[metal] flash attention on %d full layers, ctx %d (%.2f GB)\n",
+                    nfull, cap, need/1e9);
+        } else {
+            fprintf(stderr, "[metal] flash attention needs %.2f GB, budget has %.2f -> CPU\n",
+                    need/1e9, (m->mem_budget - m->mem_used)/1e9);
+        }
+    }
     if (m->resident) load_gpu_experts(m);   /* needs the Q8R bank as its source */
 #endif
 
@@ -1313,6 +1338,24 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * scratch stops growing with prompt length. */
     #define LG_QB 8
     #define LG_KC 64
+
+#ifdef LAGUNA_METAL
+    /* ---- GPU path, full-attention layers only (LAGUNA-FORK) -----------------
+     * These layers are O(S^2) and were 90.7% of the attention work at 30k
+     * context (110 of 122 TFLOP), running at ~145 GFLOP/s on the CPU. Sliding
+     * layers are O(S*window) and stay on the CPU, where they are already cheap.
+     *
+     * The GPU keeps its own f16 K/V for these layers, appended once per chunk,
+     * so keys are uploaded once rather than re-read per query. Falls through to
+     * the CPU path on any failure (no device, context beyond the allocation),
+     * which is why the CPU KV append below still runs unconditionally. */
+    if (!c->slide[li] && m->gpu_attn &&
+        lg_metal_attn_alloc(c->n_layers, li, KV, m->gpu_attn_cap, hd)) {
+        lg_metal_attn_append(li, pos0, S, k, vv, kvdim);
+        if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale))
+            goto attn_out;   /* the output gate is applied by scatter_o */
+    }
+#endif
     #pragma omp parallel
     {
         float mx[LG_QB], den[LG_QB];
@@ -1420,6 +1463,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     }
     #undef LG_QB
     #undef LG_KC
+attn_out:
     /* Append now that every query has been scored. Sliding layers skip the rows
      * this same batch would immediately overwrite: a skipped row is at position
      * < (pos0+S) - window, and no later query ever attends earlier than

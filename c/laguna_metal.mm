@@ -56,6 +56,10 @@ int lg_metal_init(void) {
 
 int lg_metal_available(void) { return g_ok; }
 
+/* Shared with laguna_attn_metal.mm: one device and one queue for the process. */
+id<MTLDevice>       lg_metal_device(void) { return g_dev; }
+id<MTLCommandQueue> lg_metal_queue(void)  { return g_q; }
+
 const char *lg_metal_name(void) {
     return g_ok ? [[g_dev name] UTF8String] : "none";
 }

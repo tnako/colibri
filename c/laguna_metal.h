@@ -28,6 +28,17 @@ int    lg_metal_gemm(void *handle, float *y, const float *x, int S);
 int    lg_metal_gemm_rows(void *handle, float *y, const float *x, int S,
                           int row0, int nrows);
 
+/* ---- GPU flash attention (full-attention layers only) --------------------
+ * Persistent per-layer f16 K/V on the GPU; append per chunk, one dispatch per
+ * (layer, chunk) does scores + softmax + PV without materializing the score
+ * matrix. All return 0 / do nothing when Metal is unavailable. */
+int    lg_metal_attn_alloc(int layers, int layer, int kv, int ctxcap, int hd);
+void   lg_metal_attn_append(int layer, int pos0, int S, const float *k,
+                            const float *vv, int kvdim);
+int    lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
+                     int S, int pos0, int H, int KV, int hd, float scale);
+size_t lg_metal_attn_bytes(int layer);
+
 #ifdef __cplusplus
 }
 #endif
