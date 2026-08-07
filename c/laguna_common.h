@@ -185,6 +185,18 @@ typedef struct {
     int8_t **K, **V; float **Ks, **Vs; int *kvcap; int kv_len, max_t;
 } Model;
 
+/* Page-aligned, page-rounded allocation. newBufferWithBytesNoCopy requires both,
+ * and returns nil otherwise -- so the KV cache is allocated this way to let the
+ * GPU read it in place instead of keeping a second f16 copy. */
+static void *kv_aligned(size_t bytes) {
+    size_t pg = 16384;
+    size_t len = (bytes + pg - 1) & ~(pg - 1);
+    void *p = NULL;
+    if (posix_memalign(&p, pg, len) != 0) return NULL;
+    memset(p, 0, len);
+    return p;
+}
+
 /* ---------- utility ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
 #if defined(__APPLE__)
@@ -1111,17 +1123,22 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * outranks the expert cache. Capped at half the budget so it can never
      * starve everything else. */
     if (lg_metal_init()) {
+        /* The GPU binds the int8 KV cache in place (lg_metal_attn_bind), so there
+         * is no per-context GPU allocation to reserve any more -- only the f16
+         * staging for the band actually scored, which is O(band) and independent
+         * of context. This used to reserve a full f16 copy: 14.24 GB at 262144 on
+         * Laguna-S, over half the budget, so it was declined and those layers ran
+         * on the CPU. That was the last thing blocking 256k on the GPU. */
         int gcap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
         int nfull = 0, nslide = 0;
         for (int i = 0; i < c->n_layers; i++) { if (c->slide[i]) nslide++; else nfull++; }
-        int sring = 2 * (c->window + LG_CHUNK);
-        if (sring > gcap) sring = gcap;
-        double need = ((double)nfull * gcap + (double)nslide * sring)
-                    * c->n_kv * c->head_dim * 2 * 2;
-        if (need <= m->mem_budget * 0.5 && need <= m->mem_budget - m->mem_used) {
+        /* band = window + chunk for sliding, chunk-limited for full; f16, K and V */
+        double band = (double)(c->window + LG_CHUNK);
+        double need = band * c->n_kv * c->head_dim * 2 * 2;
+        if (need <= m->mem_budget - m->mem_used) {
             m->gpu_attn = 1; m->gpu_attn_cap = gcap;
             m->mem_used += need;
-            fprintf(stderr, "[mem] gpu attention %.2f GB (%d full + %d sliding, ctx %d)\n",
+            fprintf(stderr, "[mem] gpu attention %.2f GB staging (%d full + %d sliding, ctx %d, KV bound in place)\n",
                     need/1e9, nfull, nslide, gcap);
         } else {
             fprintf(stderr, "[mem] gpu attention needs %.2f GB, not affordable -> CPU\n",
@@ -1376,6 +1393,27 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     #define LG_QB 8
     #define LG_KC 64
 
+    /* APPEND FIRST (LAGUNA-FORK). The GPU path now reads this int8 cache in
+     * place rather than a separate f16 copy, so this chunk's own K/V must be in
+     * it before scoring. The CPU kernels below tolerate either order because
+     * they read k/vv directly for the current chunk, but the GPU does not.
+     *
+     * Sliding layers still skip rows this same batch would overwrite: such a row
+     * is at position < (pos0+S) - window, and no later query attends earlier than
+     * (pos0+S) - window + 1, so it is dead on arrival. */
+    {
+        int s0 = 0;
+        if (c->slide[li] && S > kvcap) s0 = S - kvcap;
+        for (int s = s0; s < S; s++) {
+            int pos = pos0 + s, slot = c->slide[li] ? pos % kvcap : pos;
+            for (int h = 0; h < KV; h++) {
+                int64_t r = (int64_t)h*kvcap + slot;
+                kv_i8_pack(m->K[li] + r*hd, &m->Ks[li][r], k  + (int64_t)s*kvdim + h*hd, hd);
+                kv_i8_pack(m->V[li] + r*hd, &m->Vs[li][r], vv + (int64_t)s*kvdim + h*hd, hd);
+            }
+        }
+    }
+
 #ifdef LAGUNA_METAL
     /* ---- GPU path, full-attention layers only (LAGUNA-FORK) -----------------
      * These layers are O(S^2) and were 90.7% of the attention work at 30k
@@ -1398,10 +1436,15 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * band is 767 of 6000 and the GPU wins (32.2 -> 21.8 s). The crossover sits
      * near 4x the window, which is where the band stops being most of the row. */
     int gpu_ok = m->gpu_attn && (!c->slide[li] || pos0 + S >= 4 * c->window);
+    /* Bind the int8 cache for this layer. Nothing is copied and nothing is
+     * appended: the CPU already wrote these rows, and the GPU reads the same
+     * pages. The append must have happened before scoring, which it has -- see
+     * the note above the append site below. */
+    int64_t kvrows = (int64_t)KV * m->kvcap[li];
     if (gpu_ok &&
-        lg_metal_attn_alloc(c->n_layers, li, KV, m->gpu_attn_cap, hd,
-                            c->slide[li] ? c->window + LG_CHUNK : 0)) {
-        lg_metal_attn_append(li, pos0, S, k, vv, kvdim);
+        lg_metal_attn_bind(c->n_layers, li, KV, m->kvcap[li], hd,
+                           m->K[li], m->V[li], m->Ks[li], m->Vs[li],
+                           (size_t)kvrows * hd, (size_t)kvrows * sizeof(float))) {
         int win = c->slide[li] ? c->window : 0;
         if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale, win))
             goto attn_out;   /* the output gate is applied by scatter_o */
@@ -1517,20 +1560,6 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
 #ifdef LAGUNA_METAL
 attn_out: ;   /* empty statement: a label must precede a statement, not a decl */
 #endif
-    /* Append now that every query has been scored. Sliding layers skip the rows
-     * this same batch would immediately overwrite: a skipped row is at position
-     * < (pos0+S) - window, and no later query ever attends earlier than
-     * (pos0+S) - window + 1, so it is dead on arrival. */
-    int s0 = 0;
-    if (c->slide[li] && S > kvcap) s0 = S - kvcap;
-    for (int s = s0; s < S; s++) {
-        int pos = pos0 + s, slot = c->slide[li] ? pos % kvcap : pos;
-        for (int h = 0; h < KV; h++) {
-            int64_t r = (int64_t)h*kvcap + slot;
-            kv_i8_pack(m->K[li] + r*hd, &m->Ks[li][r], k  + (int64_t)s*kvdim + h*hd, hd);
-            kv_i8_pack(m->V[li] + r*hd, &m->Vs[li][r], vv + (int64_t)s*kvdim + h*hd, hd);
-        }
-    }
     matmul_w(out, ctx, l->o, S, qdim, D);
     /* q/k/vv/gt/ctx are arena-owned; reclaimed by arena_reset() per layer */
 }
@@ -2044,11 +2073,19 @@ static void kv_alloc(Model *m, int max_t) {
         int cap = (c->slide[i] && c->window > 0 && c->window < max_t) ? c->window : max_t;
         m->kvcap[i] = cap;
         int64_t nrow = (int64_t)c->n_kv * cap;
-        m->K[i]  = malloc((size_t)nrow * c->head_dim);
-        m->V[i]  = malloc((size_t)nrow * c->head_dim);
-        m->Ks[i] = falloc(nrow);
-        m->Vs[i] = falloc(nrow);
-        if (!m->K[i] || !m->V[i]) { fprintf(stderr, "OOM kv cache\n"); exit(1); }
+        /* PAGE ALIGNED (LAGUNA-FORK): these four buffers are handed straight to
+         * Metal with newBufferWithBytesNoCopy, so the GPU attention kernel reads
+         * the very same int8 cache the CPU maintains. That removes the separate
+         * f16 GPU copy entirely -- 14.24 GB at 262144 context on Laguna-S, which
+         * was more than half the budget and forced a CPU fallback.
+         * newBufferWithBytesNoCopy requires page-aligned base and length. */
+        m->K[i]  = kv_aligned((size_t)nrow * c->head_dim);
+        m->V[i]  = kv_aligned((size_t)nrow * c->head_dim);
+        m->Ks[i] = (float*)kv_aligned((size_t)nrow * sizeof(float));
+        m->Vs[i] = (float*)kv_aligned((size_t)nrow * sizeof(float));
+        if (!m->K[i] || !m->V[i] || !m->Ks[i] || !m->Vs[i]) {
+            fprintf(stderr, "OOM kv cache\n"); exit(1);
+        }
     }
 }
 

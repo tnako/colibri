@@ -83,6 +83,23 @@ kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
     for (int t = int(lane); t < nkey; t += int(W)) r[t] = half(float(r[t]) * inv);
 }
 
+/* Dequantize a [nkey, hd] band of one kv head from the int8 cache into f16.
+ * w = code * scale, one scale per row (kv_i8.h). This is the only place the GPU
+ * touches the cache, and it reads it in place -- no upload. */
+kernel void deq_kv(device const char*   C   [[buffer(0)]],
+                   device const float*  SC  [[buffer(1)]],
+                   device half*         O   [[buffer(2)]],
+                   constant int&        k0  [[buffer(3)]],
+                   constant int&        n   [[buffer(4)]],
+                   constant int&        hd  [[buffer(5)]],
+                   constant int&        base[[buffer(6)]],
+                   uint2 gid [[thread_position_in_grid]]) {
+    int r = int(gid.y), d = int(gid.x);
+    if (r >= n || d >= hd) return;
+    long src = (long)(base + k0 + r);
+    O[(long)r*hd + d] = (half)(float(C[src*hd + d]) * SC[src]);
+}
+
 /* f32 -> f16 copy of one query head's rows, into a [S, hd] contiguous tile. */
 kernel void gather_q(device const float* Q  [[buffer(0)]],
                      device half*        QT [[buffer(1)]],
@@ -115,9 +132,12 @@ kernel void scatter_o(device const half*  OT [[buffer(0)]],
 )";
 
 typedef struct {
-    void *K, *V;          /* CFBridgingRetain'd MTLBuffer, f16 [KV][phys][hd] */
+    void *K, *V;          /* int8 codes  [KV][ctxcap][hd], bound zero-copy */
+    void *Ks, *Vs;        /* f32 scales  [KV][ctxcap],     bound zero-copy */
+    void *kf, *vf;        /* f16 staging for the band actually scored      */
+    size_t kflen;
     int kv, ctxcap, hd;
-    int ring;             /* 0 = linear (full layers); else rows before wrap    */
+    int ring;             /* kept for the sliding path; 0 = linear         */
 } AttnLayer;
 
 /* A sliding layer only ever reads the last `window` positions, so its GPU cache
@@ -134,7 +154,7 @@ typedef struct {
  * 15572 GFLOP/s on this device against ~81 GFLOP/s for a hand-written
  * one-thread-per-query kernel (the first version of this file). Only the softmax
  * and the gather/scatter need custom shaders. */
-static void *g_pipe_sm = NULL, *g_pipe_gq = NULL, *g_pipe_so = NULL;
+static void *g_pipe_sm = NULL, *g_pipe_gq = NULL, *g_pipe_so = NULL, *g_pipe_dq = NULL;
 static void *g_qt = NULL, *g_sc = NULL, *g_ot = NULL;
 static size_t g_qtcap = 0, g_sccap = 0, g_otcap = 0;
 
@@ -194,57 +214,55 @@ static int attn_pipeline(void) {
     id<MTLComputePipelineState> gq = mk_pipe(lib, "gather_q");
     id<MTLComputePipelineState> so = mk_pipe(lib, "scatter_o");
     if (!sm || !gq || !so) return 0;
+    id<MTLComputePipelineState> dq = mk_pipe(lib, "deq_kv");
+    if (!dq) return 0;
+    g_pipe_dq = (void*)CFBridgingRetain(dq);
     g_pipe_sm = (void*)CFBridgingRetain(sm);
     g_pipe_gq = (void*)CFBridgingRetain(gq);
     g_pipe_so = (void*)CFBridgingRetain(so);
     return 1;
 }
 
-int lg_metal_attn_alloc(int layers, int layer, int kv, int ctxcap, int hd, int ring) {
+/* ZERO-COPY BIND (LAGUNA-FORK).
+ *
+ * The engine already maintains an int8 KV cache with one f32 scale per row
+ * (kv_i8.h). Previously this file kept a SECOND copy in f16 on the GPU, which at
+ * 262144 context on Laguna-S was 14.24 GB -- more than half the whole budget, so
+ * the allocation was declined and those layers fell back to the CPU.
+ *
+ * Instead of uploading tiles of a duplicate, bind the cache itself: it is
+ * page-aligned (see kv_aligned) and unified memory means the GPU reads the very
+ * same bytes the CPU wrote. GPU K/V allocation becomes ZERO, the per-chunk append
+ * disappears, and there is one source of truth for KV so the two paths cannot
+ * drift. The kernel dequantizes int8 -> f16 in the gather. */
+int lg_metal_attn_bind(int layers, int layer, int kv, int ctxcap, int hd,
+                       const void *kcodes, const void *vcodes,
+                       const float *kscale, const float *vscale, size_t code_bytes,
+                       size_t scale_bytes) {
     if (!lg_metal_device() || !attn_pipeline()) return 0;
     if (!g_al) { g_al = (AttnLayer*)calloc(layers, sizeof(AttnLayer)); g_al_n = layers; }
     if (layer < 0 || layer >= g_al_n) return 0;
     AttnLayer *L = &g_al[layer];
-    if (ring > 0 && ring >= ctxcap) ring = 0;      /* fits anyway: stay linear */
-    if (L->K && L->ctxcap >= ctxcap && L->ring == ring) return 1;
-    int phys = ring > 0 ? 2*ring : ctxcap;
-    size_t bytes = (size_t)kv * phys * hd * 2;
+    if (L->K) return 1;                       /* already bound */
     id<MTLDevice> d = lg_metal_device();
-    id<MTLBuffer> kb = [d newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> vb = [d newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    if (!kb || !vb) return 0;
-    if (L->K) CFRelease((CFTypeRef)L->K);
-    if (L->V) CFRelease((CFTypeRef)L->V);
-    L->K = (void*)CFBridgingRetain(kb);
-    L->V = (void*)CFBridgingRetain(vb);
-    L->kv = kv; L->ctxcap = ctxcap; L->hd = hd; L->ring = ring;
+    size_t cb = code_bytes  & ~(size_t)16383;
+    size_t sb = scale_bytes & ~(size_t)16383;
+    if (!cb || !sb) return 0;
+    id<MTLBuffer> kb = [d newBufferWithBytesNoCopy:(void*)kcodes length:cb
+                        options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> vb = [d newBufferWithBytesNoCopy:(void*)vcodes length:cb
+                        options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> ks = [d newBufferWithBytesNoCopy:(void*)kscale length:sb
+                        options:MTLResourceStorageModeShared deallocator:nil];
+    id<MTLBuffer> vs = [d newBufferWithBytesNoCopy:(void*)vscale length:sb
+                        options:MTLResourceStorageModeShared deallocator:nil];
+    if (!kb || !vb || !ks || !vs) return 0;
+    L->K  = (void*)CFBridgingRetain(kb);
+    L->V  = (void*)CFBridgingRetain(vb);
+    L->Ks = (void*)CFBridgingRetain(ks);
+    L->Vs = (void*)CFBridgingRetain(vs);
+    L->kv = kv; L->ctxcap = ctxcap; L->hd = hd; L->ring = 0;
     return 1;
-}
-
-/* Append this batch's rows. k/vv are f32 [S][kvdim] as attention() produces them. */
-void lg_metal_attn_append(int layer, int pos0, int S, const float *k, const float *vv,
-                          int kvdim) {
-    if (!g_al || layer < 0 || layer >= g_al_n) return;
-    AttnLayer *L = &g_al[layer];
-    if (!L->K) return;
-    __fp16 *kb = (__fp16*)[(__bridge id<MTLBuffer>)L->K contents];
-    __fp16 *vb = (__fp16*)[(__bridge id<MTLBuffer>)L->V contents];
-    int hd = L->hd;
-    int R = L->ring, phys = R > 0 ? 2*R : L->ctxcap;
-    for (int h = 0; h < L->kv; h++) {
-        for (int s = 0; s < S; s++) {
-            int t = pos0 + s;
-            if (R == 0 && t >= L->ctxcap) break;
-            const float *ks = k  + (int64_t)s*kvdim + (int64_t)h*hd;
-            const float *vs = vv + (int64_t)s*kvdim + (int64_t)h*hd;
-            int slot = R > 0 ? t % R : t;
-            for (int rep = 0; rep < (R > 0 ? 2 : 1); rep++) {
-                int64_t row = (int64_t)h*phys + slot + (int64_t)rep*R;
-                __fp16 *kd = kb + row*hd, *vd = vb + row*hd;
-                for (int d = 0; d < hd; d++) { kd[d] = (__fp16)ks[d]; vd[d] = (__fp16)vs[d]; }
-            }
-        }
-    }
 }
 
 /* One (layer, chunk) attention: per query head, QK^T then softmax then PV, with
@@ -266,6 +284,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
      * The cache is linear per kv head, so the band is a contiguous row range and
      * costs only an offset -- no gather. */
     int k0 = 0, nkey = pos0 + S;
+    if (nkey > L->ctxcap) return 0;
     if (window > 0) {
         k0 = pos0 - window + 1;
         if (k0 < 0) k0 = 0;
@@ -286,6 +305,12 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         if (!ensure(&qsrc, &qsc, (size_t)S*qdim*4)) return 0;
         if (!ensure(&odst, &odc, (size_t)S*qdim*4)) return 0;
         if (!ensure(&gsrc, &gsc, (size_t)S*H*4))    return 0;
+        /* f16 staging for the band of K and V actually scored this chunk. This is
+         * the ONLY GPU-side KV memory now: O(band), not O(context). */
+        /* All KV heads staged ONCE per chunk. Doing it inside the query-head loop
+          * dequantized each kv head `group` times over (6x on Laguna-S) and cost
+          * attention 22.2 -> 43.4 s at 262144 context. */
+        if (!ensure(&L->kf, &L->kflen, (size_t)KV*nkey*hd*2*2)) return 0;
         memcpy([(__bridge id<MTLBuffer>)qsrc contents], q,  (size_t)S*qdim*4);
         memcpy([(__bridge id<MTLBuffer>)gsrc contents], gt, (size_t)S*H*4);
 
@@ -319,11 +344,36 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         int win = window;
 
         id<MTLCommandBuffer> cb = [cq commandBuffer];
+        {   /* dequantize every kv head's band once: int8 cache -> f16, in place */
+            id<MTLComputeCommandEncoder> ed = [cb computeCommandEncoder];
+            [ed setComputePipelineState:(__bridge id<MTLComputePipelineState>)g_pipe_dq];
+            size_t kband = (size_t)nkey*hd*2;
+            for (int kh = 0; kh < KV; kh++) {
+                int kbase = kh * L->ctxcap;
+                [ed setBytes:&k0    length:4 atIndex:3];
+                [ed setBytes:&nkey  length:4 atIndex:4];
+                [ed setBytes:&hd    length:4 atIndex:5];
+                [ed setBytes:&kbase length:4 atIndex:6];
+                [ed setBuffer:(__bridge id<MTLBuffer>)L->K  offset:0 atIndex:0];
+                [ed setBuffer:(__bridge id<MTLBuffer>)L->Ks offset:0 atIndex:1];
+                [ed setBuffer:(__bridge id<MTLBuffer>)L->kf offset:(size_t)kh*kband atIndex:2];
+                [ed dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)nkey, 1)
+              threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
+                [ed setBuffer:(__bridge id<MTLBuffer>)L->V  offset:0 atIndex:0];
+                [ed setBuffer:(__bridge id<MTLBuffer>)L->Vs offset:0 atIndex:1];
+                [ed setBuffer:(__bridge id<MTLBuffer>)L->kf
+                       offset:(size_t)KV*kband + (size_t)kh*kband atIndex:2];
+                [ed dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)nkey, 1)
+              threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
+            }
+            [ed endEncoding];
+        }
         for (int hq = 0; hq < H; hq++) {
             int kh = hq / group, off = hq * hd;
-            int phys = L->ring > 0 ? 2*L->ring : L->ctxcap;
-            int kbase = L->ring > 0 ? (k0 % L->ring) : k0;
-            size_t koff = ((size_t)kh * phys + (size_t)kbase) * hd * 2;
+            id<MTLBuffer> KF = (__bridge id<MTLBuffer>)L->kf;
+            size_t kband = (size_t)nkey*hd*2;
+            size_t koff  = (size_t)kh * kband;              /* this head's K tile */
+            size_t voff  = (size_t)KV * kband + koff;       /* V tiles follow K   */
 
             id<MTLComputeCommandEncoder> e1 = [cb computeCommandEncoder];
             [e1 setComputePipelineState:pgq];
@@ -337,8 +387,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
             [e1 endEncoding];
 
             MPSMatrix *mq = [[MPSMatrix alloc] initWithBuffer:QT descriptor:dq];
-            MPSMatrix *mk = [[MPSMatrix alloc] initWithBuffer:(__bridge id<MTLBuffer>)L->K
-                                                      offset:koff descriptor:dk];
+            MPSMatrix *mk = [[MPSMatrix alloc] initWithBuffer:KF offset:koff descriptor:dk];
             MPSMatrix *ms = [[MPSMatrix alloc] initWithBuffer:SC descriptor:ds];
             [qk encodeToCommandBuffer:cb leftMatrix:mq rightMatrix:mk resultMatrix:ms];
 
@@ -353,8 +402,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             [e2 endEncoding];
 
-            MPSMatrix *mv = [[MPSMatrix alloc] initWithBuffer:(__bridge id<MTLBuffer>)L->V
-                                                      offset:koff descriptor:dv];
+            MPSMatrix *mv = [[MPSMatrix alloc] initWithBuffer:KF offset:voff descriptor:dv];
             MPSMatrix *mo = [[MPSMatrix alloc] initWithBuffer:OT descriptor:do_];
             [pv encodeToCommandBuffer:cb leftMatrix:ms rightMatrix:mv resultMatrix:mo];
 
