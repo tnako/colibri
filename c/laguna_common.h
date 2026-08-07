@@ -50,6 +50,7 @@
 #include "coli_moe_route.h"
 #include "oq.h"                   /* LAGUNA-FORK: oMLX oQ packed-weight kernels */
 #include "q8r.h"                  /* LAGUNA-FORK: UDOT-native resident format   */
+#include "kv_i8.h"                /* LAGUNA-FORK: int8 KV cache                 */
 #ifdef LAGUNA_METAL
 #include "laguna_metal.h"         /* LAGUNA-FORK: MPS f16 prefill GEMM          */
 #endif
@@ -171,8 +172,11 @@ typedef struct {
     /* rope tables, [pos][rot_dim], grown on demand, one pair per layer type */
     float *cos_t[2], *sin_t[2]; int rope_pos[2];
     /* KV cache: sliding layers keep only `window` slots (ring), full layers
-     * keep max_t. Laid out [kv_head][kvcap][head_dim]. */
-    float **K, **V; int *kvcap; int kv_len, max_t;
+     * keep max_t. Laid out [kv_head][kvcap][head_dim].
+     *
+     * int8 codes with one f32 scale per row (see kv_i8.h): 4x smaller than f32,
+     * which is what makes 256k context fit in a 20 GB budget. */
+    int8_t **K, **V; float **Ks, **Vs; int *kvcap; int kv_len, max_t;
 } Model;
 
 /* ---------- utility ---------- */
@@ -1315,16 +1319,25 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         float *accum = falloc((int64_t)LG_QB * hd);
         float *sbuf  = falloc((int64_t)LG_QB * LG_KC);
         float *qt    = falloc((int64_t)LG_QB * hd);   /* contiguous query tile */
+        float *kstage = falloc((int64_t)LG_KC * hd);  /* int8 KV -> f32, per chunk */
+        float *vstage = falloc((int64_t)LG_KC * hd);
         #pragma omp for collapse(2) schedule(static)
         for (int kh = 0; kh < KV; kh++) {
             for (int sb = 0; sb < S; sb += LG_QB) {
                 int nb = S - sb < LG_QB ? S - sb : LG_QB;
-                const float *Kh = m->K[li] + (int64_t)kh*kvcap*hd;
-                const float *Vh = m->V[li] + (int64_t)kh*kvcap*hd;
+                const int8_t *Kh = m->K[li] + (int64_t)kh*kvcap*hd;
+                const int8_t *Vh = m->V[li] + (int64_t)kh*kvcap*hd;
+                const float  *Kq = m->Ks[li] + (int64_t)kh*kvcap;
+                const float  *Vq = m->Vs[li] + (int64_t)kh*kvcap;
+                /* Cached rows are int8; stage each score chunk to f32 once so the
+                 * dot/axpy kernels below stay f32 and untouched. LG_KC rows is
+                 * 32 KB at hd=128, i.e. L1-resident, so the dequant is amortized
+                 * over all nb queries in the tile rather than done per query. */
                 #define LG_KROW(t) ((t) >= pos0 ? k  + (int64_t)((t)-pos0)*kvdim + kh*hd \
-                                                : Kh + (int64_t)(c->slide[li] ? (t) % kvcap : (t))*hd)
+                                                : kstage + (int64_t)((t) - tc)*hd)
                 #define LG_VROW(t) ((t) >= pos0 ? vv + (int64_t)((t)-pos0)*kvdim + kh*hd \
-                                                : Vh + (int64_t)(c->slide[li] ? (t) % kvcap : (t))*hd)
+                                                : vstage + (int64_t)((t) - tc)*hd)
+                #define LG_KSLOT(t) ((int64_t)(c->slide[li] ? (t) % kvcap : (t)))
                 for (int hq = kh*group; hq < (kh+1)*group; hq++) {
                     int hi = pos0 + sb + nb - 1;
                     int t0 = 0;
@@ -1342,6 +1355,16 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                                (size_t)hd*sizeof(float));
                     for (int tc = t0; tc <= hi; tc += LG_KC) {
                         int tn = hi - tc + 1; if (tn > LG_KC) tn = LG_KC;
+                        /* Dequantize the cached part of this chunk once. Rows at
+                         * t >= pos0 are this batch's own k/vv, still f32, and are
+                         * read directly by the macros. */
+                        for (int j = 0; j < tn; j++) {
+                            int t = tc + j;
+                            if (t >= pos0) break;
+                            int64_t sl = LG_KSLOT(t);
+                            kv_i8_unpack(kstage + (int64_t)j*hd, Kh + sl*hd, Kq[sl], hd);
+                            kv_i8_unpack(vstage + (int64_t)j*hd, Vh + sl*hd, Vq[sl], hd);
+                        }
                         for (int j = 0; j < tn; j++) {
                             const float *kv = LG_KROW(tc + j);
                             int t = tc + j;
@@ -1390,9 +1413,10 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 }
                 #undef LG_KROW
                 #undef LG_VROW
+                #undef LG_KSLOT
             }
         }
-        free(accum); free(sbuf); free(qt);
+        free(accum); free(sbuf); free(qt); free(kstage); free(vstage);
     }
     #undef LG_QB
     #undef LG_KC
@@ -1405,8 +1429,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     for (int s = s0; s < S; s++) {
         int pos = pos0 + s, slot = c->slide[li] ? pos % kvcap : pos;
         for (int h = 0; h < KV; h++) {
-            memcpy(m->K[li] + ((int64_t)h*kvcap + slot)*hd, k  + (int64_t)s*kvdim + h*hd, (size_t)hd*sizeof(float));
-            memcpy(m->V[li] + ((int64_t)h*kvcap + slot)*hd, vv + (int64_t)s*kvdim + h*hd, (size_t)hd*sizeof(float));
+            int64_t r = (int64_t)h*kvcap + slot;
+            kv_i8_pack(m->K[li] + r*hd, &m->Ks[li][r], k  + (int64_t)s*kvdim + h*hd, hd);
+            kv_i8_pack(m->V[li] + r*hd, &m->Vs[li][r], vv + (int64_t)s*kvdim + h*hd, hd);
         }
     }
     matmul_w(out, ctx, l->o, S, qdim, D);
@@ -1860,12 +1885,16 @@ static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
     if (m->K && max_t <= m->max_t) return;
     if (m->K) {
-        for (int i = 0; i < c->n_layers; i++) { free(m->K[i]); free(m->V[i]); }
-        free(m->K); free(m->V); free(m->kvcap);
+        for (int i = 0; i < c->n_layers; i++) {
+            free(m->K[i]); free(m->V[i]); free(m->Ks[i]); free(m->Vs[i]);
+        }
+        free(m->K); free(m->V); free(m->Ks); free(m->Vs); free(m->kvcap);
     }
     m->max_t = max_t; m->kv_len = 0;
-    m->K = calloc(c->n_layers, sizeof(float*));
-    m->V = calloc(c->n_layers, sizeof(float*));
+    m->K  = calloc(c->n_layers, sizeof(int8_t*));
+    m->V  = calloc(c->n_layers, sizeof(int8_t*));
+    m->Ks = calloc(c->n_layers, sizeof(float*));
+    m->Vs = calloc(c->n_layers, sizeof(float*));
     m->kvcap = calloc(c->n_layers, sizeof(int));
     for (int i = 0; i < c->n_layers; i++) {
         /* sliding layers only ever read the last `window` positions, so the
@@ -1873,8 +1902,12 @@ static void kv_alloc(Model *m, int max_t) {
          * attention() is what makes that safe during prefill (PR #830). */
         int cap = (c->slide[i] && c->window > 0 && c->window < max_t) ? c->window : max_t;
         m->kvcap[i] = cap;
-        m->K[i] = falloc((int64_t)c->n_kv * cap * c->head_dim);
-        m->V[i] = falloc((int64_t)c->n_kv * cap * c->head_dim);
+        int64_t nrow = (int64_t)c->n_kv * cap;
+        m->K[i]  = malloc((size_t)nrow * c->head_dim);
+        m->V[i]  = malloc((size_t)nrow * c->head_dim);
+        m->Ks[i] = falloc(nrow);
+        m->Vs[i] = falloc(nrow);
+        if (!m->K[i] || !m->V[i]) { fprintf(stderr, "OOM kv cache\n"); exit(1); }
     }
 }
 
