@@ -49,25 +49,39 @@ using namespace metal;
 
 struct ExpArgs {
     uint Kd, N, gs, bits;
-    uint rows;            /* rows for THIS expert            */
-    uint row0;            /* first row in the packed x buffer */
-    uint wwords;          /* uint32 words per weight row      */
-    uint ngroups;         /* groups per row = Kd/gs           */
+    uint rows;            /* max rows over all experts (grid sizing)   */
+    uint row0;            /* unused in grouped mode                    */
+    uint wwords;          /* uint32 words per weight row               */
+    uint ngroups;         /* groups per row = Kd/gs                    */
+    uint wslab;           /* bytes per expert in the weight tensor     */
+    uint sslab;           /* bytes per expert in scales/biases         */
 };
 
 static inline float deq(uint code, float s, float b) { return fma((float)code, s, b); }
 
 kernel void expert_gemm(device const float*    X    [[buffer(0)]],
                         device const uint*     W    [[buffer(1)]],
-                        device const ushort*   SB   [[buffer(2)]],  /* bf16 scale,bias */
+                        device const ushort*   SC   [[buffer(2)]],  /* bf16 scales */
+                        device const ushort*   BI   [[buffer(5)]],  /* bf16 biases */
                         device float*          Y    [[buffer(3)]],
                         constant ExpArgs&      a    [[buffer(4)]],
+                        device const uint*     OFF  [[buffer(6)]],  /* [E+1] row starts */
                         uint3 tg   [[threadgroup_position_in_grid]],
                         uint  sidx [[simdgroup_index_in_threadgroup]],
                         uint  lane [[thread_index_in_simdgroup]]) {
+    /* GROUPED: grid.z selects the expert, so ONE dispatch covers all of them and
+     * the GPU schedules every expert's threadgroups concurrently. Per-expert
+     * dispatches left the GPU idle (profile: 35330 samples in __psynch_cvwait). */
+    uint ex = tg.z;
+    uint xs = OFF[ex], xe = OFF[ex+1];
+    uint erows = xe - xs;
     uint r0 = tg.x * TM;
     uint n0 = tg.y * TN;
-    if (r0 >= a.rows || n0 >= a.N) return;
+    if (r0 >= erows || n0 >= a.N) return;
+    /* weight slab for this expert */
+    W  = (device const uint*)  ((device const uchar*)W  + (ulong)ex * a.wslab);
+    SC = (device const ushort*)((device const uchar*)SC + (ulong)ex * a.sslab);
+    BI = (device const ushort*)((device const uchar*)BI + (ulong)ex * a.sslab);
 
     /* f32 staging, deliberately. f16 staging measured 1479 vs 1125 GFLOP/s but
      * broke accuracy (max rel err 5.5e-2, 313/2560 values over 1e-3): expert
@@ -89,8 +103,8 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
         for (uint e = tid; e < TM*TK; e += NT) {
             uint rr = e / TK, kk = e % TK;
             uint gr = r0 + rr;
-            As[e] = (gr < a.rows && k0+kk < a.Kd)
-                  ? X[(ulong)(a.row0 + gr) * a.Kd + k0 + kk] : 0.0f;
+            As[e] = (gr < erows && k0+kk < a.Kd)
+                  ? X[(ulong)(xs + gr) * a.Kd + k0 + kk] : 0.0f;
         }
         /* stage B: TK x TN weights, dequantized from oQ on the fly */
         for (uint e = tid; e < TK*TN; e += NT) {
@@ -103,8 +117,8 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
                 uint word = W[(ulong)gn * a.wwords + widx];
                 uint code = (word >> sh) & ((1u << a.bits) - 1u);
                 uint g = gk / a.gs;
-                ushort sh_ = SB[((ulong)gn * a.ngroups + g) * 2 + 0];
-                ushort bh_ = SB[((ulong)gn * a.ngroups + g) * 2 + 1];
+                ushort sh_ = SC[(ulong)gn * a.ngroups + g];
+                ushort bh_ = BI[(ulong)gn * a.ngroups + g];
                 float s = as_type<float>((uint)sh_ << 16);     /* bf16 -> f32 */
                 float b = as_type<float>((uint)bh_ << 16);
                 v = deq(code, s, b);
@@ -133,8 +147,8 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < TM*TN; e += NT) {
         uint rr = e / TN, nn = e % TN;
-        if (r0 + rr < a.rows && n0 + nn < a.N)
-            Y[(ulong)(r0 + rr) * a.N + n0 + nn] = Cs[e];
+        if (r0 + rr < erows && n0 + nn < a.N)
+            Y[(ulong)(xs + r0 + rr) * a.N + n0 + nn] = Cs[e];
     }
 }
 )";
@@ -183,36 +197,119 @@ extern "C" void *lg_metal_map(const void *base, size_t len) {
 
 extern "C" size_t lg_metal_map_count(void) { return (size_t)g_nmap; }
 
-/* y[rows, N] = x[row0.., Kd] @ dequant(W)^T for ONE expert. */
-extern "C" int lg_metal_expert(void *wmap, size_t woff, void *sbmap, size_t sboff,
-                    void *xbuf, void *ybuf,
-                    int rows, int row0, int Kd, int N, int gs, int bits) {
-    if (!g_exp_pipe || !wmap || !sbmap || rows <= 0) return 0;
-    @autoreleasepool {
-        id<MTLCommandQueue> cq = lg_metal_queue();
-        struct { unsigned Kd, N, gs, bits, rows, row0, wwords, ngroups; } a;
-        a.Kd = Kd; a.N = N; a.gs = gs; a.bits = bits;
-        a.rows = rows; a.row0 = row0;
-        a.wwords = ((unsigned)Kd * (unsigned)bits + 31u) / 32u;
-        a.ngroups = (unsigned)(Kd / gs);
+/* Persistent shared-storage scratch buffers, indexed by slot. Shared storage on
+ * unified memory means the CPU writes activations and the GPU reads the same
+ * pages with no copy in either direction. */
+static void  *g_scr[8];
+static size_t g_scrlen[8];
+extern "C" void *lg_metal_scratch(int which, size_t bytes) {
+    if (which < 0 || which >= 8 || !lg_metal_device()) return NULL;
+    if (g_scr[which] && g_scrlen[which] >= bytes) return g_scr[which];
+    id<MTLBuffer> b = [lg_metal_device() newBufferWithLength:bytes
+                                                     options:MTLResourceStorageModeShared];
+    if (!b) return NULL;
+    if (g_scr[which]) CFRelease((CFTypeRef)g_scr[which]);
+    g_scr[which] = (void*)CFBridgingRetain(b);
+    g_scrlen[which] = bytes;
+    return g_scr[which];
+}
+extern "C" void *lg_metal_scratch_ptr(void *h) {
+    return h ? [(__bridge id<MTLBuffer>)h contents] : NULL;
+}
 
-        id<MTLCommandBuffer> cb = [cq commandBuffer];
+/* BATCHED: one command buffer holds every expert's dispatch for a layer.
+ *
+ * The first version committed and waited per expert matrix, i.e. 256 experts x 3
+ * matrices x 48 layers = 36,864 round-trips per chunk. At the measured 0.33 ms
+ * per round-trip that is 12 s of pure synchronization per chunk with the GPU
+ * mostly idle -- the run appeared to hang. Encoding many dispatches into one
+ * buffer and waiting once removes that entirely.
+ *
+ * lg_metal_expert_begin/add/end wrap one buffer; `add` is called per expert. */
+static void *g_cb = NULL, *g_enc = NULL;
+
+extern "C" int lg_metal_expert_begin(void) {
+    if (!g_exp_pipe) return 0;
+    id<MTLCommandBuffer> cb = [lg_metal_queue() commandBuffer];
+    id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+    if (!cb || !en) return 0;
+    [en setComputePipelineState:(__bridge id<MTLComputePipelineState>)g_exp_pipe];
+    g_cb  = (void*)CFBridgingRetain(cb);
+    g_enc = (void*)CFBridgingRetain(en);
+    return 1;
+}
+
+extern "C" int lg_metal_expert_add(void *wmap, size_t woff, void *smap, size_t soff,
+                    void *bmap, size_t boff, void *xbuf, void *ybuf,
+                    int rows, int row0, int Kd, int N, int gs, int bits) {
+    if (!g_enc || !wmap || !smap || !bmap || rows <= 0) return 0;
+    id<MTLComputeCommandEncoder> en = (__bridge id<MTLComputeCommandEncoder>)g_enc;
+    struct { unsigned Kd, N, gs, bits, rows, row0, wwords, ngroups; } a;
+    a.Kd = Kd; a.N = N; a.gs = gs; a.bits = bits;
+    a.rows = rows; a.row0 = row0;
+    a.wwords = ((unsigned)Kd * (unsigned)bits + 31u) / 32u;
+    a.ngroups = (unsigned)(Kd / gs);
+    [en setBuffer:(__bridge id<MTLBuffer>)xbuf  offset:0     atIndex:0];
+    [en setBuffer:(__bridge id<MTLBuffer>)wmap  offset:woff  atIndex:1];
+    [en setBuffer:(__bridge id<MTLBuffer>)smap  offset:soff  atIndex:2];
+    [en setBuffer:(__bridge id<MTLBuffer>)bmap  offset:boff  atIndex:5];
+    [en setBuffer:(__bridge id<MTLBuffer>)ybuf  offset:0     atIndex:3];
+    [en setBytes:&a length:sizeof(a) atIndex:4];
+    [en dispatchThreadgroups:MTLSizeMake((rows+63)/64, (N+31)/32, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return 1;
+}
+
+extern "C" int lg_metal_expert_end(void) {
+    if (!g_cb || !g_enc) return 0;
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)g_cb;
+    [(__bridge id<MTLComputeCommandEncoder>)g_enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    int ok = cb.status != MTLCommandBufferStatusError;
+    CFRelease((CFTypeRef)g_enc); g_enc = NULL;
+    CFRelease((CFTypeRef)g_cb);  g_cb  = NULL;
+    if (!ok) fprintf(stderr, "[metal] expert batch failed\n");
+    return ok;
+}
+
+/* GROUPED: all E experts in ONE dispatch. `offs` is E+1 row starts into the
+ * expert-sorted activation buffer; maxrows sizes the grid. */
+extern "C" int lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size_t soff,
+                    void *bmap, size_t boff, void *xbuf, void *ybuf, void *offbuf,
+                    int E, int maxrows, int Kd, int N, int gs, int bits,
+                    size_t wslab, size_t sslab) {
+    if (!g_exp_pipe || !wmap || !smap || !bmap || maxrows <= 0) return 0;
+    @autoreleasepool {
+        struct { unsigned Kd,N,gs,bits,rows,row0,wwords,ngroups,wslab,sslab; } a;
+        a.Kd=Kd; a.N=N; a.gs=gs; a.bits=bits; a.rows=maxrows; a.row0=0;
+        a.wwords=((unsigned)Kd*(unsigned)bits+31u)/32u; a.ngroups=(unsigned)(Kd/gs);
+        a.wslab=(unsigned)wslab; a.sslab=(unsigned)sslab;
+        id<MTLCommandBuffer> cb = [lg_metal_queue() commandBuffer];
         id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
         [en setComputePipelineState:(__bridge id<MTLComputePipelineState>)g_exp_pipe];
-        [en setBuffer:(__bridge id<MTLBuffer>)xbuf  offset:0     atIndex:0];
-        [en setBuffer:(__bridge id<MTLBuffer>)wmap  offset:woff  atIndex:1];
-        [en setBuffer:(__bridge id<MTLBuffer>)sbmap offset:sboff atIndex:2];
-        [en setBuffer:(__bridge id<MTLBuffer>)ybuf  offset:0     atIndex:3];
+        [en setBuffer:(__bridge id<MTLBuffer>)xbuf   offset:0    atIndex:0];
+        [en setBuffer:(__bridge id<MTLBuffer>)wmap   offset:woff atIndex:1];
+        [en setBuffer:(__bridge id<MTLBuffer>)smap   offset:soff atIndex:2];
+        [en setBuffer:(__bridge id<MTLBuffer>)bmap   offset:boff atIndex:5];
+        [en setBuffer:(__bridge id<MTLBuffer>)ybuf   offset:0    atIndex:3];
+        [en setBuffer:(__bridge id<MTLBuffer>)offbuf offset:0    atIndex:6];
         [en setBytes:&a length:sizeof(a) atIndex:4];
-        [en dispatchThreadgroups:MTLSizeMake((rows+63)/64, (N+31)/32, 1)
+        [en dispatchThreadgroups:MTLSizeMake((maxrows+63)/64, (N+31)/32, E)
            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [en endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
-        if (cb.status == MTLCommandBufferStatusError) {
-            fprintf(stderr, "[metal] expert dispatch failed\n");
-            return 0;
-        }
+        return cb.status != MTLCommandBufferStatusError;
     }
-    return 1;
+}
+
+/* single-shot convenience, used by the standalone checkers */
+extern "C" int lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff,
+                    void *bmap, size_t boff, void *xbuf, void *ybuf,
+                    int rows, int row0, int Kd, int N, int gs, int bits) {
+    if (!lg_metal_expert_begin()) return 0;
+    int ok = lg_metal_expert_add(wmap, woff, smap, soff, bmap, boff, xbuf, ybuf,
+                                 rows, row0, Kd, N, gs, bits);
+    return lg_metal_expert_end() && ok;
 }

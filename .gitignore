@@ -105,3 +105,4 @@ models/
 
 laguna_metal.o
 laguna_*_metal
+laguna_expert_metal.o

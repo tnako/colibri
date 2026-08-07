@@ -92,6 +92,11 @@ typedef struct {
     int    orig_max, yarn, rot_dim;        /* rot_dim = head_dim * partial_rotary_factor */
 } RopeCfg;
 
+/* One expert weight tensor mapped for the GPU: the whole [E, N, K] slab, plus
+ * its bf16 scales and biases. Nothing is copied; these are addresses inside the
+ * mmap'd shard. */
+typedef struct { void *wmap, *smap, *bmap; size_t woff, soff, boff; int N, Kd; } GpuExp;
+
 typedef struct {
     int hidden, n_layers, vocab;
     int n_kv, head_dim, window;
@@ -157,6 +162,8 @@ typedef struct {
      * so a whole layer is 3 handles instead of 3*E. Populated only when the GPU
      * is present and the budget allows. */
     double mem_budget, mem_used, kv_bytes, proj_reserve;
+    GpuExp *gx;                    /* [n_layers][3] mapped expert tensors */
+    int gpu_exp;
     int ctx_hint;                  /* max context, for KV headroom accounting */
     int gpu_attn, gpu_attn_cap;    /* GPU flash attention for full layers      */
     OQMap oq;                      /* per-tensor bits/group_size from config */
@@ -188,7 +195,7 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 /* Prefill chunk size. Defined here because both the memory budget and the
  * attention path need it; the chunking itself is in step() far below. */
 #ifndef LG_CHUNK
-#define LG_CHUNK 256
+#define LG_CHUNK 4096
 #endif
 
 /* ---- per-step scratch arena (LAGUNA-FORK) ----------------------------------
@@ -778,6 +785,61 @@ static void load_resident_experts(Model *m) {
 
 
 
+#ifdef LAGUNA_METAL
+/* ---- GPU expert bank, mapped not copied (LAGUNA-FORK) ----------------------
+ * Locate every layer's three expert tensors inside their mmap'd shard and hand
+ * the addresses to Metal. Nothing is read, unpacked or copied here: the GPU
+ * dequantizes the 2-bit codes in-kernel. That is why Laguna-S fits -- its 29 GB
+ * of expert weights stay in evictable page cache instead of a 39 GB Q8R bank.
+ *
+ * The [E, N, K] layout means expert e's slab is at e * (N*wwords*4) inside the
+ * weight tensor, and likewise for the bf16 scales/biases. */
+static int gpu_experts_map(Model *m) {
+    Cfg *c = &m->c;
+    int L = c->n_layers;
+    if (m->experts != EXP_OQ || !lg_metal_available()) return 0;
+    int fm = 0; while (fm < L && !c->sparse[fm]) fm++;
+    if (fm >= L) return 0;
+    char probe[384];
+    const char *pfx = "";
+    snprintf(probe, sizeof(probe), "model.layers.%d.mlp.switch_mlp.gate_proj.weight", fm);
+    if (!st_find(&m->S, probe)) pfx = "language_model.";
+
+    m->gx = calloc((size_t)L*3, sizeof(GpuExp));
+    if (!m->gx) return 0;
+    const char *kind[3] = { "gate_proj", "up_proj", "down_proj" };
+    double t0 = now_s();
+    size_t mapped = 0;
+    for (int li = 0; li < L; li++) {
+        if (!c->sparse[li]) continue;
+        for (int w = 0; w < 3; w++) {
+            char wn[384], sn[384], bn[384];
+            snprintf(wn,sizeof(wn),"%smodel.layers.%d.mlp.switch_mlp.%s.weight", pfx,li,kind[w]);
+            snprintf(sn,sizeof(sn),"%smodel.layers.%d.mlp.switch_mlp.%s.scales", pfx,li,kind[w]);
+            snprintf(bn,sizeof(bn),"%smodel.layers.%d.mlp.switch_mlp.%s.biases", pfx,li,kind[w]);
+            void *wb=NULL,*sb=NULL,*bb=NULL; size_t wo=0,so=0,bo=0,wl=0,sl=0,bl=0;
+            if (!st_tensor_ptr(&m->S, wn, &wb, &wo, &wl) ||
+                !st_tensor_ptr(&m->S, sn, &sb, &so, &sl) ||
+                !st_tensor_ptr(&m->S, bn, &bb, &bo, &bl)) { free(m->gx); m->gx=NULL; return 0; }
+            GpuExp *g = &m->gx[(size_t)li*3 + w];
+            g->wmap = lg_metal_map(wb, wl);
+            g->smap = lg_metal_map(sb, sl);
+            g->bmap = lg_metal_map(bb, bl);
+            if (!g->wmap || !g->smap || !g->bmap) { free(m->gx); m->gx=NULL; return 0; }
+            g->woff = wo; g->soff = so; g->boff = bo;
+            st_tensor *t = st_find(&m->S, wn);
+            g->N  = (int)t->shape[1];
+            g->Kd = w == 2 ? c->moe_inter : c->hidden;
+            mapped += (size_t)t->nbytes;
+        }
+    }
+    fprintf(stderr, "[mem] gpu experts: %.1f GB mapped zero-copy in %.1fs (page cache, evictable)\n",
+            mapped/1e9, now_s()-t0);
+    m->gpu_exp = 1;
+    return 1;
+}
+#endif
+
 /* ---------- weight loading ---------- */
 static float *load_t(Model *m, const char *name) {
     char resolved[384];
@@ -1096,6 +1158,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     int64_t slotb = (m->experts == EXP_OQ)
         ? 3 * I * oq_rowbytes((int)D, m->oq.bits, m->oq.gs)
         : (bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4);
+#ifdef LAGUNA_METAL
+    /* Probe the GPU expert path BEFORE sizing the cache: if the weights can be
+     * mapped, no cache is needed at all and its whole allocation is freed for
+     * everything else. This is what takes Laguna-S from 39 GB of resident bank
+     * (impossible) to zero resident expert bytes. */
+    if (gpu_experts_map(m)) cap = 4;      /* minimum, effectively unused */
+#endif
     if (cap <= 0) {
         /* Whatever the budget has left after KV, GPU attention and projections,
          * minus a margin for the arena, page cache of the mmap'd checkpoint, and
@@ -1117,7 +1186,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     /* LAGUNA-FORK: when the expert bank fits, hold all of it in RAM as Q8R and
      * skip the streaming machinery. Default ON for oQ checkpoints; LAGUNA_RESIDENT=0
      * forces the streaming path (needed for Laguna-S, which does not fit). */
-    if (m->experts == EXP_OQ) {
+    if (m->experts == EXP_OQ && !m->gpu_exp) {
         {
             /* packed codes at the checkpoint's own bit width + f32 scale/bias/rsum
              * per group. Measured, not guessed: one-byte-per-code would be 31 GB. */
@@ -1528,6 +1597,96 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
     int64_t npair = (int64_t)S*K;
     int64_t *visit = NULL;         /* streaming visit order; NULL on the resident path */
+
+    /* ---- GPU PATH (LAGUNA-FORK) --------------------------------------------
+     * Weights are mmap'd, not resident: the kernel dequantizes 2-bit oQ codes
+     * straight out of page cache with simdgroup matrix tiles. No cache, no
+     * eviction, no IO, and no resident bank -- which is what lets Laguna-S run
+     * at all, since its Q8R bank would be 39 GB against a 20 GB budget.
+     *
+     * Tokens are sorted by expert so each expert's rows are one contiguous
+     * range, then one dispatch per (expert, matrix). Throughput depends sharply
+     * on rows per expert (measured: 31 GFLOP/s at 8 rows, 1515 at 2048), and
+     * rows/expert is chunk*topk/E -- so this path wants a LARGE prefill chunk.
+     */
+#ifdef LAGUNA_METAL
+    if (m->gpu_exp && m->gx) {
+        int64_t *vis = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
+        int *cnt = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
+        memset(cnt, 0, (size_t)(E + 1) * sizeof(int));
+        for (int64_t t = 0; t < npair; t++) cnt[idx[t] + 1]++;
+        for (int e = 0; e < E; e++) cnt[e+1] += cnt[e];
+        int *estart = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
+        memcpy(estart, cnt, (size_t)(E + 1) * sizeof(int));
+        for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
+
+        int bits = m->oq.bits ? m->oq.bits : 2, gs = m->oq.gs ? m->oq.gs : 64;
+        /* shared-storage scratch: CPU writes x, GPU reads it, no copies */
+        void *hx = lg_metal_scratch(0, (size_t)npair * D * sizeof(float));
+        void *hg = lg_metal_scratch(1, (size_t)npair * I * sizeof(float));
+        void *hu = lg_metal_scratch(2, (size_t)npair * I * sizeof(float));
+        void *hh = lg_metal_scratch(3, (size_t)npair * D * sizeof(float));
+        float *xb = (float*)lg_metal_scratch_ptr(hx);
+        float *gb = (float*)lg_metal_scratch_ptr(hg);
+        float *ub = (float*)lg_metal_scratch_ptr(hu);
+        float *hb = (float*)lg_metal_scratch_ptr(hh);
+        if (xb && gb && ub && hb) {
+            for (int64_t r = 0; r < npair; r++)
+                memcpy(xb + r*D, x + (vis[r]/K)*D, (size_t)D*sizeof(float));
+
+            GpuExp *G = &m->gx[(size_t)layer*3];
+            /* THREE dispatches per layer, one per matrix, each covering ALL
+             * experts. Per-expert dispatches (768/layer) left the GPU idle:
+             * profiling showed 35330 samples in __psynch_cvwait at 13.8% CPU.
+             * grid.z indexes the expert and each threadgroup reads its own row
+             * range from `offs`, which is the grouped-GEMM shape the MoE
+             * literature uses. */
+            void *ho = lg_metal_scratch(4, (size_t)(E+1)*sizeof(unsigned));
+            unsigned *offs = (unsigned*)lg_metal_scratch_ptr(ho);
+            int maxrows = 0;
+            if (offs) {
+                for (int e = 0; e <= E; e++) offs[e] = (unsigned)estart[e];
+                for (int e = 0; e < E; e++) {
+                    int nr = estart[e+1]-estart[e];
+                    if (nr > maxrows) maxrows = nr;
+                }
+            }
+            size_t wslabGU = (size_t)G[0].N * (((size_t)D*bits+31)/32) * 4;
+            size_t sslabGU = (size_t)G[0].N * (D/gs) * 2;
+            size_t wslabD  = (size_t)G[2].N * (((size_t)I*bits+31)/32) * 4;
+            size_t sslabD  = (size_t)G[2].N * (I/gs) * 2;
+            int ok = offs && maxrows > 0;
+            /* Time ONLY the GPU work. The first version started the clock before
+             * the gather and summed it per layer, which produced the nonsense of
+             * "expert-mm 466.4s" inside a 76.1s prefill. */
+            double te = now_s();
+            ok = ok && lg_metal_expert_grouped(G[0].wmap,G[0].woff,G[0].smap,G[0].soff,
+                        G[0].bmap,G[0].boff, hx,hg,ho, E,maxrows,D,I,gs,bits, wslabGU,sslabGU);
+            ok = ok && lg_metal_expert_grouped(G[1].wmap,G[1].woff,G[1].smap,G[1].soff,
+                        G[1].bmap,G[1].boff, hx,hu,ho, E,maxrows,D,I,gs,bits, wslabGU,sslabGU);
+            if (ok) {
+                for (int64_t j = 0; j < npair*I; j++) gb[j] = siluf(gb[j]) * ub[j];
+                ok = lg_metal_expert_grouped(G[2].wmap,G[2].woff,G[2].smap,G[2].soff,
+                        G[2].bmap,G[2].boff, hg,hh,ho, E,maxrows,I,D,gs,bits, wslabD,sslabD);
+            }
+            if (ok) {
+                for (int64_t r = 0; r < npair; r++) {
+                    int64_t t = vis[r];
+                    int s = (int)(t / K), kk = (int)(t % K);
+                    float sc = wgt[(int64_t)s*K + kk];
+                    float *os = out + (int64_t)s*D, *hr = hb + r*D;
+                    for (int d = 0; d < D; d++) os[d] += sc * hr[d];
+                }
+                m->t_expert += now_s() - te;
+                m->hits += npair;
+                visit = NULL;
+                goto moe_shared;
+            }
+        }
+        /* any failure: fall through to the CPU paths below */
+        memset(out, 0, (size_t)S*D*sizeof(float));
+    }
+#endif
 
     /* ---- RESIDENT PATH (LAGUNA-FORK) ---------------------------------------
      * With the whole expert bank in RAM as Q8R there is no cache, no eviction

@@ -596,6 +596,52 @@ static st_tensor *st_find(shards *S, const char *name) {
 }
 static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL; }
 
+/* ---- shard mmap for zero-copy GPU access (LAGUNA-FORK) ----------------------
+ * st.h reads with pread on purpose: mmap'd pages count toward RSS, which was the
+ * original RSS bug this file's header describes. That reasoning still holds for
+ * the CPU path and is left alone.
+ *
+ * The GPU needs a pointer, because newBufferWithBytesNoCopy wraps existing pages.
+ * So shards are ALSO mmap'd, read-only and lazily, purely to hand their address
+ * to Metal. These pages are clean file pages: they show in RSS but the kernel can
+ * evict them under pressure, which is exactly what lets 29 GB of 2-bit experts be
+ * used by a process held to a 20 GB budget. They are never written and never
+ * dirtied.
+ */
+#include <sys/mman.h>
+static void *st_map_shard(shards *S, int fd, size_t *len_out) {
+    static void  *maps[512];
+    static size_t lens[512];
+    static int    mfd[512];
+    static int    nmap = 0;
+    for (int i = 0; i < nmap; i++)
+        if (mfd[i] == fd) { if (len_out) *len_out = lens[i]; return maps[i]; }
+    if (nmap >= 512) return NULL;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz <= 0) return NULL;
+    void *p = mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) return NULL;
+    /* sequential-ish, and do not inflate the resident set on first touch */
+    madvise(p, (size_t)sz, MADV_RANDOM);
+    maps[nmap] = p; lens[nmap] = (size_t)sz; mfd[nmap] = fd;
+    if (len_out) *len_out = (size_t)sz;
+    return maps[nmap++];
+}
+
+/* Base address + byte offset of a tensor inside its mmap'd shard. */
+static int st_tensor_ptr(shards *S, const char *name, void **base, size_t *off,
+                         size_t *maplen) {
+    st_tensor *t = st_find(S, name);
+    if (!t) return 0;
+    size_t len = 0;
+    void *p = st_map_shard(S, t->fd, &len);
+    if (!p) return 0;
+    if ((size_t)t->off + (size_t)t->nbytes > len) return 0;
+    *base = p; *off = (size_t)t->off;
+    if (maplen) *maplen = len;
+    return 1;
+}
+
 /* A missing CORE tensor is almost never an engine bug: the converter writes the final
  * norm and lm_head into the LAST shards, so a transfer that stopped early indexes
  * nearly everything and then dies on the first tensor from the gap. Bare "missing
