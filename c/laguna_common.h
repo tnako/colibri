@@ -157,6 +157,8 @@ typedef struct {
      * is present and the budget allows. */
     void **geg, **geu, **ged;
     int  gpu_experts;
+    double mem_budget, mem_used;
+    int ctx_hint;                  /* max context, for KV headroom accounting */
     OQMap oq;                      /* per-tensor bits/group_size from config */
     int   oq_tensors;              /* weights read oQ-packed                 */
     Wt embed, lm_head;
@@ -759,10 +761,9 @@ static void load_resident_experts(Model *m) {
             }
         }
         done++;
-        fprintf(stderr, "\r  resident experts: layer %d ...", li);
+        (void)0;
     }
-    fprintf(stderr, "\r  resident experts: %d layers x %d in %.1fs%*s\n",
-            done, E, now_s() - t0, 20, "");
+    fprintf(stderr, "[mem] %d layers x %d experts unpacked in %.1fs\n", done, E, now_s() - t0);
     m->resident = 1;
 }
 
@@ -876,10 +877,8 @@ static void wt_to_gpu(Wt *w, int rows, int in, double *spent, double budget) {
 static void load_gpu_weights(Model *m) {
     Cfg *c = &m->c;
     if (!lg_metal_init()) { fprintf(stderr, "[metal] unavailable, CPU only\n"); return; }
-    const char *bs = getenv("LAGUNA_GPU_BUDGET_GB");
-    double budget = (bs ? atof(bs) : 4.0) * 1e9;
-    const char *mm = getenv("LG_METAL_MIN");
-    if (mm) g_metal_min = atoi(mm);
+    /* projections are small and always worth it: cap at 1/6 of the budget */
+    double budget = m->mem_budget > 0 ? m->mem_budget / 6.0 : 4e9;
     double spent = 0;
     int D = c->hidden;
     for (int i = 0; i < c->n_layers; i++) {
@@ -893,8 +892,8 @@ static void load_gpu_weights(Model *m) {
         wt_to_gpu(&l->sh_u, c->shared_inter, D, &spent, budget);
         wt_to_gpu(&l->sh_d, D, c->shared_inter, &spent, budget);
     }
-    fprintf(stderr, "[metal] %s: %.2f GB of projections on GPU, GEMM at S>=%d\n",
-            lg_metal_name(), spent/1e9, g_metal_min);
+    m->mem_used += spent;
+    fprintf(stderr, "[metal] %s: %.2f GB projections on GPU\n", lg_metal_name(), spent/1e9);
 }
 #endif
 
@@ -918,9 +917,9 @@ static void load_gpu_weights(Model *m) {
 static void load_gpu_experts(Model *m) {
     Cfg *c = &m->c;
     if (!lg_metal_available()) return;
-    const char *bs = getenv("LAGUNA_GPU_EXPERT_GB");
-    double budget = (bs ? atof(bs) : 0.0) * 1e9;      /* opt-in: default off */
-    if (budget <= 0) return;
+    /* whatever the budget has left after weights, projections and KV headroom */
+    double budget = m->mem_budget - m->mem_used;
+    if (budget <= 1e9) return;
     int L = c->n_layers, E = c->n_experts, I = c->moe_inter, D = c->hidden;
     m->geg = calloc(L, sizeof(void*));
     m->geu = calloc(L, sizeof(void*));
@@ -968,12 +967,11 @@ static void load_gpu_experts(Model *m) {
             else m->ged[li] = hh;
         }
         spent += need; done++;
-        fprintf(stderr, "\r  gpu experts: %d layers (%.1f GB)", done, spent/1e9);
     }
     free(stage); free(row);
     m->gpu_experts = done;
-    fprintf(stderr, "\r  gpu experts: %d/%d MoE layers, %.2f GB in %.1fs%*s\n",
-            done, c->n_layers, spent/1e9, now_s()-t0, 12, "");
+    fprintf(stderr, "[metal] %d MoE layers of experts on GPU (%.2f GB, %.1fs)\n",
+            done, spent/1e9, now_s()-t0);
 }
 #endif
 
@@ -1089,8 +1087,15 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         ? 3 * I * oq_rowbytes((int)D, m->oq.bits, m->oq.gs)
         : (bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4);
     if (cap <= 0) {
+        /* Size the streaming cache from the SAME budget as everything else, not
+         * from free RAM. Reading free RAM made the cache grab ~11.8 GB regardless
+         * of LAGUNA_MEM_GB, so a low budget still peaked near 17 GB -- the knob
+         * looked broken because this path ignored it. */
+        const char *mg0 = getenv("LAGUNA_MEM_GB");
+        double bud = (mg0 ? atof(mg0) : 20.0) * 1e9;
         double avail = mem_avail_bytes();
-        cap = avail > 0 ? (int)((avail*0.80 - 4e9) / ((double)slotb * (nsp ? nsp : 1))) : 16;
+        if (avail > 0 && avail < bud) bud = avail * 0.80;
+        cap = (int)((bud - 4e9) / ((double)slotb * (nsp ? nsp : 1)));
         if (cap < 4) cap = 4;
         if (cap > c->n_experts) cap = c->n_experts;
         fprintf(stderr, "[cap auto] %d experts/layer (%.1f GB cache budget)\n",
@@ -1102,15 +1107,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     /* LAGUNA-FORK: when the expert bank fits, hold all of it in RAM as Q8R and
      * skip the streaming machinery. Default ON for oQ checkpoints; LAGUNA_RESIDENT=0
      * forces the streaming path (needed for Laguna-S, which does not fit). */
+    /* ---- ONE KNOB (LAGUNA-FORK) --------------------------------------------
+     * LAGUNA_MEM_GB is the whole tuning surface: total memory the engine may use.
+     * Everything else is derived, because the right split is a function of the
+     * model and the machine rather than something to hand-tune. Priority:
+     *   1. GPU attention projections -- cheapest win per byte (4.6x on attention)
+     *   2. resident Q8R expert bank  -- removes all expert disk IO
+     *   3. GPU f16 expert bank       -- most memory-hungry, takes the remainder
+     * Default 20 GB: what a 32 GB machine gives up without swapping. */
     if (m->experts == EXP_OQ) {
-        /* OPT-IN, not default. The resident bank costs +50% RSS (11.0 -> 16.5 GiB
-         * on XS) and buys 3.9x on expert prefill, but single-stream decode is
-         * bandwidth-capped at ~200 tok/s even at 2-bit everywhere, so the RSS is
-         * not repayable in tok/s on this machine. Streaming stays the default;
-         * LAGUNA_RESIDENT=1 opts in when prefill latency is what matters. */
-        const char *rv = getenv("LAGUNA_RESIDENT");
-        int want = rv ? atoi(rv) : 0;
-        if (want) {
+        const char *mg = getenv("LAGUNA_MEM_GB");
+        m->mem_budget = (mg ? atof(mg) : 20.0) * 1e9;
+        {
             /* packed codes at the checkpoint's own bit width + f32 scale/bias/rsum
              * per group. Measured, not guessed: one-byte-per-code would be 31 GB. */
             int bpw = m->oq.bits ? m->oq.bits : 4, g = m->oq.gs ? m->oq.gs : 64;
@@ -1118,12 +1126,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             double need = (double)nsp * c->n_experts *
                           (nw * bpw / 8.0 + (double)(nw / g) * 3 * 4);
             double avail = mem_avail_bytes();
-            if (avail > 0 && need > avail * 0.85) {
-                fprintf(stderr, "[resident] need %.1f GB, only %.1f GB available -> streaming\n",
-                        need/1e9, avail/1e9);
+            double room = m->mem_budget;
+            if (avail > 0 && avail < room) room = avail * 0.9;
+            /* leave headroom for KV + scratch, which scale with context */
+            room -= (double)c->n_layers * c->n_kv * c->head_dim * 2 * 2 *
+                    (m->ctx_hint > 0 ? m->ctx_hint : 8192);
+            if (need > room) {
+                fprintf(stderr, "[mem] expert bank %.1f GB > %.1f GB free budget -> streaming\n",
+                        need/1e9, room/1e9);
             } else {
-                fprintf(stderr, "[resident] expert bank %.1f GB in RAM, cache disabled\n", need/1e9);
+                fprintf(stderr, "[mem] expert bank %.1f GB resident\n", need/1e9);
                 load_resident_experts(m);
+                m->mem_used += need;
             }
         }
     }
@@ -1471,6 +1485,59 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
 
         double te = now_s();
+        /* ---- BATCHED GPU EXPERT DISPATCH (LAGUNA-FORK) ----------------------
+         * Issue all of this layer's expert GEMMs from ONE thread. The earlier
+         * attempt called Metal from inside `#pragma omp parallel` and threads
+         * raced on the shared MPS scratch/wrapper cache, tripping
+         *   "Number of requested rows in result exceeds result matrix size".
+         * Serializing the dispatch removes the race by construction, and costs
+         * nothing: the GPU is the parallel device here, so the CPU only needs to
+         * gather rows and enqueue.
+         *
+         * This also repairs what chunked prefill broke. With LG_CHUNK=1024 each
+         * expert sees ~40 rows instead of ~240, and the CPU UDOT kernel loses its
+         * batching (measured: expert-mm 15.1s -> 71.2s at 1902 tokens). A GEMM of
+         * 40x3072 against a resident f16 weight does not care.
+         */
+#ifdef LAGUNA_METAL
+        if (m->geg && m->geg[layer]) {
+            int64_t mx = 0;
+            for (int e = 0; e < E; e++) {
+                int64_t n = estart[e+1] - estart[e];
+                if (n > mx) mx = n;
+            }
+            float *xb = afloat(mx*D), *gb = afloat(mx*I);
+            float *ub = afloat(mx*I), *hb = afloat(mx*D);
+            int done_all = 1;
+            for (int e = 0; e < E && done_all; e++) {
+                int g0 = estart[e], nr = estart[e+1] - g0;
+                if (nr <= 0) continue;
+                for (int r = 0; r < nr; r++)
+                    memcpy(xb + (int64_t)r*D, x + (vis[g0+r]/K)*D, (size_t)D*sizeof(float));
+                if (!lg_metal_gemm_rows(m->geg[layer], gb, xb, nr, e*I, I) ||
+                    !lg_metal_gemm_rows(m->geu[layer], ub, xb, nr, e*I, I)) { done_all = 0; break; }
+                for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
+                if (!lg_metal_gemm_rows(m->ged[layer], hb, gb, nr, e*D, D)) { done_all = 0; break; }
+                for (int r = 0; r < nr; r++) {
+                    int64_t t = vis[g0+r];
+                    int s = (int)(t / K), kk = (int)(t % K);
+                    float sc = wgt[(int64_t)s*K + kk];
+                    float *os = out + (int64_t)s*D, *hr = hb + (int64_t)r*D;
+                    for (int d = 0; d < D; d++) os[d] += sc * hr[d];
+                }
+            }
+            if (done_all) {
+                m->t_expert += now_s() - te;
+                m->hits += npair;
+                visit = NULL;
+                goto moe_shared;
+            }
+            /* partial failure: fall through to the CPU path, which recomputes
+             * from scratch. `out` was only written for experts that succeeded, so
+             * zero it again to avoid double-accumulation. */
+            memset(out, 0, (size_t)S*D*sizeof(float));
+        }
+#endif
         #pragma omp parallel
         {
             int64_t rcap = 0;
@@ -1498,34 +1565,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 for (int r = 0; r < nr; r++)
                     memcpy(xb + (int64_t)r*D, x + (vis[g0+r]/K)*D, (size_t)D*sizeof(float));
                 /* one activation quantization feeds BOTH gate and up */
-#ifdef LAGUNA_METAL
-                /* GPU path for this layer's experts, when uploaded.
-                 *
-                 * DISABLED BY THE omp_in_parallel() GUARD, deliberately. This
-                 * loop runs inside `#pragma omp parallel`, and lg_metal_gemm_rows
-                 * shares global scratch buffers and cached MPSMatrix wrappers
-                 * across calls. Concurrent threads therefore raced on them, which
-                 * surfaced as an MPS assertion:
-                 *   "Number of requested rows in result exceeds result matrix size"
-                 * because one thread rebuilt the cached result wrapper for its own
-                 * N while another was mid-encode with a different N.
-                 *
-                 * Making this pay off needs the expert loop restructured so GPU
-                 * work is issued from a single thread (gather all groups, then one
-                 * batched dispatch), or per-thread Metal state. Not done; the
-                 * guard keeps the code honest and inert rather than racy, and the
-                 * CPU UDOT path below is what actually runs. */
-                if (m->geg && m->geg[layer] && nr >= g_metal_min &&
-                    !omp_in_parallel() &&
-                    lg_metal_gemm_rows(m->geg[layer], gb, xb, nr, e*I, I) &&
-                    lg_metal_gemm_rows(m->geu[layer], ub, xb, nr, e*I, I)) {
-                    for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
-                    if (!lg_metal_gemm_rows(m->ged[layer], hb, gb, nr, e*D, D)) {
-                        ah.rows = nr; q8act_fill(&ah, gb);
-                        q8r_gemm(hb, &ah, &m->ed[k]);
-                    }
-                } else
-#endif
+                /* CPU UDOT path. The GPU equivalent is the batched dispatch
+                 * above, issued single-threaded; calling Metal from in here raced
+                 * on its shared scratch. */
                 {
                 ax.rows = nr; q8act_fill(&ax, xb);
                 q8r_gemm(gb, &ax, &m->eg[k]);
@@ -1778,11 +1820,40 @@ static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     return logit;
 }
 
-/* Feed an arbitrary number of positions in one pass. Sliding layers stay correct
- * for any S because attention() appends after scoring (see there); no chunking
- * is needed and none is done, so prefill is one batched call. */
+/* Feed an arbitrary number of positions. Sliding layers stay correct for any S
+ * because attention() appends after scoring (see there).
+ *
+ * CHUNKED (LAGUNA-FORK): a single 262144-token call would need f32 scratch that
+ * scales with S -- q and ctx alone are S*heads*head_dim*4, which is 6 GiB each at
+ * 256k for Laguna-S. Splitting the prompt into fixed-size chunks makes every
+ * scratch buffer O(chunk) instead of O(S), so peak memory stops depending on
+ * context length at all. The KV cache still holds the full history, so results
+ * are identical: each chunk attends to everything before it exactly as a single
+ * big call would.
+ *
+ * The chunk is large enough that per-call overhead is amortized and the GPU GEMMs
+ * still see plenty of rows (LG_CHUNK=1024 keeps MPS well above its efficiency
+ * threshold, measured 15.5 TFLOP/s at S>=1024). */
+/* Swept with c/tools/tune_chunk.sh on XS at 1902 tokens: prefill is flat across
+ * 256..4096 (29.7-32.5 s, i.e. noise) but peak RSS is not -- 16.5 GB at 256
+ * against 20.2 GB at 4096, because every scratch buffer is O(chunk). Since the
+ * goal is long context inside a fixed memory budget, take the smallest chunk that
+ * does not lose speed. */
+#ifndef LG_CHUNK
+#define LG_CHUNK 256
+#endif
+
 static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
-    return step_raw(m, ids, S, pos0, tf_out);
+    if (S <= LG_CHUNK) return step_raw(m, ids, S, pos0, tf_out);
+    float *logit = NULL;
+    for (int off = 0; off < S; off += LG_CHUNK) {
+        int n = S - off < LG_CHUNK ? S - off : LG_CHUNK;
+        free(logit);
+        /* tf_out (teacher-forcing argmax per position) is filled per chunk at the
+         * matching offset so chunking is invisible to the fixtures. */
+        logit = step_raw(m, ids + off, n, pos0 + off, tf_out ? tf_out + off : NULL);
+    }
+    return logit;
 }
 
 static void kv_alloc(Model *m, int max_t) {
