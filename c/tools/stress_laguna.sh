@@ -64,11 +64,22 @@ echo "==> stress $TAG: $MODEL, ~$PTOK tokens ($WORDS words), $NGEN generated, ca
 
 # Run the engine in the background so `sample` can attach to a live pid, and let
 # the profiler cover the whole run rather than a fixed slice.
-# /usr/bin/time -l gives peak RSS + page-in/fault counters on macOS; the engine's
-# own RSS line only samples at the end, which misses the peak during prefill.
-/usr/bin/time -l env SNAP="$MODEL" "$ENGINE" "$CAP" 0 --chat -n "$NGEN" -f "$D/prompt.txt" \
+# /usr/bin/time -l gives peak RSS + page-in/fault counters on macOS. It must NOT
+# be the process `sample` attaches to, or the profile is 100% __sigsuspend in the
+# time wrapper; run the engine directly and read RSS from the engine's own line
+# plus a footprint poll.
+SNAP="$MODEL" "$ENGINE" "$CAP" 0 --chat -n "$NGEN" -f "$D/prompt.txt" \
      > "$D/engine.log" 2> "$D/engine.err" &
 PID=$!
+# poll peak footprint while it runs (cheap, 1 Hz)
+( peak=0
+  while kill -0 "$PID" 2>/dev/null; do
+    r=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
+    [ -n "$r" ] && [ "$r" -gt "$peak" ] && peak=$r
+    sleep 1
+  done
+  echo "peak_rss_kb $peak" > "$D/peak_rss" ) &
+RSSPID=$!
 
 # 1 ms sampling for up to an hour: a 16K-token prefill runs many minutes and the
 # old 600s cap silently ended the profile (and this script) mid-run.
@@ -84,27 +95,13 @@ echo "--- engine ---"
 grep -hoE "\[[0-9]+ prompt tokens\]|prefill [0-9.]+s.*|\[phases\].*|oQ: .*" \
   "$D/engine.log" "$D/engine.err" 2>/dev/null | sort -u || true
 
+wait "$RSSPID" 2>/dev/null || true
 echo
-echo "--- memory / IO ---"
-# /usr/bin/time -l writes to stderr alongside the engine's own output
-grep -E "maximum resident set size|page reclaims|page faults|voluntary context switches|involuntary context switches|real[ ]|user[ ]|sys[ ]" \
-  "$D/engine.err" 2>/dev/null | sed 's/^[[:space:]]*/  /' || true
-python3 - "$D/engine.err" <<'PY'
-import re,sys
-t=open(sys.argv[1],errors="ignore").read()
-def g(pat):
-    m=re.search(pat,t)
-    return int(m.group(1)) if m else None
-peak=g(r'(\d+)\s+maximum resident set size')
-if peak: print(f"  peak RSS: {peak/2**30:.2f} GiB")
-mf=g(r'(\d+)\s+page faults')          # major faults = real disk IO
-if mf is not None: print(f"  major page faults (disk-backed): {mf}")
-real=re.search(r'([\d.]+)\s+real\s+([\d.]+)\s+user\s+([\d.]+)\s+sys',t)
-if real:
-    r_,u,s=(float(x) for x in real.groups())
-    # user+sys across 10 cores vs wall: how much of wall was NOT cpu work
-    print(f"  wall {r_:.1f}s  user {u:.1f}s  sys {s:.1f}s  (cpu/wall = {(u+s)/r_:.1f}x, 10 cores available)")
-PY
+echo "--- memory ---"
+if [ -f "$D/peak_rss" ]; then
+  awk '{printf "  peak RSS: %.2f GiB\n", $2/1048576}' "$D/peak_rss"
+fi
+grep -hoE "RSS [0-9.]+ GB" "$D/engine.log" 2>/dev/null | tail -1 | sed 's/^/  final /' || true
 
 echo
 echo "--- self time by symbol (sampled) ---"

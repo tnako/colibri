@@ -49,6 +49,7 @@
 #include "route_trace.h"
 #include "coli_moe_route.h"
 #include "oq.h"                   /* LAGUNA-FORK: oMLX oQ packed-weight kernels */
+#include "q8r.h"                  /* LAGUNA-FORK: UDOT-native resident format   */
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
@@ -142,6 +143,11 @@ typedef struct {
     shards S;
     int quant_bits;
     int experts;                   /* EXP_* : routed-expert tensor layout    */
+    /* Resident Q8R expert bank (LAGUNA_RESIDENT=1, the default when the whole
+     * model fits). eg/eu/ed are [n_layers][n_experts]; when populated the LRU
+     * cache, slot_fill and all expert disk IO are bypassed entirely. */
+    Q8R *eg, *eu, *ed;
+    int  resident;
     OQMap oq;                      /* per-tensor bits/group_size from config */
     int   oq_tensors;              /* weights read oQ-packed                 */
     Wt embed, lm_head;
@@ -605,10 +611,93 @@ static int oq_load(Model *m, const char *stem, Wt *w, int expert) {
     return 1;
 }
 
+/* ---- resident Q8R expert bank (LAGUNA-FORK) --------------------------------
+ * Expand every routed expert from packed oQ into UDOT-native Q8R, once, at
+ * load. This deletes the entire streaming design at runtime: no LRU, no
+ * slot_fill, no per-token disk reads, no eviction correctness hazard.
+ *
+ * It is affordable because expanding 2-bit codes to one byte each still lands
+ * the whole XS model near 9 GiB -- BELOW the 11.05 GiB the streaming cache was
+ * measured at, since that peak was dominated by cache slots and scratch. The
+ * memory is spent where it converts directly into arithmetic throughput.
+ *
+ * Fill is parallel over experts and reads through the safetensors fd; the OS
+ * page cache turns 40 layers x 256 experts of pread into mostly sequential IO.
+ */
 static void wt_free_oq(Wt *w) {
     free(w->q32); free(w->qs); free(w->qb);
     w->q32 = NULL; w->qs = w->qb = NULL; w->qbits = 0;
 }
+
+static int q8r_from_oq(Model *m, const char *stem, int expert, Q8R *out) {
+    Wt w = {0};
+    if (!oq_load(m, stem, &w, expert)) return 0;
+    int O = w.rows, I = w.in, gs = w.gs, ng = I / gs;
+    out->rows = O; out->in = I; out->gs = gs; out->ng = ng; out->bits = w.qbits;
+    int64_t rw = oq_words(I, w.qbits);
+    int wpg = gs * w.qbits / 32;
+    /* codes are ADOPTED from the Wt, not copied: oq_load already malloc'd them
+     * in exactly the packed layout the kernel wants */
+    out->codes = w.q32;  w.q32 = NULL;
+    out->scale = w.qs;   w.qs = NULL;
+    out->bias  = w.qb;   w.qb = NULL;
+    out->rsum  = malloc((size_t)O * ng * sizeof(float));
+    if (!out->rsum) { fprintf(stderr, "OOM rsum for %s\n", stem); exit(1); }
+    uint8_t sc[512];
+    for (int o = 0; o < O; o++) {
+        const uint32_t *src = out->codes + (int64_t)o * rw;
+        for (int g = 0; g < ng; g++) {
+            oq_unpack(src + (int64_t)g * wpg, w.qbits, gs, sc);
+            float s = 0;
+            for (int i = 0; i < gs; i++) s += sc[i];
+            out->rsum[(int64_t)o*ng + g] = s;
+        }
+    }
+    wt_free_oq(&w);
+    return 1;
+}
+
+static void load_resident_experts(Model *m) {
+    Cfg *c = &m->c;
+    int L = c->n_layers, E = c->n_experts;
+    m->eg = calloc((size_t)L*E, sizeof(Q8R));
+    m->eu = calloc((size_t)L*E, sizeof(Q8R));
+    m->ed = calloc((size_t)L*E, sizeof(Q8R));
+    if (!m->eg || !m->eu || !m->ed) { fprintf(stderr, "OOM expert bank\n"); exit(1); }
+
+    int fm = 0;
+    while (fm < L && !c->sparse[fm]) fm++;
+    char probe[384];
+    const char *pfx = "";
+    snprintf(probe, sizeof(probe), "model.layers.%d.mlp.switch_mlp.gate_proj.weight", fm);
+    if (!st_find(&m->S, probe)) pfx = "language_model.";
+
+    double t0 = now_s();
+    int done = 0;
+    for (int li = 0; li < L; li++) {
+        if (!c->sparse[li]) continue;
+        char sg[352], su[352], sd[352];
+        snprintf(sg,sizeof(sg),"%smodel.layers.%d.mlp.switch_mlp.gate_proj",pfx,li);
+        snprintf(su,sizeof(su),"%smodel.layers.%d.mlp.switch_mlp.up_proj",  pfx,li);
+        snprintf(sd,sizeof(sd),"%smodel.layers.%d.mlp.switch_mlp.down_proj",pfx,li);
+        #pragma omp parallel for schedule(dynamic,4)
+        for (int e = 0; e < E; e++) {
+            int64_t k = (int64_t)li*E + e;
+            if (!q8r_from_oq(m, sg, e, &m->eg[k]) ||
+                !q8r_from_oq(m, su, e, &m->eu[k]) ||
+                !q8r_from_oq(m, sd, e, &m->ed[k])) {
+                fprintf(stderr, "resident: layer %d expert %d missing\n", li, e); exit(1);
+            }
+        }
+        done++;
+        fprintf(stderr, "\r  resident experts: layer %d ...", li);
+    }
+    fprintf(stderr, "\r  resident experts: %d layers x %d in %.1fs%*s\n",
+            done, E, now_s() - t0, 20, "");
+    m->resident = 1;
+}
+
+
 
 /* ---------- weight loading ---------- */
 static float *load_t(Model *m, const char *name) {
@@ -798,6 +887,30 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+
+    /* LAGUNA-FORK: when the expert bank fits, hold all of it in RAM as Q8R and
+     * skip the streaming machinery. Default ON for oQ checkpoints; LAGUNA_RESIDENT=0
+     * forces the streaming path (needed for Laguna-S, which does not fit). */
+    if (m->experts == EXP_OQ) {
+        const char *rv = getenv("LAGUNA_RESIDENT");
+        int want = rv ? atoi(rv) : 1;
+        if (want) {
+            /* packed codes at the checkpoint's own bit width + f32 scale/bias/rsum
+             * per group. Measured, not guessed: one-byte-per-code would be 31 GB. */
+            int bpw = m->oq.bits ? m->oq.bits : 4, g = m->oq.gs ? m->oq.gs : 64;
+            int64_t nw = (int64_t)3 * c->moe_inter * c->hidden;
+            double need = (double)nsp * c->n_experts *
+                          (nw * bpw / 8.0 + (double)(nw / g) * 3 * 4);
+            double avail = mem_avail_bytes();
+            if (avail > 0 && need > avail * 0.85) {
+                fprintf(stderr, "[resident] need %.1f GB, only %.1f GB available -> streaming\n",
+                        need/1e9, avail/1e9);
+            } else {
+                fprintf(stderr, "[resident] expert bank %.1f GB in RAM, cache disabled\n", need/1e9);
+                load_resident_experts(m);
+            }
+        }
+    }
 
     rt_init(LAGUNA_NAME, c->n_layers, c->n_experts);
     for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);
@@ -1109,6 +1222,79 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     int64_t npair = (int64_t)S*K;
+    int64_t *visit = NULL;         /* streaming visit order; NULL on the resident path */
+
+    /* ---- RESIDENT PATH (LAGUNA-FORK) ---------------------------------------
+     * With the whole expert bank in RAM as Q8R there is no cache, no eviction
+     * and no IO: gather each expert's tokens, run three UDOT GEMMs, scatter.
+     * One pass over the experts that this batch actually touched. */
+    if (m->resident) {
+        int64_t *vis = malloc((size_t)npair * sizeof(int64_t));
+        int *cnt = calloc((size_t)E + 1, sizeof(int));
+        if (!vis || !cnt) { fprintf(stderr, "OOM moe resident\n"); exit(1); }
+        for (int64_t t = 0; t < npair; t++) cnt[idx[t] + 1]++;
+        for (int e = 0; e < E; e++) cnt[e+1] += cnt[e];
+        int *estart = malloc((size_t)(E + 1) * sizeof(int));
+        memcpy(estart, cnt, (size_t)(E + 1) * sizeof(int));
+        for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
+        free(cnt);
+
+        double te = now_s();
+        #pragma omp parallel
+        {
+            int64_t rcap = 0;
+            float *xb=NULL,*gb=NULL,*ub=NULL,*hb=NULL;
+            Q8Act ax={0}, ah={0};
+            #pragma omp for schedule(dynamic,1)
+            for (int e = 0; e < E; e++) {
+                int g0 = estart[e], g1 = estart[e+1], nr = g1 - g0;
+                if (nr <= 0) continue;
+                int64_t k = (int64_t)layer*E + e;
+                /* Realloc when the row count grows OR the group size changes:
+                 * oQ checkpoints mix group sizes per tensor, and Q8Act's ng
+                 * (hence every metadata array) is derived from gs. Keying the
+                 * cache on rows alone silently reused a buffer sized for a
+                 * different ng. */
+                if (nr > rcap || ax.gs != m->eg[k].gs || ah.gs != m->ed[k].gs) {
+                    if (nr > rcap) rcap = nr;
+                    free(xb);free(gb);free(ub);free(hb);
+                    q8act_free(&ax); q8act_free(&ah);
+                    xb=falloc(rcap*D); gb=falloc(rcap*I);
+                    ub=falloc(rcap*I); hb=falloc(rcap*D);
+                    q8act_alloc(&ax,(int)rcap,D,m->eg[k].gs);
+                    q8act_alloc(&ah,(int)rcap,I,m->ed[k].gs);
+                }
+                for (int r = 0; r < nr; r++)
+                    memcpy(xb + (int64_t)r*D, x + (vis[g0+r]/K)*D, (size_t)D*sizeof(float));
+                /* one activation quantization feeds BOTH gate and up */
+                ax.rows = nr; q8act_fill(&ax, xb);
+                q8r_gemm(gb, &ax, &m->eg[k]);
+                q8r_gemm(ub, &ax, &m->eu[k]);
+                for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
+                ah.rows = nr; q8act_fill(&ah, gb);
+                q8r_gemm(hb, &ah, &m->ed[k]);
+                for (int r = 0; r < nr; r++) {
+                    int64_t t = vis[g0+r];
+                    int s = (int)(t / K), kk = (int)(t % K);
+                    float sc = wgt[(int64_t)s*K + kk];
+                    float *os = out + (int64_t)s*D, *hr = hb + (int64_t)r*D;
+                    for (int d = 0; d < D; d++) {
+                        #pragma omp atomic
+                        os[d] += sc * hr[d];
+                    }
+                }
+            }
+            free(xb);free(gb);free(ub);free(hb);
+            q8act_free(&ax); q8act_free(&ah);
+        }
+        m->t_expert += now_s() - te;
+        m->hits += npair;
+        free(vis); free(estart);
+        free(g); free(u); free(hh);
+        visit = NULL;              /* streaming path never allocated it here */
+        goto moe_shared;
+    }
+
 
     /* ROUND 8 (docs/oq-optimization-rounds.md): walk the pairs in EXPERT order.
      *
@@ -1122,7 +1308,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * once per layer per call: all of its tokens are consumed while it is
      * resident. Pure scheduling change -- the arithmetic per pair, and the
      * `cap`-sized eviction safety property, are untouched. */
-    int64_t *visit = malloc((size_t)npair * sizeof(int64_t));
+    visit = malloc((size_t)npair * sizeof(int64_t));
     if (!visit) { fprintf(stderr, "OOM moe visit order\n"); exit(1); }
     {   /* counting sort over expert id: O(npair + E), no comparator */
         int *cnt = calloc((size_t)E + 1, sizeof(int));
@@ -1265,8 +1451,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
     free(g); free(u); free(hh);
 
+moe_shared:
     /* shared expert: every token, unscaled, added on top of the routed sum */
-    double ts = now_s();
+    { double ts = now_s();
     int SI = c->shared_inter;
     float *sg = falloc((int64_t)S*SI), *su = falloc((int64_t)S*SI), *sd = falloc((int64_t)S*D);
     matmul_w(sg, x, l->sh_g, S, D, SI);
@@ -1275,7 +1462,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     matmul_w(sd, sg, l->sh_d, S, SI, D);
     for (int64_t i = 0; i < (int64_t)S*D; i++) out[i] += sd[i];
     free(sg); free(su); free(sd);
-    m->t_shared += now_s() - ts;
+    m->t_shared += now_s() - ts; }
 
     free(visit);
     free(logits); free(idx); free(wgt); free(choice); free(use); free(fill);
