@@ -152,6 +152,11 @@ typedef struct {
      * cache, slot_fill and all expert disk IO are bypassed entirely. */
     Q8R *eg, *eu, *ed;
     int  resident;
+    /* GPU expert bank: one f16 upload per (layer, matrix), all E experts stacked
+     * so a whole layer is 3 handles instead of 3*E. Populated only when the GPU
+     * is present and the budget allows. */
+    void **geg, **geu, **ged;
+    int  gpu_experts;
     OQMap oq;                      /* per-tensor bits/group_size from config */
     int   oq_tensors;              /* weights read oQ-packed                 */
     Wt embed, lm_head;
@@ -894,6 +899,84 @@ static void load_gpu_weights(Model *m) {
 #endif
 
 /* one row of a resident weight as f32 (see the note above wt_to_gpu's block). */
+/* ---- routed experts on the GPU (LAGUNA-FORK) --------------------------------
+ * The ANE investigation (docs/ane-investigation.md) ruled out the NPU for this
+ * phase -- baked weights cannot express per-token expert selection -- and pointed
+ * back at the GPU, whose measured 15.6 TFLOP/s f16 is 52x the CPU's 0.3 TOP/s
+ * UDOT rate.
+ *
+ * Layout: all E experts of a layer are stacked into ONE f16 buffer per matrix,
+ * so a layer costs 3 uploads rather than 3*E, and a per-expert GEMM is just an
+ * offset into it. Uploaded once at load, so the compile-time-weights problem that
+ * kills the ANE does not exist here.
+ *
+ * Memory: E*3*I*D at f16 per layer. For XS that is 1.6 GB/layer, 63 GB for all
+ * 39 -- far too much, so this is bounded by LAGUNA_GPU_EXPERT_GB and fills as
+ * many layers as fit. Layers that miss out use the CPU path, which still works.
+ */
+#ifdef LAGUNA_METAL
+static void load_gpu_experts(Model *m) {
+    Cfg *c = &m->c;
+    if (!lg_metal_available()) return;
+    const char *bs = getenv("LAGUNA_GPU_EXPERT_GB");
+    double budget = (bs ? atof(bs) : 0.0) * 1e9;      /* opt-in: default off */
+    if (budget <= 0) return;
+    int L = c->n_layers, E = c->n_experts, I = c->moe_inter, D = c->hidden;
+    m->geg = calloc(L, sizeof(void*));
+    m->geu = calloc(L, sizeof(void*));
+    m->ged = calloc(L, sizeof(void*));
+    if (!m->geg || !m->geu || !m->ged) return;
+
+    /* staging: one matrix's worth of all experts, reused per layer */
+    int64_t rows_gu = (int64_t)E * I, rows_d = (int64_t)E * D;
+    uint16_t *stage = malloc((size_t)(rows_gu > rows_d ? rows_gu : rows_d) *
+                             (size_t)(D > I ? D : I) * 2);
+    if (!stage) return;
+    float *row = malloc((size_t)(D > I ? D : I) * sizeof(float));
+    if (!row) { free(stage); return; }
+
+    double spent = 0; int done = 0;
+    double t0 = now_s();
+    for (int li = 0; li < L && spent < budget; li++) {
+        if (!c->sparse[li]) continue;
+        double need = (double)(2*rows_gu*D + rows_d*I) * 2;
+        if (spent + need > budget) break;
+        /* three matrices: gate[E*I, D], up[E*I, D], down[E*D, I] */
+        for (int which = 0; which < 3; which++) {
+            int rows = which < 2 ? (int)rows_gu : (int)rows_d;
+            int cols = which < 2 ? D : I;
+            int per  = which < 2 ? I : D;
+            for (int e = 0; e < E; e++) {
+                Q8R *q = which == 0 ? &m->eg[(int64_t)li*E+e]
+                       : which == 1 ? &m->eu[(int64_t)li*E+e]
+                                    : &m->ed[(int64_t)li*E+e];
+                if (!q8r_valid(q)) { free(stage); free(row); return; }
+                for (int o = 0; o < per; o++) {
+                    oq_dequant_row(q->codes, q->scale, q->bias, o, cols,
+                                   q->bits, q->gs, row);
+                    uint16_t *dst = stage + ((int64_t)e*per + o) * cols;
+                    for (int i = 0; i < cols; i++) {
+                        __fp16 h = (__fp16)row[i];
+                        memcpy(&dst[i], &h, 2);
+                    }
+                }
+            }
+            void *hh = lg_metal_upload_f16(stage, rows, cols);
+            if (!hh) { free(stage); free(row); return; }
+            if (which == 0) m->geg[li] = hh;
+            else if (which == 1) m->geu[li] = hh;
+            else m->ged[li] = hh;
+        }
+        spent += need; done++;
+        fprintf(stderr, "\r  gpu experts: %d layers (%.1f GB)", done, spent/1e9);
+    }
+    free(stage); free(row);
+    m->gpu_experts = done;
+    fprintf(stderr, "\r  gpu experts: %d/%d MoE layers, %.2f GB in %.1fs%*s\n",
+            done, c->n_layers, spent/1e9, now_s()-t0, 12, "");
+}
+#endif
+
 static void wt_row_f32(Wt w, int64_t row, float *out, int n) {
     if (w.qbits)  oq_dequant_row(w.q32, w.qs, w.qb, (int)row, n, w.qbits, w.gs, out);
     else if (w.f) memcpy(out, w.f + row*n, (size_t)n * sizeof(float));
@@ -1047,6 +1130,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 
 #ifdef LAGUNA_METAL
     load_gpu_weights(m);
+    if (m->resident) load_gpu_experts(m);   /* needs the Q8R bank as its source */
 #endif
 
     rt_init(LAGUNA_NAME, c->n_layers, c->n_experts);
@@ -1414,12 +1498,42 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 for (int r = 0; r < nr; r++)
                     memcpy(xb + (int64_t)r*D, x + (vis[g0+r]/K)*D, (size_t)D*sizeof(float));
                 /* one activation quantization feeds BOTH gate and up */
+#ifdef LAGUNA_METAL
+                /* GPU path for this layer's experts, when uploaded.
+                 *
+                 * DISABLED BY THE omp_in_parallel() GUARD, deliberately. This
+                 * loop runs inside `#pragma omp parallel`, and lg_metal_gemm_rows
+                 * shares global scratch buffers and cached MPSMatrix wrappers
+                 * across calls. Concurrent threads therefore raced on them, which
+                 * surfaced as an MPS assertion:
+                 *   "Number of requested rows in result exceeds result matrix size"
+                 * because one thread rebuilt the cached result wrapper for its own
+                 * N while another was mid-encode with a different N.
+                 *
+                 * Making this pay off needs the expert loop restructured so GPU
+                 * work is issued from a single thread (gather all groups, then one
+                 * batched dispatch), or per-thread Metal state. Not done; the
+                 * guard keeps the code honest and inert rather than racy, and the
+                 * CPU UDOT path below is what actually runs. */
+                if (m->geg && m->geg[layer] && nr >= g_metal_min &&
+                    !omp_in_parallel() &&
+                    lg_metal_gemm_rows(m->geg[layer], gb, xb, nr, e*I, I) &&
+                    lg_metal_gemm_rows(m->geu[layer], ub, xb, nr, e*I, I)) {
+                    for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
+                    if (!lg_metal_gemm_rows(m->ged[layer], hb, gb, nr, e*D, D)) {
+                        ah.rows = nr; q8act_fill(&ah, gb);
+                        q8r_gemm(hb, &ah, &m->ed[k]);
+                    }
+                } else
+#endif
+                {
                 ax.rows = nr; q8act_fill(&ax, xb);
                 q8r_gemm(gb, &ax, &m->eg[k]);
                 q8r_gemm(ub, &ax, &m->eu[k]);
                 for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
                 ah.rows = nr; q8act_fill(&ah, gb);
                 q8r_gemm(hb, &ah, &m->ed[k]);
+                }
                 for (int r = 0; r < nr; r++) {
                     int64_t t = vis[g0+r];
                     int s = (int)(t / K), kk = (int)(t % K);

@@ -39,7 +39,7 @@ typedef struct LgMetalW {
      * one 6144-token prefill. Cached per (weight, S) instead. */
     void *mm;               /* MPSMatrixMultiplication for cached_S              */
     void *db;               /* right-matrix descriptor                           */
-    int cached_S;
+    int cached_S, cached_N;
 } LgMetalW;
 
 int lg_metal_init(void) {
@@ -78,6 +78,24 @@ void *lg_metal_upload(const float *w, int rows, int cols) {
     }
 }
 
+/* Upload an already-dequantized f16 buffer directly. Used by the MoE path, which
+ * dequantizes a whole layer's experts into one contiguous staging buffer: the ANE
+ * investigation (docs/ane-investigation.md) confirmed the GPU is the right target
+ * for this, and one big upload beats 256 small ones. */
+void *lg_metal_upload_f16(const void *w16, int rows, int cols) {
+    if (!g_ok) return NULL;
+    @autoreleasepool {
+        size_t n = (size_t)rows * cols;
+        id<MTLBuffer> b = [g_dev newBufferWithBytes:w16 length:n*2
+                                            options:MTLResourceStorageModeShared];
+        if (!b) return NULL;
+        LgMetalW *h = (LgMetalW*)calloc(1, sizeof(LgMetalW));
+        h->raw = (void*)CFBridgingRetain(b);
+        h->rows = rows; h->cols = cols;
+        return h;
+    }
+}
+
 void lg_metal_free(void *handle) {
     if (!handle) return;
     LgMetalW *h = (LgMetalW*)handle;
@@ -103,6 +121,8 @@ static size_t g_acap = 0, g_ccap = 0;
 static void *g_ma = NULL, *g_mc = NULL, *g_ma_buf = NULL, *g_mc_buf = NULL;
 static int g_ma_S = -1, g_ma_K = -1, g_mc_S = -1, g_mc_N = -1;
 
+/* Returns the buffer, and sets *grew when the underlying MTLBuffer was replaced
+ * (callers cache MPSMatrix wrappers over it and must invalidate them). */
 static void *ensure_buf(void **slot, size_t *cap, size_t need) {
     if (*cap >= need && *slot) return *slot;
     id<MTLBuffer> nb = [g_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
@@ -117,12 +137,24 @@ static void *ensure_buf(void **slot, size_t *cap, size_t need) {
  * Returns 0 when it declines (no device, buffer failure) so the caller runs the
  * CPU path. */
 int lg_metal_gemm(void *handle, float *y, const float *x, int S) {
+    return lg_metal_gemm_rows(handle, y, x, S, 0, 0);
+}
+
+/* Same, but restricted to N rows starting at row0 of the weight buffer -- lets a
+ * stacked per-expert bank be addressed without a separate handle per expert. */
+int lg_metal_gemm_rows(void *handle, float *y, const float *x, int S,
+                       int row0, int nrows) {
     if (!g_ok || !handle) return 0;
     LgMetalW *h = (LgMetalW*)handle;
-    int K = h->cols, N = h->rows;
+    int K = h->cols, N = nrows > 0 ? nrows : h->rows;
+    if (row0 + N > h->rows) return 0;
     @autoreleasepool {
+        void *a_before = g_a, *c_before = g_c;
         if (!ensure_buf(&g_a, &g_acap, (size_t)S*K*2)) return 0;
         if (!ensure_buf(&g_c, &g_ccap, (size_t)S*N*2)) return 0;
+        /* invalidate cached wrappers if the buffer object itself was replaced */
+        if (g_a != a_before && g_ma) { CFRelease((CFTypeRef)g_ma); g_ma = NULL; g_ma_S = -1; }
+        if (g_c != c_before && g_mc) { CFRelease((CFTypeRef)g_mc); g_mc = NULL; g_mc_S = -1; }
         id<MTLBuffer> ab = (__bridge id<MTLBuffer>)g_a;
         id<MTLBuffer> cbuf = (__bridge id<MTLBuffer>)g_c;
         __fp16 *ap = (__fp16*)ab.contents;
@@ -131,7 +163,7 @@ int lg_metal_gemm(void *handle, float *y, const float *x, int S) {
         /* W is [N,K] row-major, i.e. B^T with B[K,N]; transposeRight handles it
          * without a repack, which matters because repacking every call would
          * cost more than the GEMM. */
-        if (h->cached_S != S) {
+        if (h->cached_S != S || h->cached_N != N) {
             if (h->mm) { CFRelease((CFTypeRef)h->mm); h->mm = NULL; }
             if (h->db) { CFRelease((CFTypeRef)h->db); h->db = NULL; }
             MPSMatrixDescriptor *nd = [MPSMatrixDescriptor matrixDescriptorWithRows:N columns:K
@@ -143,7 +175,7 @@ int lg_metal_gemm(void *handle, float *y, const float *x, int S) {
             if (!nd || !nm) return 0;
             h->db = (void*)CFBridgingRetain(nd);
             h->mm = (void*)CFBridgingRetain(nm);
-            h->cached_S = S;
+            h->cached_S = S; h->cached_N = N;
         }
         /* Cache the activation/result MPSMatrix wrappers too. They are cheap
          * objects but Metal keeps per-object state alive, and recreating them on
@@ -157,10 +189,17 @@ int lg_metal_gemm(void *handle, float *y, const float *x, int S) {
             g_ma = (void*)CFBridgingRetain(nm);
             g_ma_S = S; g_ma_K = K; g_ma_buf = g_a;
         }
+        /* Result wrapper. Its row count must match this call's N exactly, not a
+         * previously cached larger N: MPS asserts "Number of requested rows in
+         * result exceeds result matrix size" otherwise. That fired as soon as the
+         * per-expert path started passing different N values through one handle,
+         * so the cache key includes N and the buffer identity. */
         if (g_mc_S != S || g_mc_N != N || g_mc_buf != g_c) {
             if (g_mc) { CFRelease((CFTypeRef)g_mc); g_mc = NULL; }
             MPSMatrixDescriptor *dc = [MPSMatrixDescriptor matrixDescriptorWithRows:S columns:N
                                         rowBytes:(size_t)N*2 dataType:MPSDataTypeFloat16];
+            /* rowBytes = N*2 means the wrapper spans exactly S*N*2 bytes, which is
+             * what ensure_buf just guaranteed. */
             MPSMatrix *nm = [[MPSMatrix alloc] initWithBuffer:cbuf descriptor:dc];
             if (!nm) return 0;
             g_mc = (void*)CFBridgingRetain(nm);
@@ -169,6 +208,7 @@ int lg_metal_gemm(void *handle, float *y, const float *x, int S) {
         MPSMatrix *ma = (__bridge MPSMatrix*)g_ma;
         MPSMatrix *mc = (__bridge MPSMatrix*)g_mc;
         MPSMatrix *mb = [[MPSMatrix alloc] initWithBuffer:(__bridge id<MTLBuffer>)h->raw
+                                                   offset:(size_t)row0*K*2
                                                descriptor:(__bridge MPSMatrixDescriptor*)h->db];
         MPSMatrixMultiplication *mm = (__bridge MPSMatrixMultiplication*)h->mm;
         id<MTLCommandBuffer> cb = [g_q commandBuffer];
