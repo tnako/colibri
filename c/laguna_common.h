@@ -156,7 +156,7 @@ typedef struct {
     /* GPU expert bank: one f16 upload per (layer, matrix), all E experts stacked
      * so a whole layer is 3 handles instead of 3*E. Populated only when the GPU
      * is present and the budget allows. */
-    double mem_budget, mem_used;
+    double mem_budget, mem_used, kv_bytes, proj_reserve;
     int ctx_hint;                  /* max context, for KV headroom accounting */
     int gpu_attn, gpu_attn_cap;    /* GPU flash attention for full layers      */
     OQMap oq;                      /* per-tensor bits/group_size from config */
@@ -886,8 +886,9 @@ static void wt_to_gpu(Wt *w, int rows, int in, double *spent, double budget) {
 static void load_gpu_weights(Model *m) {
     Cfg *c = &m->c;
     if (!lg_metal_init()) { fprintf(stderr, "[metal] unavailable, CPU only\n"); return; }
-    /* projections are small and always worth it: cap at 1/6 of the budget */
-    double budget = m->mem_budget > 0 ? m->mem_budget / 6.0 : 4e9;
+    /* Spend the reserve set aside before the expert cache was sized, so the
+     * projections cannot be crowded out by a cache that already took the room. */
+    double budget = m->proj_reserve > 0 ? m->proj_reserve : 4e9;
     double spent = 0;
     int D = c->hidden;
     for (int i = 0; i < c->n_layers; i++) {
@@ -901,8 +902,11 @@ static void load_gpu_weights(Model *m) {
         wt_to_gpu(&l->sh_u, c->shared_inter, D, &spent, budget);
         wt_to_gpu(&l->sh_d, D, c->shared_inter, &spent, budget);
     }
-    m->mem_used += spent;
-    fprintf(stderr, "[metal] %s: %.2f GB projections on GPU\n", lg_metal_name(), spent/1e9);
+    /* the reserve was already charged before the cache was sized; settle up with
+     * what was really spent so later consumers see the truth either way */
+    m->mem_used += spent - m->proj_reserve;
+    fprintf(stderr, "[mem] gpu projections %.2f GB (reserved %.2f)\n",
+            spent/1e9, m->proj_reserve/1e9);
 }
 #endif
 
@@ -1012,6 +1016,79 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
         break;
     }
+    /* ---- ONE BUDGET, RESERVED IN PRIORITY ORDER (LAGUNA-FORK) ---------------
+     * LAGUNA_MEM_GB is the whole tuning surface; everything else is derived.
+     *
+     * ORDER MATTERS AND WAS A BUG. The streaming cache used to be sized first,
+     * from the FULL budget, and only then did GPU attention, the GPU projections
+     * and the CPU KV cache take their share -- so the same 20 GB was handed out
+     * three times. On Laguna-S that was cap 8.0 GB + attention 0.33 + projections
+     * 3.33 + KV, against a 20 GB budget the OS then had to make up with ~10 GB of
+     * swap (visible in htop with no other process to blame).
+     *
+     * Now every consumer is reserved against m->mem_used BEFORE the cache is
+     * sized, and the cache gets only what is genuinely left. */
+    {
+        const char *mg = getenv("LAGUNA_MEM_GB");
+        m->mem_budget = (mg ? atof(mg) : 20.0) * 1e9;
+        const char *cm = getenv("CTX_MAX");
+        m->ctx_hint = cm ? atoi(cm) : 8192;
+        /* CPU KV cache: int8 codes + one f32 scale per row, k and v, full layers
+         * at ctx and sliding layers at their window ring. */
+        double kvb = 0;
+        for (int i = 0; i < c->n_layers; i++) {
+            double rows = (c->slide[i] && c->window > 0 && c->window < m->ctx_hint)
+                        ? c->window : m->ctx_hint;
+            kvb += rows * c->n_kv * (c->head_dim + 4.0) * 2;
+        }
+        m->mem_used += kvb;
+        m->kv_bytes = kvb;
+    }
+#ifdef LAGUNA_METAL
+    /* GPU attention K/V next: measured 3.66x on the largest phase at 30k, so it
+     * outranks the expert cache. Capped at half the budget so it can never
+     * starve everything else. */
+    if (lg_metal_init()) {
+        int gcap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
+        int nfull = 0, nslide = 0;
+        for (int i = 0; i < c->n_layers; i++) { if (c->slide[i]) nslide++; else nfull++; }
+        int sring = 2 * (c->window + LG_CHUNK);
+        if (sring > gcap) sring = gcap;
+        double need = ((double)nfull * gcap + (double)nslide * sring)
+                    * c->n_kv * c->head_dim * 2 * 2;
+        if (need <= m->mem_budget * 0.5 && need <= m->mem_budget - m->mem_used) {
+            m->gpu_attn = 1; m->gpu_attn_cap = gcap;
+            m->mem_used += need;
+            fprintf(stderr, "[mem] gpu attention %.2f GB (%d full + %d sliding, ctx %d)\n",
+                    need/1e9, nfull, nslide, gcap);
+        } else {
+            fprintf(stderr, "[mem] gpu attention needs %.2f GB, not affordable -> CPU\n",
+                    need/1e9);
+        }
+    }
+    /* GPU projections and the shared expert.
+     *
+     * UNIFIED MEMORY: on Apple silicon an MTLResourceStorageModeShared buffer is
+     * ordinary RAM. Calling it "GPU memory" does not make it free, and an earlier
+     * version reserved a guess (attention projections only) while the loader
+     * actually uploaded the shared expert too -- dense=12288 on Laguna-S, which is
+     * far larger than the projections. The cache had already taken the remainder,
+     * so the total over-committed and the OS made up ~5 GB in swap.
+     *
+     * Reserve the exact figure the loader will spend, including the shared expert,
+     * and cap it at a third of what is left. */
+    m->proj_reserve = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        double qd = (double)c->heads[i] * c->head_dim;
+        m->proj_reserve += ((double)D*qd + 2.0*D*(c->n_kv*c->head_dim) + qd*D) * 2;
+        if (c->shared_inter > 0)
+            m->proj_reserve += (2.0*D*c->shared_inter + (double)c->shared_inter*D) * 2;
+    }
+    double left_for_proj = (m->mem_budget - m->mem_used) / 3.0;
+    if (m->proj_reserve > left_for_proj) m->proj_reserve = left_for_proj;
+    m->mem_used += m->proj_reserve;
+#endif
+
     int64_t I = c->moe_inter;
     /* bytes per cached expert: 3 matrices of I rows. oQ rows are packed, so an
      * oQ slot is bits/8 per weight plus the group scale/bias pair -- ~13x under
@@ -1020,69 +1097,26 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         ? 3 * I * oq_rowbytes((int)D, m->oq.bits, m->oq.gs)
         : (bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4);
     if (cap <= 0) {
-        /* Size the streaming cache from the SAME budget as everything else, not
-         * from free RAM. Reading free RAM made the cache grab ~11.8 GB regardless
-         * of LAGUNA_MEM_GB, so a low budget still peaked near 17 GB -- the knob
-         * looked broken because this path ignored it. */
-        const char *mg0 = getenv("LAGUNA_MEM_GB");
-        double bud = (mg0 ? atof(mg0) : 20.0) * 1e9;
+        /* Whatever the budget has left after KV, GPU attention and projections,
+         * minus a margin for the arena, page cache of the mmap'd checkpoint, and
+         * the f32 dequant scratch the cache itself needs while filling. Taking
+         * the whole remainder is what tipped Laguna-S into swap. */
+        double bud = (m->mem_budget - m->mem_used) * 0.75;
         double avail = mem_avail_bytes();
-        if (avail > 0 && avail < bud) bud = avail * 0.80;
-        cap = (int)((bud - 4e9) / ((double)slotb * (nsp ? nsp : 1)));
+        if (avail > 0 && avail * 0.70 < bud) bud = avail * 0.70;
+        cap = (int)(bud / ((double)slotb * (nsp ? nsp : 1)));
         if (cap < 4) cap = 4;
         if (cap > c->n_experts) cap = c->n_experts;
-        fprintf(stderr, "[cap auto] %d experts/layer (%.1f GB cache budget)\n",
-                cap, (double)cap*slotb*nsp/1e9);
+        fprintf(stderr, "[mem] expert cache %d/layer (%.1f GB of %.1f GB left)\n",
+                cap, (double)cap*slotb*nsp/1e9, bud/1e9);
     }
+    m->mem_used += (double)cap * slotb * (nsp ? nsp : 1);
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
 
     /* LAGUNA-FORK: when the expert bank fits, hold all of it in RAM as Q8R and
      * skip the streaming machinery. Default ON for oQ checkpoints; LAGUNA_RESIDENT=0
      * forces the streaming path (needed for Laguna-S, which does not fit). */
-    /* ---- ONE KNOB (LAGUNA-FORK) --------------------------------------------
-     * LAGUNA_MEM_GB is the whole tuning surface: total memory the engine may use.
-     * Everything else is derived, because the right split is a function of the
-     * model and the machine rather than something to hand-tune. Priority:
-     *   1. GPU attention projections -- cheapest win per byte (4.6x on attention)
-     *   2. resident Q8R expert bank  -- removes all expert disk IO
-     *   3. GPU f16 expert bank       -- most memory-hungry, takes the remainder
-     * Default 20 GB: what a 32 GB machine gives up without swapping. */
-    {
-        const char *mg = getenv("LAGUNA_MEM_GB");
-        m->mem_budget = (mg ? atof(mg) : 20.0) * 1e9;
-        const char *cm = getenv("CTX_MAX");
-        m->ctx_hint = cm ? atoi(cm) : 8192;
-    }
-#ifdef LAGUNA_METAL
-    /* RESERVE the GPU attention K/V first. Priority matters: measured at 30k
-     * context it is 3.66x on the largest phase (attention 839.8 -> 229.7 s),
-     * while the resident expert bank is 1.5x on a smaller one. Letting the bank
-     * claim the budget first meant a 20 GB run silently fell back to CPU
-     * attention -- the slower configuration -- because nothing was left. */
-    if (lg_metal_init()) {
-        int cap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
-        /* Full layers need the whole context linearly. Sliding layers get a
-         * double-mapped ring of 2*(window+chunk) rows, which keeps every band
-         * contiguous while costing 1536 rows instead of `cap`. At 250k that is
-         * 11.4 GiB instead of 45.8 GiB for 48 layers. */
-        int nfull = 0, nslide = 0;
-        for (int i = 0; i < c->n_layers; i++) { if (c->slide[i]) nslide++; else nfull++; }
-        int sring = 2 * (c->window + LG_CHUNK);
-        if (sring > cap) sring = cap;
-        double need = ((double)nfull * cap + (double)nslide * sring)
-                    * c->n_kv * c->head_dim * 2 * 2;
-        if (need <= m->mem_budget * 0.5) {      /* never let it eat the whole budget */
-            m->gpu_attn = 1; m->gpu_attn_cap = cap;
-            m->mem_used += need;
-            fprintf(stderr, "[metal] flash attention on %d full layers, ctx %d (%.2f GB)\n",
-                    nfull, cap, need/1e9);
-        } else {
-            fprintf(stderr, "[metal] flash attention needs %.2f GB (>half of budget) -> CPU\n",
-                    need/1e9);
-        }
-    }
-#endif
     if (m->experts == EXP_OQ) {
         {
             /* packed codes at the checkpoint's own bit width + f32 scale/bias/rsum
@@ -1091,12 +1125,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             int64_t nw = (int64_t)3 * c->moe_inter * c->hidden;
             double need = (double)nsp * c->n_experts *
                           (nw * bpw / 8.0 + (double)(nw / g) * 3 * 4);
+            /* what is left after KV, GPU attention, projections and the cache */
+            double room = m->mem_budget - m->mem_used;
             double avail = mem_avail_bytes();
-            double room = m->mem_budget;
-            if (avail > 0 && avail < room) room = avail * 0.9;
-            /* leave headroom for KV + scratch, which scale with context */
-            room -= (double)c->n_layers * c->n_kv * c->head_dim * 2 * 2 *
-                    (m->ctx_hint > 0 ? m->ctx_hint : 8192);
+            if (avail > 0 && avail * 0.9 < room) room = avail * 0.9;
             if (need > room) {
                 fprintf(stderr, "[mem] expert bank %.1f GB > %.1f GB free budget -> streaming\n",
                         need/1e9, room/1e9);
