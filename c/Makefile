@@ -703,11 +703,25 @@ LG_ARCH ?= -mcpu=native
 endif
 endif
 
-laguna_xs$(EXE): laguna_xs.c laguna_common.h oq.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
+laguna_xs$(EXE): laguna_xs.c laguna_common.h oq.h q8r.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $(LG_ARCH) laguna_xs.c -o laguna_xs$(EXE) $(LDFLAGS)
 
-laguna_s$(EXE): laguna_s.c laguna_common.h oq.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
+laguna_s$(EXE): laguna_s.c laguna_common.h oq.h q8r.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $(LG_ARCH) laguna_s.c -o laguna_s$(EXE) $(LDFLAGS)
+
+# LAGUNA-FORK: Metal/MPS prefill build. Separate targets because they need the
+# ObjC++ TU and two frameworks; the plain targets stay dependency-free.
+# Measured: MPS f16 GEMM 15.5 TFLOP/s vs 59 GFLOP/s on the CPU (docs/redesign-roofline.md).
+LG_METAL_LD = -framework Metal -framework MetalPerformanceShaders -framework Foundation -lc++ -lobjc
+
+laguna_metal.o: laguna_metal.mm laguna_metal.h
+	$(CXX) -x objective-c++ -std=gnu++17 -fobjc-arc -O3 $(LG_ARCH) -c laguna_metal.mm -o laguna_metal.o
+
+laguna_xs_metal$(EXE): laguna_xs.c laguna_common.h oq.h q8r.h laguna_metal.h laguna_metal.o
+	$(CC) $(CFLAGS) $(LG_ARCH) -DLAGUNA_METAL laguna_xs.c laguna_metal.o -o laguna_xs_metal$(EXE) $(LDFLAGS) $(LG_METAL_LD)
+
+laguna_s_metal$(EXE): laguna_s.c laguna_common.h oq.h q8r.h laguna_metal.h laguna_metal.o
+	$(CC) $(CFLAGS) $(LG_ARCH) -DLAGUNA_METAL laguna_s.c laguna_metal.o -o laguna_s_metal$(EXE) $(LDFLAGS) $(LG_METAL_LD)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
 # kimi_k3.c contains no COLI_CUDA code at all — its GPU path is Vulkan. But

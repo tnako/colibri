@@ -50,6 +50,9 @@
 #include "coli_moe_route.h"
 #include "oq.h"                   /* LAGUNA-FORK: oMLX oQ packed-weight kernels */
 #include "q8r.h"                  /* LAGUNA-FORK: UDOT-native resident format   */
+#ifdef LAGUNA_METAL
+#include "laguna_metal.h"         /* LAGUNA-FORK: MPS f16 prefill GEMM          */
+#endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
@@ -108,6 +111,7 @@ typedef struct { float *f; uint16_t *h;
                  float *qs, *qb;     /* per-group scale and bias, [rows*ng]  */
                  int gs, qbits;      /* 0 = not quantized                    */
                  int rows, in;       /* O and I, for the kernel call         */
+                 void *gpu;          /* LAGUNA-FORK: f16 copy on the GPU     */
 } Wt;
 
 typedef struct {
@@ -296,7 +300,16 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
     }
 }
 
+/* Rows below which the GPU loses. A Metal dispatch round-trip measures 0.327 ms
+ * on M5, so a small GEMM is pure latency; upstream colibri.c gates its own GPU
+ * GEMM at 16 rows for the same reason. LG_METAL_MIN overrides for experiments. */
+static int g_metal_min = 32;
+
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
+#ifdef LAGUNA_METAL
+    if (W.gpu && S >= g_metal_min && !omp_in_parallel() &&
+        lg_metal_gemm(W.gpu, y, x, S)) return;
+#endif
     if (W.qbits) matmul_oq(y, x, W.q32, W.qs, W.qb, S, I, O, W.qbits, W.gs);
     else if (W.f) matmul(y, x, W.f, S, I, O);
     else          matmul_h(y, x, W.h, S, I, O);
@@ -766,6 +779,70 @@ static Wt load_w(Model *m, const char *name) {
  * in an oQ checkpoint it is PACKED (8-bit in every variant seen), so the row has
  * to be dequantized rather than copied -- reading it as bf16 walks off the end
  * of a buffer that is bits/16 of the size the f32 view assumes. */
+
+/* ---- GPU upload of the big resident projections (LAGUNA-FORK) ---------------
+ * Only the per-layer attention projections and the shared expert go to the GPU.
+ * They are the same weights for every token, so uploading once amortizes over
+ * the whole prefill, and together they are 40% of prefill FLOPs.
+ *
+ * The routed experts deliberately do NOT go here: 256 per layer at f16 is 63 GB
+ * for XS, far past the machine. They stay on the CPU's UDOT path.
+ *
+ * A GPU copy is ADDITIONAL memory, so it is only taken when it fits in the
+ * budget the user allowed; otherwise the weight stays CPU-only and matmul_w
+ * falls back automatically. */
+#ifdef LAGUNA_METAL
+static void wt_to_gpu(Wt *w, int rows, int in, double *spent, double budget) {
+    if (!w || w->gpu) return;
+    double need = (double)rows * in * 2;              /* f16 */
+    if (*spent + need > budget) return;
+    float *tmp = NULL;
+    if (w->f) {
+        w->gpu = lg_metal_upload(w->f, rows, in);
+    } else if (w->qbits) {
+        tmp = malloc((size_t)rows * in * sizeof(float));
+        if (!tmp) return;
+        for (int o = 0; o < rows; o++)
+            oq_dequant_row(w->q32, w->qs, w->qb, o, in, w->qbits, w->gs,
+                           tmp + (int64_t)o * in);
+        w->gpu = lg_metal_upload(tmp, rows, in);
+        free(tmp);
+    } else if (w->h) {
+        tmp = malloc((size_t)rows * in * sizeof(float));
+        if (!tmp) return;
+        for (int64_t i = 0; i < (int64_t)rows * in; i++) tmp[i] = bf16_to_f32(w->h[i]);
+        w->gpu = lg_metal_upload(tmp, rows, in);
+        free(tmp);
+    }
+    if (w->gpu) *spent += need;
+}
+
+static void load_gpu_weights(Model *m) {
+    Cfg *c = &m->c;
+    if (!lg_metal_init()) { fprintf(stderr, "[metal] unavailable, CPU only\n"); return; }
+    const char *bs = getenv("LAGUNA_GPU_BUDGET_GB");
+    double budget = (bs ? atof(bs) : 4.0) * 1e9;
+    const char *mm = getenv("LG_METAL_MIN");
+    if (mm) g_metal_min = atoi(mm);
+    double spent = 0;
+    int D = c->hidden;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        int qd = c->heads[i] * c->head_dim, kvd = c->n_kv * c->head_dim;
+        wt_to_gpu(&l->q, qd,  D, &spent, budget);
+        wt_to_gpu(&l->k, kvd, D, &spent, budget);
+        wt_to_gpu(&l->v, kvd, D, &spent, budget);
+        wt_to_gpu(&l->o, D,  qd, &spent, budget);
+        wt_to_gpu(&l->sh_g, c->shared_inter, D, &spent, budget);
+        wt_to_gpu(&l->sh_u, c->shared_inter, D, &spent, budget);
+        wt_to_gpu(&l->sh_d, D, c->shared_inter, &spent, budget);
+    }
+    fprintf(stderr, "[metal] %s: %.2f GB of projections on GPU, GEMM at S>=%d\n",
+            lg_metal_name(), spent/1e9, g_metal_min);
+}
+#endif
+
+/* one row of a resident weight as f32 (see the note above wt_to_gpu's block). */
 static void wt_row_f32(Wt w, int64_t row, float *out, int n) {
     if (w.qbits)  oq_dequant_row(w.q32, w.qs, w.qb, (int)row, n, w.qbits, w.gs, out);
     else if (w.f) memcpy(out, w.f + row*n, (size_t)n * sizeof(float));
@@ -892,8 +969,13 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * skip the streaming machinery. Default ON for oQ checkpoints; LAGUNA_RESIDENT=0
      * forces the streaming path (needed for Laguna-S, which does not fit). */
     if (m->experts == EXP_OQ) {
+        /* OPT-IN, not default. The resident bank costs +50% RSS (11.0 -> 16.5 GiB
+         * on XS) and buys 3.9x on expert prefill, but single-stream decode is
+         * bandwidth-capped at ~200 tok/s even at 2-bit everywhere, so the RSS is
+         * not repayable in tok/s on this machine. Streaming stays the default;
+         * LAGUNA_RESIDENT=1 opts in when prefill latency is what matters. */
         const char *rv = getenv("LAGUNA_RESIDENT");
-        int want = rv ? atoi(rv) : 1;
+        int want = rv ? atoi(rv) : 0;
         if (want) {
             /* packed codes at the checkpoint's own bit width + f32 scale/bias/rsum
              * per group. Measured, not guessed: one-byte-per-code would be 31 GB. */
@@ -911,6 +993,10 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
             }
         }
     }
+
+#ifdef LAGUNA_METAL
+    load_gpu_weights(m);
+#endif
 
     rt_init(LAGUNA_NAME, c->n_layers, c->n_experts);
     for (int i = 0; i < c->n_layers; i++) if (!c->sparse[i]) rt_drop_row(i);

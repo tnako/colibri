@@ -102,3 +102,6 @@ c/tiny_inkling/
 # LAGUNA-FORK: generated test fixture (make_laguna_tiny.py), never committed
 laguna_tiny/
 models/
+
+laguna_metal.o
+laguna_*_metal
