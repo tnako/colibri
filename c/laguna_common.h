@@ -156,8 +156,6 @@ typedef struct {
     /* GPU expert bank: one f16 upload per (layer, matrix), all E experts stacked
      * so a whole layer is 3 handles instead of 3*E. Populated only when the GPU
      * is present and the budget allows. */
-    void **geg, **geu, **ged;
-    int  gpu_experts;
     double mem_budget, mem_used;
     int ctx_hint;                  /* max context, for KV headroom accounting */
     int gpu_attn, gpu_attn_cap;    /* GPU flash attention for full layers      */
@@ -903,82 +901,6 @@ static void load_gpu_weights(Model *m) {
 #endif
 
 /* one row of a resident weight as f32 (see the note above wt_to_gpu's block). */
-/* ---- routed experts on the GPU (LAGUNA-FORK) --------------------------------
- * The ANE investigation (docs/ane-investigation.md) ruled out the NPU for this
- * phase -- baked weights cannot express per-token expert selection -- and pointed
- * back at the GPU, whose measured 15.6 TFLOP/s f16 is 52x the CPU's 0.3 TOP/s
- * UDOT rate.
- *
- * Layout: all E experts of a layer are stacked into ONE f16 buffer per matrix,
- * so a layer costs 3 uploads rather than 3*E, and a per-expert GEMM is just an
- * offset into it. Uploaded once at load, so the compile-time-weights problem that
- * kills the ANE does not exist here.
- *
- * Memory: E*3*I*D at f16 per layer. For XS that is 1.6 GB/layer, 63 GB for all
- * 39 -- far too much, so this is bounded by LAGUNA_GPU_EXPERT_GB and fills as
- * many layers as fit. Layers that miss out use the CPU path, which still works.
- */
-#ifdef LAGUNA_METAL
-static void load_gpu_experts(Model *m) {
-    Cfg *c = &m->c;
-    if (!lg_metal_available()) return;
-    /* whatever the budget has left after weights, projections and KV headroom */
-    double budget = m->mem_budget - m->mem_used;
-    if (budget <= 1e9) return;
-    int L = c->n_layers, E = c->n_experts, I = c->moe_inter, D = c->hidden;
-    m->geg = calloc(L, sizeof(void*));
-    m->geu = calloc(L, sizeof(void*));
-    m->ged = calloc(L, sizeof(void*));
-    if (!m->geg || !m->geu || !m->ged) return;
-
-    /* staging: one matrix's worth of all experts, reused per layer */
-    int64_t rows_gu = (int64_t)E * I, rows_d = (int64_t)E * D;
-    uint16_t *stage = malloc((size_t)(rows_gu > rows_d ? rows_gu : rows_d) *
-                             (size_t)(D > I ? D : I) * 2);
-    if (!stage) return;
-    float *row = malloc((size_t)(D > I ? D : I) * sizeof(float));
-    if (!row) { free(stage); return; }
-
-    double spent = 0; int done = 0;
-    double t0 = now_s();
-    for (int li = 0; li < L && spent < budget; li++) {
-        if (!c->sparse[li]) continue;
-        double need = (double)(2*rows_gu*D + rows_d*I) * 2;
-        if (spent + need > budget) break;
-        /* three matrices: gate[E*I, D], up[E*I, D], down[E*D, I] */
-        for (int which = 0; which < 3; which++) {
-            int rows = which < 2 ? (int)rows_gu : (int)rows_d;
-            int cols = which < 2 ? D : I;
-            int per  = which < 2 ? I : D;
-            for (int e = 0; e < E; e++) {
-                Q8R *q = which == 0 ? &m->eg[(int64_t)li*E+e]
-                       : which == 1 ? &m->eu[(int64_t)li*E+e]
-                                    : &m->ed[(int64_t)li*E+e];
-                if (!q8r_valid(q)) { free(stage); free(row); return; }
-                for (int o = 0; o < per; o++) {
-                    oq_dequant_row(q->codes, q->scale, q->bias, o, cols,
-                                   q->bits, q->gs, row);
-                    uint16_t *dst = stage + ((int64_t)e*per + o) * cols;
-                    for (int i = 0; i < cols; i++) {
-                        __fp16 h = (__fp16)row[i];
-                        memcpy(&dst[i], &h, 2);
-                    }
-                }
-            }
-            void *hh = lg_metal_upload_f16(stage, rows, cols);
-            if (!hh) { free(stage); free(row); return; }
-            if (which == 0) m->geg[li] = hh;
-            else if (which == 1) m->geu[li] = hh;
-            else m->ged[li] = hh;
-        }
-        spent += need; done++;
-    }
-    free(stage); free(row);
-    m->gpu_experts = done;
-    fprintf(stderr, "[metal] %d MoE layers of experts on GPU (%.2f GB, %.1fs)\n",
-            done, spent/1e9, now_s()-t0);
-}
-#endif
 
 static void wt_row_f32(Wt w, int64_t row, float *out, int n) {
     if (w.qbits)  oq_dequant_row(w.q32, w.qs, w.qb, (int)row, n, w.qbits, w.gs, out);
@@ -1126,6 +1048,28 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         const char *cm = getenv("CTX_MAX");
         m->ctx_hint = cm ? atoi(cm) : 8192;
     }
+#ifdef LAGUNA_METAL
+    /* RESERVE the GPU attention K/V first. Priority matters: measured at 30k
+     * context it is 3.66x on the largest phase (attention 839.8 -> 229.7 s),
+     * while the resident expert bank is 1.5x on a smaller one. Letting the bank
+     * claim the budget first meant a 20 GB run silently fell back to CPU
+     * attention -- the slower configuration -- because nothing was left. */
+    if (lg_metal_init()) {
+        int cap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
+        int nfull = 0;
+        for (int i = 0; i < c->n_layers; i++) if (!c->slide[i]) nfull++;
+        double need = (double)nfull * c->n_kv * cap * c->head_dim * 2 * 2;
+        if (need <= m->mem_budget * 0.5) {      /* never let it eat the whole budget */
+            m->gpu_attn = 1; m->gpu_attn_cap = cap;
+            m->mem_used += need;
+            fprintf(stderr, "[metal] flash attention on %d full layers, ctx %d (%.2f GB)\n",
+                    nfull, cap, need/1e9);
+        } else {
+            fprintf(stderr, "[metal] flash attention needs %.2f GB (>half of budget) -> CPU\n",
+                    need/1e9);
+        }
+    }
+#endif
     if (m->experts == EXP_OQ) {
         {
             /* packed codes at the checkpoint's own bit width + f32 scale/bias/rsum
@@ -1153,27 +1097,6 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 
 #ifdef LAGUNA_METAL
     load_gpu_weights(m);
-    /* GPU flash attention for the full-attention layers. Sized to the context the
-     * user asked for (CTX_MAX), because the f16 K/V for those layers is the one
-     * GPU allocation that scales with context: 10 full layers x 8 kv x hd=128 is
-     * 0.31 GiB at 8k and 10.0 GiB at 256k. Charged against the same budget as
-     * everything else, and simply not enabled if it does not fit. */
-    if (lg_metal_available()) {
-        int nfull = 0;
-        for (int i = 0; i < c->n_layers; i++) if (!c->slide[i]) nfull++;
-        int cap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
-        double need = (double)nfull * c->n_kv * cap * c->head_dim * 2 * 2;
-        if (need <= m->mem_budget - m->mem_used) {
-            m->gpu_attn = 1; m->gpu_attn_cap = cap;
-            m->mem_used += need;
-            fprintf(stderr, "[metal] flash attention on %d full layers, ctx %d (%.2f GB)\n",
-                    nfull, cap, need/1e9);
-        } else {
-            fprintf(stderr, "[metal] flash attention needs %.2f GB, budget has %.2f -> CPU\n",
-                    need/1e9, (m->mem_budget - m->mem_used)/1e9);
-        }
-    }
-    if (m->resident) load_gpu_experts(m);   /* needs the Q8R bank as its source */
 #endif
 
     rt_init(LAGUNA_NAME, c->n_layers, c->n_experts);
@@ -1349,10 +1272,17 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * so keys are uploaded once rather than re-read per query. Falls through to
      * the CPU path on any failure (no device, context beyond the allocation),
      * which is why the CPU KV append below still runs unconditionally. */
+    /* FULL-ATTENTION LAYERS ONLY, and that is a measured decision, not an
+     * oversight. Sending sliding layers here too was tried: the GEMM has no way
+     * to skip out-of-window keys, so it computes the whole S x nkey matrix and
+     * lets softmax_causal mask it away -- 6x redundant work at 6k, 29x at 30k.
+     * Measured: 2k improved 9.8 -> 8.6 s, but 6k regressed 32.4 -> 53.1 s.
+     * The CPU loop skips those keys outright, so sliding layers stay there. */
     if (!c->slide[li] && m->gpu_attn &&
         lg_metal_attn_alloc(c->n_layers, li, KV, m->gpu_attn_cap, hd)) {
         lg_metal_attn_append(li, pos0, S, k, vv, kvdim);
-        if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale))
+        if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale,
+                          c->slide[li] ? c->window : 0))
             goto attn_out;   /* the output gate is applied by scatter_o */
     }
 #endif
@@ -1554,59 +1484,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
 
         double te = now_s();
-        /* ---- BATCHED GPU EXPERT DISPATCH (LAGUNA-FORK) ----------------------
-         * Issue all of this layer's expert GEMMs from ONE thread. The earlier
-         * attempt called Metal from inside `#pragma omp parallel` and threads
-         * raced on the shared MPS scratch/wrapper cache, tripping
-         *   "Number of requested rows in result exceeds result matrix size".
-         * Serializing the dispatch removes the race by construction, and costs
-         * nothing: the GPU is the parallel device here, so the CPU only needs to
-         * gather rows and enqueue.
-         *
-         * This also repairs what chunked prefill broke. With LG_CHUNK=1024 each
-         * expert sees ~40 rows instead of ~240, and the CPU UDOT kernel loses its
-         * batching (measured: expert-mm 15.1s -> 71.2s at 1902 tokens). A GEMM of
-         * 40x3072 against a resident f16 weight does not care.
-         */
-#ifdef LAGUNA_METAL
-        if (m->geg && m->geg[layer]) {
-            int64_t mx = 0;
-            for (int e = 0; e < E; e++) {
-                int64_t n = estart[e+1] - estart[e];
-                if (n > mx) mx = n;
-            }
-            float *xb = afloat(mx*D), *gb = afloat(mx*I);
-            float *ub = afloat(mx*I), *hb = afloat(mx*D);
-            int done_all = 1;
-            for (int e = 0; e < E && done_all; e++) {
-                int g0 = estart[e], nr = estart[e+1] - g0;
-                if (nr <= 0) continue;
-                for (int r = 0; r < nr; r++)
-                    memcpy(xb + (int64_t)r*D, x + (vis[g0+r]/K)*D, (size_t)D*sizeof(float));
-                if (!lg_metal_gemm_rows(m->geg[layer], gb, xb, nr, e*I, I) ||
-                    !lg_metal_gemm_rows(m->geu[layer], ub, xb, nr, e*I, I)) { done_all = 0; break; }
-                for (int64_t i = 0; i < (int64_t)nr*I; i++) gb[i] = siluf(gb[i]) * ub[i];
-                if (!lg_metal_gemm_rows(m->ged[layer], hb, gb, nr, e*D, D)) { done_all = 0; break; }
-                for (int r = 0; r < nr; r++) {
-                    int64_t t = vis[g0+r];
-                    int s = (int)(t / K), kk = (int)(t % K);
-                    float sc = wgt[(int64_t)s*K + kk];
-                    float *os = out + (int64_t)s*D, *hr = hb + (int64_t)r*D;
-                    for (int d = 0; d < D; d++) os[d] += sc * hr[d];
-                }
-            }
-            if (done_all) {
-                m->t_expert += now_s() - te;
-                m->hits += npair;
-                visit = NULL;
-                goto moe_shared;
-            }
-            /* partial failure: fall through to the CPU path, which recomputes
-             * from scratch. `out` was only written for experts that succeeded, so
-             * zero it again to avoid double-accumulation. */
-            memset(out, 0, (size_t)S*D*sizeof(float));
-        }
-#endif
+        /* Experts stay on the CPU. A GPU version was built and measured: at
+         * LG_CHUNK=256 each expert sees ~8 rows, and an 8x2048 @ 2048x512 GEMM
+         * is far too small for MPS -- dispatch dominates. It cost 8 GB of f16
+         * weights to make expert-mm 2.5x SLOWER (13.7 -> 33.8 s), so it was
+         * removed rather than left behind a flag. UDOT needs no dispatch. */
         #pragma omp parallel
         {
             int64_t rcap = 0;
@@ -2007,6 +1889,9 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     }
     double dt = now_s() - t1;
     int gen = len - np;
+#ifdef LAGUNA_METAL
+    lg_metal_prof_dump();
+#endif
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
            t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());
     double tot = m->hits + m->miss;

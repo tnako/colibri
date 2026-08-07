@@ -82,24 +82,6 @@ void *lg_metal_upload(const float *w, int rows, int cols) {
     }
 }
 
-/* Upload an already-dequantized f16 buffer directly. Used by the MoE path, which
- * dequantizes a whole layer's experts into one contiguous staging buffer: the ANE
- * investigation (docs/ane-investigation.md) confirmed the GPU is the right target
- * for this, and one big upload beats 256 small ones. */
-void *lg_metal_upload_f16(const void *w16, int rows, int cols) {
-    if (!g_ok) return NULL;
-    @autoreleasepool {
-        size_t n = (size_t)rows * cols;
-        id<MTLBuffer> b = [g_dev newBufferWithBytes:w16 length:n*2
-                                            options:MTLResourceStorageModeShared];
-        if (!b) return NULL;
-        LgMetalW *h = (LgMetalW*)calloc(1, sizeof(LgMetalW));
-        h->raw = (void*)CFBridgingRetain(b);
-        h->rows = rows; h->cols = cols;
-        return h;
-    }
-}
-
 void lg_metal_free(void *handle) {
     if (!handle) return;
     LgMetalW *h = (LgMetalW*)handle;
@@ -141,17 +123,9 @@ static void *ensure_buf(void **slot, size_t *cap, size_t need) {
  * Returns 0 when it declines (no device, buffer failure) so the caller runs the
  * CPU path. */
 int lg_metal_gemm(void *handle, float *y, const float *x, int S) {
-    return lg_metal_gemm_rows(handle, y, x, S, 0, 0);
-}
-
-/* Same, but restricted to N rows starting at row0 of the weight buffer -- lets a
- * stacked per-expert bank be addressed without a separate handle per expert. */
-int lg_metal_gemm_rows(void *handle, float *y, const float *x, int S,
-                       int row0, int nrows) {
     if (!g_ok || !handle) return 0;
     LgMetalW *h = (LgMetalW*)handle;
-    int K = h->cols, N = nrows > 0 ? nrows : h->rows;
-    if (row0 + N > h->rows) return 0;
+    int K = h->cols, N = h->rows, row0 = 0;
     @autoreleasepool {
         void *a_before = g_a, *c_before = g_c;
         if (!ensure_buf(&g_a, &g_acap, (size_t)S*K*2)) return 0;

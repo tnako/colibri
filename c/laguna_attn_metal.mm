@@ -146,6 +146,25 @@ static void *ensure(void **slot, size_t *cap, size_t need) {
 static AttnLayer *g_al = NULL;
 static int g_al_n = 0;
 
+/* GPU-side profiling. cb.GPUStartTime/GPUEndTime are the same timestamps
+ * Instruments reports; reading them in-process avoids needing Xcode (not
+ * installed here -- only CommandLineTools, so no xctrace). LAGUNA_GPU_PROF=1. */
+static int    g_prof = -1;
+static double g_gpu_s = 0, g_wall_s = 0;
+static long   g_calls = 0;
+
+static int prof_on(void) {
+    if (g_prof < 0) { const char *e = getenv("LAGUNA_GPU_PROF"); g_prof = e ? atoi(e) : 0; }
+    return g_prof;
+}
+
+void lg_metal_prof_dump(void) {
+    if (!prof_on() || g_calls == 0) return;
+    fprintf(stderr,
+        "[gpuprof] attn: %ld dispatches, GPU busy %.2fs, wall %.2fs (%.0f%% busy)\n",
+        g_calls, g_gpu_s, g_wall_s, 100.0*g_gpu_s/g_wall_s);
+}
+
 static int attn_pipeline(void) {
     if (g_pipe_sm) return 1;
     id<MTLDevice> d = lg_metal_device();
@@ -210,7 +229,7 @@ void lg_metal_attn_append(int layer, int pos0, int S, const float *k, const floa
  * both GEMMs on MPS. win>0 restricts to a sliding window (unused for now: only
  * full-attention layers take this path). */
 int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
-                  int S, int pos0, int H, int KV, int hd, float scale) {
+                  int S, int pos0, int H, int KV, int hd, float scale, int window) {
     if (!g_al || !g_pipe_sm || layer < 0 || layer >= g_al_n) return 0;
     AttnLayer *L = &g_al[layer];
     if (!L->K || pos0 + S > L->ctxcap) return 0;
@@ -259,7 +278,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         id<MTLComputePipelineState> psm = (__bridge id<MTLComputePipelineState>)g_pipe_sm;
         id<MTLComputePipelineState> pgq = (__bridge id<MTLComputePipelineState>)g_pipe_gq;
         id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)g_pipe_so;
-        int win = 0;
+        int win = window;
 
         id<MTLCommandBuffer> cb = [cq commandBuffer];
         for (int hq = 0; hq < H; hq++) {
@@ -312,9 +331,15 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
           threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
             [e3 endEncoding];
         }
+        double w0 = prof_on() ? CFAbsoluteTimeGetCurrent() : 0;
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.status == MTLCommandBufferStatusError) return 0;
+        if (prof_on()) {
+            g_wall_s += CFAbsoluteTimeGetCurrent() - w0;
+            g_gpu_s  += cb.GPUEndTime - cb.GPUStartTime;
+            g_calls++;
+        }
         memcpy(ctx_out, [OD contents], (size_t)S*qdim*4);
     }
     return 1;

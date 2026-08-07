@@ -17,16 +17,11 @@ const char *lg_metal_name(void);
 
 /* Upload row-major f32 [rows][cols] as f16. NULL on failure. */
 void  *lg_metal_upload(const float *w, int rows, int cols);
-/* Same, but the source is already f16 (one big staging buffer, no conversion). */
-void  *lg_metal_upload_f16(const void *w16, int rows, int cols);
 void   lg_metal_free(void *handle);
 size_t lg_metal_bytes(void *handle);
 
 /* y[S,rows] = x[S,cols] @ W^T. Returns 1 if it ran on the GPU, 0 to fall back. */
 int    lg_metal_gemm(void *handle, float *y, const float *x, int S);
-/* N rows starting at row0 -- for a stacked per-expert weight bank. */
-int    lg_metal_gemm_rows(void *handle, float *y, const float *x, int S,
-                          int row0, int nrows);
 
 /* ---- GPU flash attention (full-attention layers only) --------------------
  * Persistent per-layer f16 K/V on the GPU; append per chunk, one dispatch per
@@ -36,8 +31,12 @@ int    lg_metal_attn_alloc(int layers, int layer, int kv, int ctxcap, int hd);
 void   lg_metal_attn_append(int layer, int pos0, int S, const float *k,
                             const float *vv, int kvdim);
 int    lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
-                     int S, int pos0, int H, int KV, int hd, float scale);
+                     int S, int pos0, int H, int KV, int hd, float scale, int window);
 size_t lg_metal_attn_bytes(int layer);
+/* GPU busy vs wall for the attention dispatches (LAGUNA_GPU_PROF=1). */
+void   lg_metal_prof_dump(void);
+/* GPU busy vs wall time for the attention dispatches (LAGUNA_GPU_PROF=1). */
+void   lg_metal_prof_dump(void);
 
 #ifdef __cplusplus
 }
