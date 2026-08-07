@@ -185,6 +185,12 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 #endif
+/* Prefill chunk size. Defined here because both the memory budget and the
+ * attention path need it; the chunking itself is in step() far below. */
+#ifndef LG_CHUNK
+#define LG_CHUNK 256
+#endif
+
 /* ---- per-step scratch arena (LAGUNA-FORK) ----------------------------------
  * attention() and moe() allocate ~26 S-sized buffers per layer with malloc and
  * free them again. Over 40 layers per pass that churns thousands of large
@@ -1056,9 +1062,16 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * attention -- the slower configuration -- because nothing was left. */
     if (lg_metal_init()) {
         int cap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
-        int nfull = 0;
-        for (int i = 0; i < c->n_layers; i++) if (!c->slide[i]) nfull++;
-        double need = (double)nfull * c->n_kv * cap * c->head_dim * 2 * 2;
+        /* Full layers need the whole context linearly. Sliding layers get a
+         * double-mapped ring of 2*(window+chunk) rows, which keeps every band
+         * contiguous while costing 1536 rows instead of `cap`. At 250k that is
+         * 11.4 GiB instead of 45.8 GiB for 48 layers. */
+        int nfull = 0, nslide = 0;
+        for (int i = 0; i < c->n_layers; i++) { if (c->slide[i]) nslide++; else nfull++; }
+        int sring = 2 * (c->window + LG_CHUNK);
+        if (sring > cap) sring = cap;
+        double need = ((double)nfull * cap + (double)nslide * sring)
+                    * c->n_kv * c->head_dim * 2 * 2;
         if (need <= m->mem_budget * 0.5) {      /* never let it eat the whole budget */
             m->gpu_attn = 1; m->gpu_attn_cap = cap;
             m->mem_used += need;
@@ -1272,14 +1285,21 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * so keys are uploaded once rather than re-read per query. Falls through to
      * the CPU path on any failure (no device, context beyond the allocation),
      * which is why the CPU KV append below still runs unconditionally. */
-    /* FULL-ATTENTION LAYERS ONLY, and that is a measured decision, not an
-     * oversight. Sending sliding layers here too was tried: the GEMM has no way
-     * to skip out-of-window keys, so it computes the whole S x nkey matrix and
-     * lets softmax_causal mask it away -- 6x redundant work at 6k, 29x at 30k.
-     * Measured: 2k improved 9.8 -> 8.6 s, but 6k regressed 32.4 -> 53.1 s.
-     * The CPU loop skips those keys outright, so sliding layers stay there. */
-    if (!c->slide[li] && m->gpu_attn &&
-        lg_metal_attn_alloc(c->n_layers, li, KV, m->gpu_attn_cap, hd)) {
+    /* Both layer kinds, now that the kernel is BANDED. A first attempt sent
+     * sliding layers through the dense path, which computed the whole S x nkey
+     * matrix and masked it away: 6x wasted work at 6k, and it regressed
+     * 32.4 -> 53.1 s. The band restricts the GEMM to the window+chunk-1 columns
+     * a chunk can actually reach, which is constant in context, so sliding layers
+     * are now O(S*window) on the GPU exactly as they were on the CPU. */
+    /* Sliding layers only go to the GPU once the context is long enough to pay
+     * for the dispatch. Measured on XS: at 2k the band is 767 of 2000 columns, so
+     * the CPU still wins (attn 9.8 s CPU-sliding vs 13.0 s all-GPU); by 6k the
+     * band is 767 of 6000 and the GPU wins (32.2 -> 21.8 s). The crossover sits
+     * near 4x the window, which is where the band stops being most of the row. */
+    int gpu_ok = m->gpu_attn && (!c->slide[li] || pos0 + S >= 4 * c->window);
+    if (gpu_ok &&
+        lg_metal_attn_alloc(c->n_layers, li, KV, m->gpu_attn_cap, hd,
+                            c->slide[li] ? c->window + LG_CHUNK : 0)) {
         lg_metal_attn_append(li, pos0, S, k, vv, kvdim);
         if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale,
                           c->slide[li] ? c->window : 0))
@@ -1786,14 +1806,11 @@ static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
  * The chunk is large enough that per-call overhead is amortized and the GPU GEMMs
  * still see plenty of rows (LG_CHUNK=1024 keeps MPS well above its efficiency
  * threshold, measured 15.5 TFLOP/s at S>=1024). */
-/* Swept with c/tools/tune_chunk.sh on XS at 1902 tokens: prefill is flat across
- * 256..4096 (29.7-32.5 s, i.e. noise) but peak RSS is not -- 16.5 GB at 256
- * against 20.2 GB at 4096, because every scratch buffer is O(chunk). Since the
- * goal is long context inside a fixed memory budget, take the smallest chunk that
- * does not lose speed. */
-#ifndef LG_CHUNK
-#define LG_CHUNK 256
-#endif
+/* LG_CHUNK is defined at the top of this file. Swept with c/tools/tune_chunk.sh
+ * on XS at 1902 tokens: prefill is flat across 256..4096 (29.7-32.5 s, i.e.
+ * noise) but peak RSS is not -- 16.5 GB at 256 against 20.2 GB at 4096, because
+ * every scratch buffer is O(chunk). The goal is long context inside a fixed
+ * budget, so take the smallest chunk that costs no speed. */
 
 static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     if (S <= LG_CHUNK) return step_raw(m, ids, S, pos0, tf_out);

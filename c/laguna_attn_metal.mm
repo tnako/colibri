@@ -38,10 +38,14 @@ using namespace metal;
  * One threadgroup per row: max, then exp-and-sum, then normalize. Keeping this
  * on the GPU is the whole point -- downloading the score matrix to softmax on
  * the CPU would be 256 MiB per head at 256k context. */
+/* `k0` is the absolute position of score column 0. It is 0 for a full-attention
+ * layer (columns are absolute positions) and the band origin for a sliding layer,
+ * where only `window + chunk - 1` columns are materialized. */
 kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
                            constant int&       nkey [[buffer(1)]],
                            constant int&       pos0 [[buffer(2)]],
                            constant int&       win  [[buffer(3)]],
+                           constant int&       k0   [[buffer(4)]],
                            uint  row  [[threadgroup_position_in_grid]],
                            uint  lane [[thread_position_in_threadgroup]],
                            uint  W    [[threads_per_threadgroup]]) {
@@ -49,6 +53,7 @@ kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
     int qpos = pos0 + int(row);
     int lo = 0;
     if (win > 0) { lo = qpos - win + 1; if (lo < 0) lo = 0; }
+    lo -= k0; qpos -= k0;             /* into band-local column space */
 
     threadgroup float red[32];
     float m = -INFINITY;
@@ -110,9 +115,20 @@ kernel void scatter_o(device const half*  OT [[buffer(0)]],
 )";
 
 typedef struct {
-    void *K, *V;          /* CFBridgingRetain'd MTLBuffer, f16 [KV][ctxcap][hd] */
+    void *K, *V;          /* CFBridgingRetain'd MTLBuffer, f16 [KV][phys][hd] */
     int kv, ctxcap, hd;
+    int ring;             /* 0 = linear (full layers); else rows before wrap    */
 } AttnLayer;
+
+/* A sliding layer only ever reads the last `window` positions, so its GPU cache
+ * needs window+chunk rows, not the whole context: at 250k that is the difference
+ * between 45.8 GiB for 48 layers and 11.4 GiB for the 12 full ones.
+ *
+ * But the banded GEMM addresses its band as ONE contiguous row range, and a plain
+ * ring would split it at the wrap. The fix is the standard double-mapped ring:
+ * physical capacity is 2*ring and every row is written at both `r` and `r+ring`,
+ * so any window-length span starting anywhere in [0,ring) is contiguous. Costs 2x
+ * a ring (1536 rows) instead of 250000. */
 
 /* Scores and PV are plain GEMMs, so MPSMatrixMultiplication does them: measured
  * 15572 GFLOP/s on this device against ~81 GFLOP/s for a hand-written
@@ -184,13 +200,15 @@ static int attn_pipeline(void) {
     return 1;
 }
 
-int lg_metal_attn_alloc(int layers, int layer, int kv, int ctxcap, int hd) {
+int lg_metal_attn_alloc(int layers, int layer, int kv, int ctxcap, int hd, int ring) {
     if (!lg_metal_device() || !attn_pipeline()) return 0;
     if (!g_al) { g_al = (AttnLayer*)calloc(layers, sizeof(AttnLayer)); g_al_n = layers; }
     if (layer < 0 || layer >= g_al_n) return 0;
     AttnLayer *L = &g_al[layer];
-    if (L->K && L->ctxcap >= ctxcap) return 1;
-    size_t bytes = (size_t)kv * ctxcap * hd * 2;
+    if (ring > 0 && ring >= ctxcap) ring = 0;      /* fits anyway: stay linear */
+    if (L->K && L->ctxcap >= ctxcap && L->ring == ring) return 1;
+    int phys = ring > 0 ? 2*ring : ctxcap;
+    size_t bytes = (size_t)kv * phys * hd * 2;
     id<MTLDevice> d = lg_metal_device();
     id<MTLBuffer> kb = [d newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> vb = [d newBufferWithLength:bytes options:MTLResourceStorageModeShared];
@@ -199,7 +217,7 @@ int lg_metal_attn_alloc(int layers, int layer, int kv, int ctxcap, int hd) {
     if (L->V) CFRelease((CFTypeRef)L->V);
     L->K = (void*)CFBridgingRetain(kb);
     L->V = (void*)CFBridgingRetain(vb);
-    L->kv = kv; L->ctxcap = ctxcap; L->hd = hd;
+    L->kv = kv; L->ctxcap = ctxcap; L->hd = hd; L->ring = ring;
     return 1;
 }
 
@@ -212,15 +230,19 @@ void lg_metal_attn_append(int layer, int pos0, int S, const float *k, const floa
     __fp16 *kb = (__fp16*)[(__bridge id<MTLBuffer>)L->K contents];
     __fp16 *vb = (__fp16*)[(__bridge id<MTLBuffer>)L->V contents];
     int hd = L->hd;
+    int R = L->ring, phys = R > 0 ? 2*R : L->ctxcap;
     for (int h = 0; h < L->kv; h++) {
         for (int s = 0; s < S; s++) {
             int t = pos0 + s;
-            if (t >= L->ctxcap) break;
+            if (R == 0 && t >= L->ctxcap) break;
             const float *ks = k  + (int64_t)s*kvdim + (int64_t)h*hd;
             const float *vs = vv + (int64_t)s*kvdim + (int64_t)h*hd;
-            __fp16 *kd = kb + ((int64_t)h*L->ctxcap + t)*hd;
-            __fp16 *vd = vb + ((int64_t)h*L->ctxcap + t)*hd;
-            for (int d = 0; d < hd; d++) { kd[d] = (__fp16)ks[d]; vd[d] = (__fp16)vs[d]; }
+            int slot = R > 0 ? t % R : t;
+            for (int rep = 0; rep < (R > 0 ? 2 : 1); rep++) {
+                int64_t row = (int64_t)h*phys + slot + (int64_t)rep*R;
+                __fp16 *kd = kb + row*hd, *vd = vb + row*hd;
+                for (int d = 0; d < hd; d++) { kd[d] = (__fp16)ks[d]; vd[d] = (__fp16)vs[d]; }
+            }
         }
     }
 }
@@ -233,7 +255,23 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
     if (!g_al || !g_pipe_sm || layer < 0 || layer >= g_al_n) return 0;
     AttnLayer *L = &g_al[layer];
     if (!L->K || pos0 + S > L->ctxcap) return 0;
-    int nkey = pos0 + S, group = H / KV, qdim = H * hd;
+    /* BANDED (LAGUNA-FORK): a sliding layer's queries in this chunk span absolute
+     * positions [pos0, pos0+S), so the only keys any of them can attend are
+     * [pos0-window+1, pos0+S). That band is window+S-1 wide -- CONSTANT in
+     * context -- while a full layer needs all pos0+S keys. At 262144 tokens with
+     * window 512 and chunk 256 that is 341x fewer score columns, which is what
+     * makes the GPU viable for sliding layers at all: the dense version computed
+     * the whole matrix and masked it away (measured 32.4 -> 53.1 s at 6k).
+     *
+     * The cache is linear per kv head, so the band is a contiguous row range and
+     * costs only an offset -- no gather. */
+    int k0 = 0, nkey = pos0 + S;
+    if (window > 0) {
+        k0 = pos0 - window + 1;
+        if (k0 < 0) k0 = 0;
+        nkey = pos0 + S - k0;
+    }
+    int group = H / KV, qdim = H * hd;
     id<MTLDevice> d = lg_metal_device();
     id<MTLCommandQueue> cq = lg_metal_queue();
 
@@ -283,7 +321,9 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         id<MTLCommandBuffer> cb = [cq commandBuffer];
         for (int hq = 0; hq < H; hq++) {
             int kh = hq / group, off = hq * hd;
-            size_t koff = (size_t)kh * L->ctxcap * hd * 2;
+            int phys = L->ring > 0 ? 2*L->ring : L->ctxcap;
+            int kbase = L->ring > 0 ? (k0 % L->ring) : k0;
+            size_t koff = ((size_t)kh * phys + (size_t)kbase) * hd * 2;
 
             id<MTLComputeCommandEncoder> e1 = [cb computeCommandEncoder];
             [e1 setComputePipelineState:pgq];
@@ -308,6 +348,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
             [e2 setBytes:&nkey length:4 atIndex:1];
             [e2 setBytes:&pos0 length:4 atIndex:2];
             [e2 setBytes:&win  length:4 atIndex:3];
+            [e2 setBytes:&k0   length:4 atIndex:4];
             [e2 dispatchThreadgroups:MTLSizeMake((NSUInteger)S, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             [e2 endEncoding];
