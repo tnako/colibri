@@ -102,15 +102,31 @@ The 18.9 GiB in the streaming rows above is **not** the Metal port. Measured on 
 There is a **4.98 GB floor** reported at load, which is page-cached safetensors
 data: the OS counts mapped file pages against RSS, and they are evictable rather
 than committed. The variable part above that floor is the f32 expert cache, which
-`CAP` controls directly. So for a memory-constrained run the lever is `CAP`, and
-the honest statement is that peak RSS at long context is dominated by cache slots
-plus per-call scratch, not by the GPU copies (3.10 GB, bounded by
-`LAGUNA_GPU_BUDGET_GB`).
+`CAP` controls directly.
+
+**But `CAP` stops being an effective lever at long context**, and the 512-token
+table above does not generalize. Measured at 6144 tokens with the same binary:
+
+| CAP | peak RSS @6144 |
+|---|---|
+| 16 | 19.68 GiB |
+| 48 | 18.88 GiB |
+
+Effectively identical, and not ordered the way CAP would predict. At long context
+the per-call scratch (q/ctx are S*qdim f32 = 151 MB each, plus nrm/tmp/shared) and
+the KV cache dominate, so shrinking the expert cache reclaims little. Reducing
+peak RSS at 6K therefore needs the scratch itself addressed -- f16 or chunked
+prefill -- not a smaller cache.
+
+Honest summary of the memory picture: the Metal port adds a bounded 3.10 GB
+(`LAGUNA_GPU_BUDGET_GB`), the resident bank adds 13.7 GB and is opt-in, and the
+~19 GiB seen in long-context streaming runs is mostly scratch plus page cache
+that none of this work reduced.
 
 ## Current recommended configurations
 
 ```
-# lowest memory, still gets the GPU attention win
+# lowest memory on SHORT prompts (CAP is only effective there -- see above)
 CAP=8 ./c/laguna_xs_metal ...
 
 # fastest prefill, needs ~18 GiB
@@ -119,6 +135,11 @@ LAGUNA_RESIDENT=1 ./c/laguna_xs_metal ...
 # no GPU at all (other platforms, or to A/B the port)
 ./c/laguna_xs ...
 ```
+
+At 6144 tokens every streaming configuration lands near 19 GiB regardless of
+`CAP`, so there is currently no long-context configuration that fits a ~13 GiB
+budget. That is an open problem, not a solved one: the fix is f16 or chunked
+prefill scratch, which is not done.
 
 ## Correctness
 
