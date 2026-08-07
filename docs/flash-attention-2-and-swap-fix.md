@@ -55,6 +55,15 @@ Back-to-back on Laguna-XS, same prompts:
 | 6,000 | 32.0 s | 6.43 s | **30.2 s** | 6.45 s | 1.06x |
 | 12,000 | **62.6 s** | 16.11 s | 67.4 s | 18.74 s | 0.93x |
 
+**Read these as a ratio, not as absolutes.** This batch ran under heavy CPU
+contention (a browser at 85%, later a background shortcut runner at 66%), so its
+prefill times are ~2.9x the clean figures elsewhere in these docs -- 72.5 s at 2k
+here against 25.1 s clean, 428.7 s at 12k against 139.4 s. The comparison is still
+sound because both arms ran back-to-back under identical load, and the GPU-busy
+column is GPU-side and barely moves with CPU load. But do not compare an attn
+number from this table against a clean one from another document and conclude
+there was a regression.
+
 **A wash, trending worse with context.** GPU busy time is slightly *higher* for
 FA2 at 12k (18.74 vs 16.11 s), so it is doing more work, not less.
 
