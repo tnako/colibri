@@ -33,6 +33,9 @@ void   lg_metal_attn_append(int layer, int pos0, int S, const float *k,
 int    lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                      int S, int pos0, int H, int KV, int hd, float scale, int window);
 size_t lg_metal_attn_bytes(int layer);
+/* FlashAttention-2 streaming variant: no score matrix, O(tile) memory. */
+int    lg_metal_attn2(int layer, float *ctx_out, const float *q, const float *gt,
+                      int S, int pos0, int H, int KV, int hd, float scale, int window);
 /* GPU busy vs wall for the attention dispatches (LAGUNA_GPU_PROF=1). */
 void   lg_metal_prof_dump(void);
 /* GPU busy vs wall time for the attention dispatches (LAGUNA_GPU_PROF=1). */

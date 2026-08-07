@@ -83,6 +83,111 @@ kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
     for (int t = int(lane); t < nkey; t += int(W)) r[t] = half(float(r[t]) * inv);
 }
 
+/* ---- FlashAttention-2 style streaming kernel (LAGUNA-FORK) -------------------
+ * One threadgroup per (query, head). Keys are consumed in tiles of KT: each tile
+ * is staged into threadgroup memory cooperatively, then every thread scores its
+ * own query against it and folds the result into a running (max, denom, accum).
+ *
+ * Why this and not the GEMM path: the GEMM materializes an [S, nkey] score matrix,
+ * which at 250k context is 128 MiB per head per chunk and forces a full-context
+ * f16 K/V on the GPU (13.1 GB for Laguna-S). This kernel never materializes
+ * scores at all and reads K/V straight from the cache, so its memory is O(tile).
+ *
+ * The online-softmax rescale is the FA2 formulation: keep m = running max and
+ * l = running sum, and on a new tile max m' compute the correction exp(m - m')
+ * once per tile rather than once per key.
+ */
+#define KT   64      /* keys per tile      */
+#define TGQ  64      /* threads per group  */
+
+kernel void flash_attn2(device const half*  K    [[buffer(0)]],
+                        device const half*  V    [[buffer(1)]],
+                        device const float* Q    [[buffer(2)]],
+                        device float*       OUT  [[buffer(3)]],
+                        device const float* GT   [[buffer(4)]],
+                        constant int&       S    [[buffer(5)]],
+                        constant int&       pos0 [[buffer(6)]],
+                        constant int&       H    [[buffer(7)]],
+                        constant int&       hd   [[buffer(8)]],
+                        constant int&       group[[buffer(9)]],
+                        constant int&       phys [[buffer(10)]],
+                        constant int&       ring [[buffer(11)]],
+                        constant int&       win  [[buffer(12)]],
+                        constant float&     scale[[buffer(13)]],
+                        uint2 tg   [[threadgroup_position_in_grid]],
+                        uint2 lid  [[thread_position_in_threadgroup]]) {
+    uint lane = lid.x;
+    int s  = int(tg.x);
+    int hq = int(tg.y);
+    if (s >= S || hq >= H) return;
+    int kh = hq / group;
+    int qpos = pos0 + s;
+    int lo = 0;
+    if (win > 0) { lo = qpos - win + 1; if (lo < 0) lo = 0; }
+
+    threadgroup half  ktile[KT * 128];
+    threadgroup half  vtile[KT * 128];
+    threadgroup float stile[KT];
+
+    device const float* qr = Q + (long)s * (H*hd) + (long)hq * hd;
+    device const half*  Kh = K + (long)kh * phys * hd;
+    device const half*  Vh = V + (long)kh * phys * hd;
+
+    /* accumulator lives in registers, split across lanes by head-dim slice */
+    float acc = 0.0f;                    /* this lane owns dim d = lane        */
+    float m = -INFINITY, l = 0.0f;
+    bool  own = (int(lane) < hd);
+    float qv_own = own ? qr[lane] : 0.0f;
+
+    for (int t0 = lo; t0 <= qpos; t0 += KT) {
+        int tn = qpos - t0 + 1; if (tn > KT) tn = KT;
+        /* stage the tile cooperatively: every lane copies whole rows */
+        for (int j = int(lane); j < tn; j += TGQ) {
+            int tt = t0 + j;
+            int slot = ring > 0 ? (tt % ring) : tt;
+            device const half* ks = Kh + (long)slot * hd;
+            device const half* vs = Vh + (long)slot * hd;
+            for (int d = 0; d < hd; d++) {
+                ktile[j*128 + d] = ks[d];
+                vtile[j*128 + d] = vs[d];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Score the tile ONCE, keeping the scores in threadgroup memory, then do
+         * a single rescale for the whole tile (this is the FA2 saving: one
+         * exp(m-m') per tile instead of one per key). */
+        float tmax = -INFINITY;
+        for (int j = int(lane); j < tn; j += TGQ) {
+            float dot = 0.0f;
+            for (int d = 0; d < hd; d++) dot = fma(qr[d], float(ktile[j*128+d]), dot);
+            stile[j] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < tn; j++) if (stile[j] > tmax) tmax = stile[j];
+
+        float mnew = m > tmax ? m : tmax;
+        float corr = (m == -INFINITY) ? 0.0f : exp(m - mnew);
+        l *= corr;
+        if (own) acc *= corr;
+        m = mnew;
+
+        for (int j = 0; j < tn; j++) {
+            float w = exp(stile[j] - m);
+            l += w;
+            if (own) acc = fma(w, float(vtile[j*128 + lane]), acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (own) {
+        float g = GT[(long)s*H + hq];
+        float gate = g > 20.0f ? g : log(1.0f + exp(g));
+        float inv = l > 0.0f ? gate / l : 0.0f;
+        OUT[(long)s*(H*hd) + (long)hq*hd + lane] = acc * inv;
+    }
+}
+
 /* f32 -> f16 copy of one query head's rows, into a [S, hd] contiguous tile. */
 kernel void gather_q(device const float* Q  [[buffer(0)]],
                      device half*        QT [[buffer(1)]],
@@ -134,7 +239,7 @@ typedef struct {
  * 15572 GFLOP/s on this device against ~81 GFLOP/s for a hand-written
  * one-thread-per-query kernel (the first version of this file). Only the softmax
  * and the gather/scatter need custom shaders. */
-static void *g_pipe_sm = NULL, *g_pipe_gq = NULL, *g_pipe_so = NULL;
+static void *g_pipe_sm = NULL, *g_pipe_gq = NULL, *g_pipe_so = NULL, *g_pipe_fa = NULL;
 static void *g_qt = NULL, *g_sc = NULL, *g_ot = NULL;
 static size_t g_qtcap = 0, g_sccap = 0, g_otcap = 0;
 
@@ -194,6 +299,8 @@ static int attn_pipeline(void) {
     id<MTLComputePipelineState> gq = mk_pipe(lib, "gather_q");
     id<MTLComputePipelineState> so = mk_pipe(lib, "scatter_o");
     if (!sm || !gq || !so) return 0;
+    id<MTLComputePipelineState> fa = mk_pipe(lib, "flash_attn2");
+    if (fa) g_pipe_fa = (void*)CFBridgingRetain(fa);
     g_pipe_sm = (void*)CFBridgingRetain(sm);
     g_pipe_gq = (void*)CFBridgingRetain(gq);
     g_pipe_so = (void*)CFBridgingRetain(so);
@@ -382,6 +489,60 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
             g_calls++;
         }
         memcpy(ctx_out, [OD contents], (size_t)S*qdim*4);
+    }
+    return 1;
+}
+
+/* FA2 streaming path: no score matrix, K/V read straight from the cache.
+ * Returns 0 if the kernel is unavailable so the caller can fall back. */
+int lg_metal_attn2(int layer, float *ctx_out, const float *q, const float *gt,
+                   int S, int pos0, int H, int KV, int hd, float scale, int window) {
+    if (!g_al || !g_pipe_fa || layer < 0 || layer >= g_al_n || hd > 128) return 0;
+    AttnLayer *L = &g_al[layer];
+    if (!L->K || (L->ring == 0 && pos0 + S > L->ctxcap)) return 0;
+    int group = H / KV, qdim = H * hd;
+    int phys = L->ring > 0 ? 2*L->ring : L->ctxcap, ring = L->ring;
+    id<MTLDevice> d = lg_metal_device();
+    id<MTLCommandQueue> cq = lg_metal_queue();
+    @autoreleasepool {
+        static void *qb = NULL, *ob = NULL, *gb = NULL;
+        static size_t qc = 0, oc = 0, gc = 0;
+        size_t nb = (size_t)S*qdim*4;
+        if (!ensure(&qb, &qc, nb) || !ensure(&ob, &oc, nb) ||
+            !ensure(&gb, &gc, (size_t)S*H*4)) return 0;
+        memcpy([(__bridge id<MTLBuffer>)qb contents], q,  nb);
+        memcpy([(__bridge id<MTLBuffer>)gb contents], gt, (size_t)S*H*4);
+
+        id<MTLCommandBuffer> cb = [cq commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:(__bridge id<MTLComputePipelineState>)g_pipe_fa];
+        [e setBuffer:(__bridge id<MTLBuffer>)L->K offset:0 atIndex:0];
+        [e setBuffer:(__bridge id<MTLBuffer>)L->V offset:0 atIndex:1];
+        [e setBuffer:(__bridge id<MTLBuffer>)qb offset:0 atIndex:2];
+        [e setBuffer:(__bridge id<MTLBuffer>)ob offset:0 atIndex:3];
+        [e setBuffer:(__bridge id<MTLBuffer>)gb offset:0 atIndex:4];
+        [e setBytes:&S     length:4 atIndex:5];
+        [e setBytes:&pos0  length:4 atIndex:6];
+        [e setBytes:&H     length:4 atIndex:7];
+        [e setBytes:&hd    length:4 atIndex:8];
+        [e setBytes:&group length:4 atIndex:9];
+        [e setBytes:&phys  length:4 atIndex:10];
+        [e setBytes:&ring  length:4 atIndex:11];
+        [e setBytes:&window length:4 atIndex:12];
+        [e setBytes:&scale length:4 atIndex:13];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)S, (NSUInteger)H, 1)
+          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [e endEncoding];
+        double w0 = prof_on() ? CFAbsoluteTimeGetCurrent() : 0;
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) return 0;
+        if (prof_on()) {
+            g_wall_s += CFAbsoluteTimeGetCurrent() - w0;
+            g_gpu_s  += cb.GPUEndTime - cb.GPUStartTime;
+            g_calls++;
+        }
+        memcpy(ctx_out, [(__bridge id<MTLBuffer>)ob contents], nb);
     }
     return 1;
 }

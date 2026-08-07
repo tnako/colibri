@@ -1333,8 +1333,15 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         lg_metal_attn_alloc(c->n_layers, li, KV, m->gpu_attn_cap, hd,
                             c->slide[li] ? c->window + LG_CHUNK : 0)) {
         lg_metal_attn_append(li, pos0, S, k, vv, kvdim);
-        if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale,
-                          c->slide[li] ? c->window : 0))
+        int win = c->slide[li] ? c->window : 0;
+        /* LG_FA2=1 selects the streaming FlashAttention-2 kernel over the GEMM
+         * path. Both are token-exact; they differ in memory (FA2 is O(tile) and
+         * never materializes scores) and in speed, so the choice is measured. */
+        static int fa2 = -1;
+        if (fa2 < 0) { const char *e = getenv("LG_FA2"); fa2 = e ? atoi(e) : 0; }
+        if (fa2 && lg_metal_attn2(li, ctx, q, gt, S, pos0, H, KV, hd, scale, win))
+            goto attn_out;
+        if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale, win))
             goto attn_out;   /* the output gate is applied by scatter_o */
     }
 #endif
