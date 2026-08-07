@@ -138,8 +138,35 @@ LAGUNA_RESIDENT=1 ./c/laguna_xs_metal ...
 
 At 6144 tokens every streaming configuration lands near 19 GiB regardless of
 `CAP`, so there is currently no long-context configuration that fits a ~13 GiB
-budget. That is an open problem, not a solved one: the fix is f16 or chunked
-prefill scratch, which is not done.
+budget. That is an open problem, not a solved one.
+
+### Diagnosed: most of that footprint is heap fragmentation, not working set
+
+The clue came from a contended run that was otherwise useless (metal4: 469.8 s
+because a second process was competing, vs 249.6 s clean). It used **8.50 GiB**
+where the identical clean run used **18.88 GiB**. A configuration cannot need
+19 GiB if it completes in 8.5 GiB under pressure.
+
+`vmmap` on a live 6144-token prefill confirms it:
+
+```
+Physical footprint:  12.3G
+Writable regions: Total=12.8G written=9.2G(72%) resident=7.3G(57%) swapped_out=7.4G
+MALLOC_SMALL          7.7G virtual   2.1G resident   5.5G swapped   1976 regions
+MALLOC_LARGE (empty) 730.6M
+```
+
+1976 MALLOC_SMALL regions and 730 MB of empty large blocks: `attention()` and
+`moe()` do ~26 malloc/free pairs per layer, all sized from S, so a 40-layer pass
+churns thousands of large transient allocations. The allocator neither coalesces
+nor returns them, and 7.4 GB ends up swapped.
+
+The fix is a bump arena reset per layer, replacing the transient mallocs. **A
+first attempt was written and reverted**: converting the allocations mechanically
+broke the fixtures (24/24 -> 8/24) because some buffers stay live across the
+layer boundary the reset assumes. Lifetime analysis has to be done per buffer by
+hand, which is the actual remaining work. Reverting was cheap; shipping a
+plausible-looking wrong answer would not have been.
 
 ## Correctness
 
