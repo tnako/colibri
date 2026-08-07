@@ -1078,6 +1078,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         float mx[LG_QB], den[LG_QB];
         float *accum = falloc((int64_t)LG_QB * hd);
         float *sbuf  = falloc((int64_t)LG_QB * LG_KC);
+        float *qt    = falloc((int64_t)LG_QB * hd);   /* contiguous query tile */
         #pragma omp for collapse(2) schedule(static)
         for (int kh = 0; kh < KV; kh++) {
             for (int sb = 0; sb < S; sb += LG_QB) {
@@ -1096,17 +1097,25 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                         mx[b] = -INFINITY; den[b] = 0.f;
                         memset(accum + (int64_t)b*hd, 0, (size_t)hd*sizeof(float));
                     }
+                    /* Hoist the query rows into a small contiguous tile. The old
+                     * shape re-read q[(sb+b)*qdim + hq*hd] from a strided
+                     * location inside the innermost loop; qdim is 6144 floats so
+                     * consecutive b are 24 KB apart and every access missed. */
+                    for (int b = 0; b < nb; b++)
+                        memcpy(qt + (int64_t)b*hd, q + (int64_t)(sb+b)*qdim + hq*hd,
+                               (size_t)hd*sizeof(float));
                     for (int tc = t0; tc <= hi; tc += LG_KC) {
                         int tn = hi - tc + 1; if (tn > LG_KC) tn = LG_KC;
-                        /* score the chunk: each K row loaded once, used by all nb */
                         for (int j = 0; j < tn; j++) {
                             const float *kv = LG_KROW(tc + j);
+                            int t = tc + j;
+                            /* one K row, all nb queries: K stays in L1 across
+                             * the whole inner loop instead of being re-fetched */
                             for (int b = 0; b < nb; b++) {
                                 int qpos = pos0 + sb + b;
-                                int t = tc + j;
                                 float v = -INFINITY;
                                 if (t <= qpos && !(c->slide[li] && t < qpos - c->window + 1))
-                                    v = dot_f32(q + (int64_t)(sb+b)*qdim + hq*hd, kv, hd) * scale;
+                                    v = dot_f32(qt + (int64_t)b*hd, kv, hd) * scale;
                                 sbuf[(int64_t)b*LG_KC + j] = v;
                             }
                         }
@@ -1147,7 +1156,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 #undef LG_VROW
             }
         }
-        free(accum); free(sbuf);
+        free(accum); free(sbuf); free(qt);
     }
     #undef LG_QB
     #undef LG_KC
