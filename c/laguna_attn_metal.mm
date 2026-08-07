@@ -41,7 +41,7 @@ using namespace metal;
 /* `k0` is the absolute position of score column 0. It is 0 for a full-attention
  * layer (columns are absolute positions) and the band origin for a sliding layer,
  * where only `window + chunk - 1` columns are materialized. */
-kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
+kernel void softmax_causal(device float*       Sc   [[buffer(0)]],
                            constant int&       nkey [[buffer(1)]],
                            constant int&       pos0 [[buffer(2)]],
                            constant int&       win  [[buffer(3)]],
@@ -49,7 +49,7 @@ kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
                            uint  row  [[threadgroup_position_in_grid]],
                            uint  lane [[thread_position_in_threadgroup]],
                            uint  W    [[threads_per_threadgroup]]) {
-    device half* r = Sc + (long)row * nkey;
+    device float* r = Sc + (long)row * nkey;
     int qpos = pos0 + int(row);
     int lo = 0;
     if (win > 0) { lo = qpos - win + 1; if (lo < 0) lo = 0; }
@@ -58,7 +58,7 @@ kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
     threadgroup float red[32];
     float m = -INFINITY;
     for (int t = int(lane); t <= qpos; t += int(W))
-        if (t >= lo) { float v = float(r[t]); if (v > m) m = v; }
+        if (t >= lo) { float v = r[t]; if (v > m) m = v; }
     red[lane] = m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) { float g = -INFINITY;
@@ -69,9 +69,9 @@ kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
 
     float s = 0.0f;
     for (int t = int(lane); t < nkey; t += int(W)) {
-        if (t > qpos || t < lo) { r[t] = half(0.0f); continue; }
-        float e = exp(float(r[t]) - m);
-        r[t] = half(e); s += e;
+        if (t > qpos || t < lo) { r[t] = 0.0f; continue; }
+        float e = exp(r[t] - m);
+        r[t] = e; s += e;
     }
     red[lane] = s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -80,15 +80,15 @@ kernel void softmax_causal(device half*        Sc   [[buffer(0)]],
         red[0] = g; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
-    for (int t = int(lane); t < nkey; t += int(W)) r[t] = half(float(r[t]) * inv);
+    for (int t = int(lane); t < nkey; t += int(W)) r[t] *= inv;
 }
 
-/* Dequantize a [nkey, hd] band of one kv head from the int8 cache into f16.
+/* Dequantize a [nkey, hd] band of one kv head from the int8 cache into f32.
  * w = code * scale, one scale per row (kv_i8.h). This is the only place the GPU
  * touches the cache, and it reads it in place -- no upload. */
 kernel void deq_kv(device const char*   C   [[buffer(0)]],
                    device const float*  SC  [[buffer(1)]],
-                   device half*         O   [[buffer(2)]],
+                   device float*        O   [[buffer(2)]],
                    constant int&        k0  [[buffer(3)]],
                    constant int&        n   [[buffer(4)]],
                    constant int&        hd  [[buffer(5)]],
@@ -97,23 +97,23 @@ kernel void deq_kv(device const char*   C   [[buffer(0)]],
     int r = int(gid.y), d = int(gid.x);
     if (r >= n || d >= hd) return;
     long src = (long)(base + k0 + r);
-    O[(long)r*hd + d] = (half)(float(C[src*hd + d]) * SC[src]);
+    O[(long)r*hd + d] = float(C[src*hd + d]) * SC[src];
 }
 
 /* f32 -> f16 copy of one query head's rows, into a [S, hd] contiguous tile. */
 kernel void gather_q(device const float* Q  [[buffer(0)]],
-                     device half*        QT [[buffer(1)]],
+                     device float*       QT [[buffer(1)]],
                      constant int&       qdim [[buffer(2)]],
                      constant int&       off  [[buffer(3)]],
                      constant int&       hd   [[buffer(4)]],
                      uint2 gid [[thread_position_in_grid]]) {
     int s = int(gid.y), d = int(gid.x);
     if (d >= hd) return;
-    QT[(long)s*hd + d] = half(Q[(long)s*qdim + off + d]);
+    QT[(long)s*hd + d] = Q[(long)s*qdim + off + d];
 }
 
 /* scatter a [S, hd] f16 result into the strided ctx output, applying the gate. */
-kernel void scatter_o(device const half*  OT [[buffer(0)]],
+kernel void scatter_o(device const float* OT [[buffer(0)]],
                       device float*       O  [[buffer(1)]],
                       device const float* GT [[buffer(2)]],
                       constant int&       qdim [[buffer(3)]],
@@ -127,7 +127,7 @@ kernel void scatter_o(device const half*  OT [[buffer(0)]],
     float g = GT[(long)s*H + hq];
     /* softplus, matching the CPU path */
     float gate = g > 20.0f ? g : log(1.0f + exp(g));
-    O[(long)s*qdim + off + d] = float(OT[(long)s*hd + d]) * gate;
+    O[(long)s*qdim + off + d] = OT[(long)s*hd + d] * gate;
 }
 )";
 
@@ -296,9 +296,9 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
 
     @autoreleasepool {
         /* Q for one head as f16 [S,hd]; scores [S,nkey] f16; out [S,hd] f16. */
-        if (!ensure(&g_qt, &g_qtcap, (size_t)S*hd*2)) return 0;
-        if (!ensure(&g_sc, &g_sccap, (size_t)S*nkey*2)) return 0;
-        if (!ensure(&g_ot, &g_otcap, (size_t)S*hd*2)) return 0;
+        if (!ensure(&g_qt, &g_qtcap, (size_t)S*hd*4)) return 0;
+        if (!ensure(&g_sc, &g_sccap, (size_t)S*nkey*4)) return 0;
+        if (!ensure(&g_ot, &g_otcap, (size_t)S*hd*4)) return 0;
         /* the strided f32 Q and the f32 ctx/gate live in shared buffers too */
         static void *qsrc = NULL, *odst = NULL, *gsrc = NULL;
         static size_t qsc = 0, odc = 0, gsc = 0;
@@ -310,7 +310,13 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         /* All KV heads staged ONCE per chunk. Doing it inside the query-head loop
           * dequantized each kv head `group` times over (6x on Laguna-S) and cost
           * attention 22.2 -> 43.4 s at 262144 context. */
-        if (!ensure(&L->kf, &L->kflen, (size_t)KV*nkey*hd*2*2)) return 0;
+        /* f32 staging, deliberately. Dequantizing int8 -> f16 stacked a second
+         * rounding on top of the cache's own 8-bit quantization and cost
+         * token-exactness: Laguna-S went 208/208 -> 207/208, isolated to this
+         * path (experts and the CPU build were both exact). The old code kept a
+         * separate f16 K/V copy, so it only ever rounded once. f32 here restores
+         * the single-rounding budget; MPS runs the GEMMs in f32 to match. */
+        if (!ensure(&L->kf, &L->kflen, (size_t)KV*nkey*hd*4*2)) return 0;
         memcpy([(__bridge id<MTLBuffer>)qsrc contents], q,  (size_t)S*qdim*4);
         memcpy([(__bridge id<MTLBuffer>)gsrc contents], gt, (size_t)S*H*4);
 
@@ -320,16 +326,18 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         id<MTLBuffer> SC = (__bridge id<MTLBuffer>)g_sc;
         id<MTLBuffer> OT = (__bridge id<MTLBuffer>)g_ot;
 
+        /* f32 end to end: K/V come from an int8 cache, so a second f16 rounding
+         * here broke token-exactness (see the staging note above). */
         MPSMatrixDescriptor *dq = [MPSMatrixDescriptor matrixDescriptorWithRows:S columns:hd
-                                    rowBytes:(size_t)hd*2 dataType:MPSDataTypeFloat16];
+                                    rowBytes:(size_t)hd*4 dataType:MPSDataTypeFloat32];
         MPSMatrixDescriptor *dk = [MPSMatrixDescriptor matrixDescriptorWithRows:nkey columns:hd
-                                    rowBytes:(size_t)hd*2 dataType:MPSDataTypeFloat16];
+                                    rowBytes:(size_t)hd*4 dataType:MPSDataTypeFloat32];
         MPSMatrixDescriptor *ds = [MPSMatrixDescriptor matrixDescriptorWithRows:S columns:nkey
-                                    rowBytes:(size_t)nkey*2 dataType:MPSDataTypeFloat16];
+                                    rowBytes:(size_t)nkey*4 dataType:MPSDataTypeFloat32];
         MPSMatrixDescriptor *dv = [MPSMatrixDescriptor matrixDescriptorWithRows:nkey columns:hd
-                                    rowBytes:(size_t)hd*2 dataType:MPSDataTypeFloat16];
+                                    rowBytes:(size_t)hd*4 dataType:MPSDataTypeFloat32];
         MPSMatrixDescriptor *do_ = [MPSMatrixDescriptor matrixDescriptorWithRows:S columns:hd
-                                    rowBytes:(size_t)hd*2 dataType:MPSDataTypeFloat16];
+                                    rowBytes:(size_t)hd*4 dataType:MPSDataTypeFloat32];
 
         MPSMatrixMultiplication *qk =
             [[MPSMatrixMultiplication alloc] initWithDevice:d transposeLeft:NO transposeRight:YES
@@ -347,7 +355,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         {   /* dequantize every kv head's band once: int8 cache -> f16, in place */
             id<MTLComputeCommandEncoder> ed = [cb computeCommandEncoder];
             [ed setComputePipelineState:(__bridge id<MTLComputePipelineState>)g_pipe_dq];
-            size_t kband = (size_t)nkey*hd*2;
+            size_t kband = (size_t)nkey*hd*4;
             for (int kh = 0; kh < KV; kh++) {
                 int kbase = kh * L->ctxcap;
                 [ed setBytes:&k0    length:4 atIndex:3];
@@ -371,7 +379,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         for (int hq = 0; hq < H; hq++) {
             int kh = hq / group, off = hq * hd;
             id<MTLBuffer> KF = (__bridge id<MTLBuffer>)L->kf;
-            size_t kband = (size_t)nkey*hd*2;
+            size_t kband = (size_t)nkey*hd*4;
             size_t koff  = (size_t)kh * kband;              /* this head's K tile */
             size_t voff  = (size_t)KV * kband + koff;       /* V tiles follow K   */
 

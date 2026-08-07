@@ -55,6 +55,15 @@ struct ExpArgs {
     uint ngroups;         /* groups per row = Kd/gs                    */
     uint wslab;           /* bytes per expert in the weight tensor     */
     uint sslab;           /* bytes per expert in scales/biases         */
+    /* Tensor byte offsets inside the shard, carried as scalars and applied in
+     * uchar space instead of via setBuffer:offset:. safetensors puts its data at
+     * header_len+8 -- 9794 here, i.e. 2 mod 16 -- so EVERY tensor offset is
+     * unaligned for a uint/ushort binding. Metal's unaligned loads return
+     * shifted data rather than faulting: layers 2..18 happened to survive, layer
+     * 19 produced 3.4e38 and the router collapsed to expert 0 for every token. */
+    uint woff_lo, woff_hi;
+    uint soff_lo, soff_hi;
+    uint boff_lo, boff_hi;
 };
 
 static inline float deq(uint code, float s, float b) { return fma((float)code, s, b); }
@@ -79,9 +88,12 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
     uint n0 = tg.y * TN;
     if (r0 >= erows || n0 >= a.N) return;
     /* weight slab for this expert */
-    W  = (device const uint*)  ((device const uchar*)W  + (ulong)ex * a.wslab);
-    SC = (device const ushort*)((device const uchar*)SC + (ulong)ex * a.sslab);
-    BI = (device const ushort*)((device const uchar*)BI + (ulong)ex * a.sslab);
+    ulong wo = ((ulong)a.woff_hi << 32) | a.woff_lo;
+    ulong so = ((ulong)a.soff_hi << 32) | a.soff_lo;
+    ulong bo = ((ulong)a.boff_hi << 32) | a.boff_lo;
+    device const uchar* Wb = (device const uchar*)W  + wo + (ulong)ex * a.wslab;
+    device const uchar* Sb = (device const uchar*)SC + so + (ulong)ex * a.sslab;
+    device const uchar* Bb = (device const uchar*)BI + bo + (ulong)ex * a.sslab;
 
     /* f32 staging, deliberately. f16 staging measured 1479 vs 1125 GFLOP/s but
      * broke accuracy (max rel err 5.5e-2, 313/2560 values over 1e-3): expert
@@ -114,11 +126,16 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
             if (gn < a.N && gk < a.Kd) {
                 uint per = 32u / a.bits;                       /* codes per word */
                 uint widx = gk / per, sh = (gk % per) * a.bits;
-                uint word = W[(ulong)gn * a.wwords + widx];
+                /* byte-wise: the base is unaligned, so never form a uint*/ushort* */
+                device const uchar* wp = Wb + ((ulong)gn * a.wwords + widx) * 4;
+                uint word = (uint)wp[0] | ((uint)wp[1] << 8)
+                          | ((uint)wp[2] << 16) | ((uint)wp[3] << 24);
                 uint code = (word >> sh) & ((1u << a.bits) - 1u);
                 uint g = gk / a.gs;
-                ushort sh_ = SC[(ulong)gn * a.ngroups + g];
-                ushort bh_ = BI[(ulong)gn * a.ngroups + g];
+                device const uchar* sp = Sb + ((ulong)gn * a.ngroups + g) * 2;
+                device const uchar* bp = Bb + ((ulong)gn * a.ngroups + g) * 2;
+                ushort sh_ = (ushort)sp[0] | ((ushort)sp[1] << 8);
+                ushort bh_ = (ushort)bp[0] | ((ushort)bp[1] << 8);
                 float s = as_type<float>((uint)sh_ << 16);     /* bf16 -> f32 */
                 float b = as_type<float>((uint)bh_ << 16);
                 v = deq(code, s, b);
@@ -179,7 +196,7 @@ static int exp_pipeline(void) {
  * `base` must be page aligned, which mmap guarantees. */
 extern "C" void *lg_metal_map(const void *base, size_t len) {
     if (!lg_metal_device() || !exp_pipeline()) return NULL;
-    size_t use = len & ~(size_t)16383;
+    size_t use = (len + 16383) & ~(size_t)16383;   /* round UP, never truncate */
     if (!use) return NULL;
     id<MTLBuffer> b = [lg_metal_device() newBufferWithBytesNoCopy:(void*)base
                                                           length:use
@@ -231,17 +248,21 @@ extern "C" int lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size
                     size_t wslab, size_t sslab) {
     if (!g_exp_pipe || !wmap || !smap || !bmap || maxrows <= 0) return 0;
     @autoreleasepool {
-        struct { unsigned Kd,N,gs,bits,rows,row0,wwords,ngroups,wslab,sslab; } a;
+        struct { unsigned Kd,N,gs,bits,rows,row0,wwords,ngroups,wslab,sslab,
+                          wlo,whi,slo,shi,blo,bhi; } a;
         a.Kd=Kd; a.N=N; a.gs=gs; a.bits=bits; a.rows=maxrows; a.row0=0;
         a.wwords=((unsigned)Kd*(unsigned)bits+31u)/32u; a.ngroups=(unsigned)(Kd/gs);
         a.wslab=(unsigned)wslab; a.sslab=(unsigned)sslab;
+        a.wlo=(unsigned)(woff & 0xffffffffu); a.whi=(unsigned)(woff >> 32);
+        a.slo=(unsigned)(soff & 0xffffffffu); a.shi=(unsigned)(soff >> 32);
+        a.blo=(unsigned)(boff & 0xffffffffu); a.bhi=(unsigned)(boff >> 32);
         id<MTLCommandBuffer> cb = [lg_metal_queue() commandBuffer];
         id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
         [en setComputePipelineState:(__bridge id<MTLComputePipelineState>)g_exp_pipe];
         [en setBuffer:(__bridge id<MTLBuffer>)xbuf   offset:0    atIndex:0];
-        [en setBuffer:(__bridge id<MTLBuffer>)wmap   offset:woff atIndex:1];
-        [en setBuffer:(__bridge id<MTLBuffer>)smap   offset:soff atIndex:2];
-        [en setBuffer:(__bridge id<MTLBuffer>)bmap   offset:boff atIndex:5];
+        [en setBuffer:(__bridge id<MTLBuffer>)wmap   offset:0 atIndex:1];
+        [en setBuffer:(__bridge id<MTLBuffer>)smap   offset:0 atIndex:2];
+        [en setBuffer:(__bridge id<MTLBuffer>)bmap   offset:0 atIndex:5];
         [en setBuffer:(__bridge id<MTLBuffer>)ybuf   offset:0    atIndex:3];
         [en setBuffer:(__bridge id<MTLBuffer>)offbuf offset:0    atIndex:6];
         [en setBytes:&a length:sizeof(a) atIndex:4];

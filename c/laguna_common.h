@@ -1435,7 +1435,13 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * the CPU still wins (attn 9.8 s CPU-sliding vs 13.0 s all-GPU); by 6k the
      * band is 767 of 6000 and the GPU wins (32.2 -> 21.8 s). The crossover sits
      * near 4x the window, which is where the band stops being most of the row. */
-    int gpu_ok = m->gpu_attn && (!c->slide[li] || pos0 + S >= 4 * c->window);
+    /* S >= 64: prefill only. Decode presents one query row, so the GEMMs are
+     * degenerate and every dispatch is pure round-trip. This gate was latent
+     * until the KV bind started succeeding on small caches -- before that the
+     * bind failed and decode silently used the CPU, which is why generation
+     * regressed to 1/12 the moment the bind was fixed. */
+    int gpu_ok = m->gpu_attn && S >= 64 &&
+                 (!c->slide[li] || pos0 + S >= 4 * c->window);
     /* Bind the int8 cache for this layer. Nothing is copied and nothing is
      * appended: the CPU already wrote these rows, and the GPU reads the same
      * pages. The append must have happened before scoring, which it has -- see
