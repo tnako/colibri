@@ -79,6 +79,15 @@ Two causes, both "cheap object created per call":
 
 After both: RSS flat at ~2 GiB for the same run, matching the CPU build.
 
+Important caveat on that number: it was measured at `CAP=16` on a 512-token
+prompt, where the expert cache is small enough for the leak to be visible. In the
+`CAP=48` 6144-token runs the cache dominates RSS completely, so before/after the
+fix those runs measure 15.9 and 18.9 GiB respectively -- the fix does not reduce
+RSS there and was never going to. Both statements are true; the leak was real
+(a monotonic ~12 GB climb) and is gone, but eliminating it does not by itself
+make the long-context CAP=48 configuration fit a memory budget. `CAP` is the
+lever for that. Timings are unaffected either way: 247.8 s before, 249.6 s after.
+
 ## Where the remaining memory actually goes
 
 The 18.9 GiB in the streaming rows above is **not** the Metal port. Measured on a
