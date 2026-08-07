@@ -217,61 +217,11 @@ extern "C" void *lg_metal_scratch_ptr(void *h) {
     return h ? [(__bridge id<MTLBuffer>)h contents] : NULL;
 }
 
-/* BATCHED: one command buffer holds every expert's dispatch for a layer.
- *
- * The first version committed and waited per expert matrix, i.e. 256 experts x 3
- * matrices x 48 layers = 36,864 round-trips per chunk. At the measured 0.33 ms
- * per round-trip that is 12 s of pure synchronization per chunk with the GPU
- * mostly idle -- the run appeared to hang. Encoding many dispatches into one
- * buffer and waiting once removes that entirely.
- *
- * lg_metal_expert_begin/add/end wrap one buffer; `add` is called per expert. */
-static void *g_cb = NULL, *g_enc = NULL;
-
-extern "C" int lg_metal_expert_begin(void) {
-    if (!g_exp_pipe) return 0;
-    id<MTLCommandBuffer> cb = [lg_metal_queue() commandBuffer];
-    id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
-    if (!cb || !en) return 0;
-    [en setComputePipelineState:(__bridge id<MTLComputePipelineState>)g_exp_pipe];
-    g_cb  = (void*)CFBridgingRetain(cb);
-    g_enc = (void*)CFBridgingRetain(en);
-    return 1;
-}
-
-extern "C" int lg_metal_expert_add(void *wmap, size_t woff, void *smap, size_t soff,
-                    void *bmap, size_t boff, void *xbuf, void *ybuf,
-                    int rows, int row0, int Kd, int N, int gs, int bits) {
-    if (!g_enc || !wmap || !smap || !bmap || rows <= 0) return 0;
-    id<MTLComputeCommandEncoder> en = (__bridge id<MTLComputeCommandEncoder>)g_enc;
-    struct { unsigned Kd, N, gs, bits, rows, row0, wwords, ngroups; } a;
-    a.Kd = Kd; a.N = N; a.gs = gs; a.bits = bits;
-    a.rows = rows; a.row0 = row0;
-    a.wwords = ((unsigned)Kd * (unsigned)bits + 31u) / 32u;
-    a.ngroups = (unsigned)(Kd / gs);
-    [en setBuffer:(__bridge id<MTLBuffer>)xbuf  offset:0     atIndex:0];
-    [en setBuffer:(__bridge id<MTLBuffer>)wmap  offset:woff  atIndex:1];
-    [en setBuffer:(__bridge id<MTLBuffer>)smap  offset:soff  atIndex:2];
-    [en setBuffer:(__bridge id<MTLBuffer>)bmap  offset:boff  atIndex:5];
-    [en setBuffer:(__bridge id<MTLBuffer>)ybuf  offset:0     atIndex:3];
-    [en setBytes:&a length:sizeof(a) atIndex:4];
-    [en dispatchThreadgroups:MTLSizeMake((rows+63)/64, (N+31)/32, 1)
-       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    return 1;
-}
-
-extern "C" int lg_metal_expert_end(void) {
-    if (!g_cb || !g_enc) return 0;
-    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)g_cb;
-    [(__bridge id<MTLComputeCommandEncoder>)g_enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    int ok = cb.status != MTLCommandBufferStatusError;
-    CFRelease((CFTypeRef)g_enc); g_enc = NULL;
-    CFRelease((CFTypeRef)g_cb);  g_cb  = NULL;
-    if (!ok) fprintf(stderr, "[metal] expert batch failed\n");
-    return ok;
-}
+/* NOTE: an earlier per-expert batched API (begin/add/end) lived here. It issued
+ * one dispatch per expert -- 768 per layer, 36,864 per chunk -- and profiling
+ * showed the process 87% blocked in __psynch_cvwait with the GPU idle. The
+ * grouped kernel below replaced it and it was deleted rather than kept as a
+ * second path. See docs/gpu-expert-grouped-gemm.md. */
 
 /* GROUPED: all E experts in ONE dispatch. `offs` is E+1 row starts into the
  * expert-sorted activation buffer; maxrows sizes the grid. */
@@ -304,12 +254,17 @@ extern "C" int lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size
     }
 }
 
-/* single-shot convenience, used by the standalone checkers */
+/* Single-expert convenience for the standalone checkers (c/tools/chk_expert.mm,
+ * bench_expert.mm). The engine uses the grouped entry point above. */
 extern "C" int lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff,
                     void *bmap, size_t boff, void *xbuf, void *ybuf,
                     int rows, int row0, int Kd, int N, int gs, int bits) {
-    if (!lg_metal_expert_begin()) return 0;
-    int ok = lg_metal_expert_add(wmap, woff, smap, soff, bmap, boff, xbuf, ybuf,
-                                 rows, row0, Kd, N, gs, bits);
-    return lg_metal_expert_end() && ok;
+    static void *offh = NULL;
+    unsigned *o = NULL;
+    if (!offh) offh = lg_metal_scratch(7, 2*sizeof(unsigned));
+    o = (unsigned*)lg_metal_scratch_ptr(offh);
+    if (!o) return 0;
+    o[0] = (unsigned)row0; o[1] = (unsigned)(row0 + rows);
+    return lg_metal_expert_grouped(wmap, woff, smap, soff, bmap, boff,
+                                   xbuf, ybuf, offh, 1, rows, Kd, N, gs, bits, 0, 0);
 }

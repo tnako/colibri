@@ -10,7 +10,7 @@
 
 extern "C" {
 void  *lg_metal_map(const void *base, size_t len);
-int    lg_metal_expert(void *wmap, size_t woff, void *sbmap, size_t sboff,
+int    lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff, void *bmap, size_t boff,
                        void *xbuf, void *ybuf,
                        int rows, int row0, int Kd, int N, int gs, int bits);
 int    lg_metal_init(void);
@@ -32,14 +32,17 @@ int main(void) {
                       MAP_PRIVATE|MAP_ANON, -1, 0);
     void *smem = mmap(NULL, (sbytes+16383)&~(size_t)16383, PROT_READ|PROT_WRITE,
                       MAP_PRIVATE|MAP_ANON, -1, 0);
+    void *bmem = mmap(NULL, (sbytes+16383)&~(size_t)16383, PROT_READ|PROT_WRITE,
+                      MAP_PRIVATE|MAP_ANON, -1, 0);
     unsigned *W = (unsigned*)wmem;
     unsigned short *SB = (unsigned short*)smem;
+    unsigned short *BI = (unsigned short*)bmem;
 
     srandom(7);
     for (size_t i = 0; i < (size_t)N*wwords; i++) W[i] = (unsigned)random();
     for (int n = 0; n < N; n++) for (int g = 0; g < ng; g++) {
-        SB[(n*ng+g)*2+0] = fbf16(0.02f + 0.001f*(float)((n+g)%7));
-        SB[(n*ng+g)*2+1] = fbf16(-0.03f + 0.002f*(float)((n*g)%5));
+        SB[n*ng+g] = fbf16(0.02f + 0.001f*(float)((n+g)%7));
+        BI[n*ng+g] = fbf16(-0.03f + 0.002f*(float)((n*g)%5));
     }
     float *x = (float*)malloc((size_t)rows*Kd*sizeof(float));
     for (size_t i = 0; i < (size_t)rows*Kd; i++) x[i] = ((float)random()/RAND_MAX - 0.5f);
@@ -52,8 +55,8 @@ int main(void) {
         for (int k = 0; k < Kd; k++) {
             unsigned word = W[(size_t)n*wwords + k/per];
             unsigned code = (word >> ((k%per)*bits)) & ((1u<<bits)-1u);
-            float sc = bf16f(SB[((size_t)n*ng + k/gs)*2+0]);
-            float bi = bf16f(SB[((size_t)n*ng + k/gs)*2+1]);
+            float sc = bf16f(SB[(size_t)n*ng + k/gs]);
+            float bi = bf16f(BI[(size_t)n*ng + k/gs]);
             s += (double)x[(size_t)r*Kd+k] * ((float)code*sc + bi);
         }
         ref[(size_t)r*N+n] = (float)s;
@@ -63,13 +66,14 @@ int main(void) {
         id<MTLDevice> d = lg_metal_device();
         void *wm = lg_metal_map(wmem, (wbytes+16383)&~(size_t)16383);
         void *sm = lg_metal_map(smem, (sbytes+16383)&~(size_t)16383);
+        void *bm = lg_metal_map(bmem, (sbytes+16383)&~(size_t)16383);
         if (!wm || !sm) { printf("map failed\n"); return 2; }
         id<MTLBuffer> xb = [d newBufferWithBytes:x length:(size_t)rows*Kd*4
                                          options:MTLResourceStorageModeShared];
         id<MTLBuffer> yb = [d newBufferWithLength:(size_t)rows*N*4
                                           options:MTLResourceStorageModeShared];
         void *xh = (void*)CFBridgingRetain(xb), *yh = (void*)CFBridgingRetain(yb);
-        if (!lg_metal_expert(wm, 0, sm, 0, xh, yh, rows, 0, Kd, N, gs, bits)) {
+        if (!lg_metal_expert(wm, 0, sm, 0, bm, 0, xh, yh, rows, 0, Kd, N, gs, bits)) {
             printf("dispatch failed\n"); return 3;
         }
         float *y = (float*)yb.contents;

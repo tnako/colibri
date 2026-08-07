@@ -1159,11 +1159,11 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         ? 3 * I * oq_rowbytes((int)D, m->oq.bits, m->oq.gs)
         : (bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4);
 #ifdef LAGUNA_METAL
-    /* Probe the GPU expert path BEFORE sizing the cache: if the weights can be
-     * mapped, no cache is needed at all and its whole allocation is freed for
-     * everything else. This is what takes Laguna-S from 39 GB of resident bank
-     * (impossible) to zero resident expert bytes. */
-    if (gpu_experts_map(m)) cap = 4;      /* minimum, effectively unused */
+    /* Map the expert weights for the GPU. This covers PREFILL only (see the S>=64
+     * gate in moe), so the streaming cache is still sized normally for decode --
+     * an earlier version set cap=4 here on the assumption the GPU handled every
+     * batch size, which made decode fall back onto a 4-slot cache and thrash. */
+    gpu_experts_map(m);
 #endif
     if (cap <= 0) {
         /* Whatever the budget has left after KV, GPU attention and projections,
@@ -1403,13 +1403,6 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                             c->slide[li] ? c->window + LG_CHUNK : 0)) {
         lg_metal_attn_append(li, pos0, S, k, vv, kvdim);
         int win = c->slide[li] ? c->window : 0;
-        /* LG_FA2=1 selects the streaming FlashAttention-2 kernel over the GEMM
-         * path. Both are token-exact; they differ in memory (FA2 is O(tile) and
-         * never materializes scores) and in speed, so the choice is measured. */
-        static int fa2 = -1;
-        if (fa2 < 0) { const char *e = getenv("LG_FA2"); fa2 = e ? atoi(e) : 0; }
-        if (fa2 && lg_metal_attn2(li, ctx, q, gt, S, pos0, H, KV, hd, scale, win))
-            goto attn_out;
         if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale, win))
             goto attn_out;   /* the output gate is applied by scatter_o */
     }
@@ -1610,7 +1603,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * rows/expert is chunk*topk/E -- so this path wants a LARGE prefill chunk.
      */
 #ifdef LAGUNA_METAL
-    if (m->gpu_exp && m->gx) {
+    /* PREFILL ONLY. At S=1 the whole layer has topk=10 rows spread over 10
+     * experts, which is the kernel's worst regime (measured 31.6 GFLOP/s at 8
+     * rows) and costs 3 dispatch round-trips per layer on top. Measured cost of
+     * getting this wrong: a 4-token generation spent ~390 s in the expert phase
+     * against a 77 s prefill. Decode stays on the CPU UDOT path, which needs no
+     * dispatch at all. LG_GPU_EXP_MIN rows is the crossover from bench_expert. */
+    if (m->gpu_exp && m->gx && S >= 64) {
         int64_t *vis = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
         int *cnt = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
         memset(cnt, 0, (size_t)(E + 1) * sizeof(int));

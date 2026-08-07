@@ -10,7 +10,7 @@
 
 extern "C" {
 void  *lg_metal_map(const void *base, size_t len);
-int    lg_metal_expert(void *wmap, size_t woff, void *sbmap, size_t sboff,
+int    lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff, void *bmap, size_t boff,
                        void *xbuf, void *ybuf,
                        int rows, int row0, int Kd, int N, int gs, int bits);
 int    lg_metal_init(void);
@@ -29,14 +29,16 @@ int main(void) {
     size_t sb = ((size_t)N*ng*2*2   + 16383) & ~(size_t)16383;
     void *wmem = mmap(NULL, wb, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
     void *smem = mmap(NULL, sb, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+    void *bmem = mmap(NULL, sb, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
     unsigned *W = (unsigned*)wmem; unsigned short *SB = (unsigned short*)smem;
+    unsigned short *BI = (unsigned short*)bmem;
     srandom(3);
     for (size_t i = 0; i < (size_t)N*wwords; i++) W[i] = (unsigned)random();
-    for (int i = 0; i < N*ng; i++) { SB[i*2]=fbf16(0.01f); SB[i*2+1]=fbf16(-0.005f); }
+    for (int i = 0; i < N*ng; i++) { SB[i]=fbf16(0.01f); BI[i]=fbf16(-0.005f); }
 
     @autoreleasepool {
         id<MTLDevice> d = lg_metal_device();
-        void *wm = lg_metal_map(wmem, wb), *sm = lg_metal_map(smem, sb);
+        void *wm = lg_metal_map(wmem, wb), *sm = lg_metal_map(smem, sb), *bm = lg_metal_map(bmem, sb);
         printf("shape Kd=%d N=%d %d-bit gs=%d  (one Laguna-S expert matrix)\n", Kd,N,bits,gs);
         printf("%8s %10s %12s %12s\n", "rows", "ms", "GFLOP/s", "vs CPU UDOT");
         int rowset[] = {8, 32, 128, 512, 2048};
@@ -48,11 +50,11 @@ int main(void) {
             id<MTLBuffer> yb = [d newBufferWithLength:(size_t)rows*N*4
                                               options:MTLResourceStorageModeShared];
             void *xh=(void*)CFBridgingRetain(xb), *yh=(void*)CFBridgingRetain(yb);
-            lg_metal_expert(wm,0,sm,0,xh,yh,rows,0,Kd,N,gs,bits);   // warm
+            lg_metal_expert(wm,0,sm,0,bm,0,xh,yh,rows,0,Kd,N,gs,bits);   // warm
             int reps = rows <= 128 ? 50 : 10;
             double t0 = now_s();
             for (int r = 0; r < reps; r++)
-                lg_metal_expert(wm,0,sm,0,xh,yh,rows,0,Kd,N,gs,bits);
+                lg_metal_expert(wm,0,sm,0,bm,0,xh,yh,rows,0,Kd,N,gs,bits);
             double dt = (now_s()-t0)/reps;
             double fl = 2.0*rows*Kd*N;
             printf("%8d %9.3f %11.1f %11.1fx\n", rows, dt*1e3, fl/dt/1e9, (fl/dt/1e9)/298.0);

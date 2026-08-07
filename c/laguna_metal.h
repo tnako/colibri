@@ -33,9 +33,6 @@ void   lg_metal_attn_append(int layer, int pos0, int S, const float *k,
 int    lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                      int S, int pos0, int H, int KV, int hd, float scale, int window);
 size_t lg_metal_attn_bytes(int layer);
-/* FlashAttention-2 streaming variant: no score matrix, O(tile) memory. */
-int    lg_metal_attn2(int layer, float *ctx_out, const float *q, const float *gt,
-                      int S, int pos0, int H, int KV, int hd, float scale, int window);
 /* GPU busy vs wall for the attention dispatches (LAGUNA_GPU_PROF=1). */
 void   lg_metal_prof_dump(void);
 
@@ -48,12 +45,6 @@ size_t lg_metal_map_count(void);
 int    lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff,
                        void *bmap, size_t boff, void *xbuf, void *ybuf,
                        int rows, int row0, int Kd, int N, int gs, int bits);
-/* Batched form: begin, add one dispatch per expert, end (commits + waits once). */
-int    lg_metal_expert_begin(void);
-int    lg_metal_expert_add(void *wmap, size_t woff, void *smap, size_t soff,
-                           void *bmap, size_t boff, void *xbuf, void *ybuf,
-                           int rows, int row0, int Kd, int N, int gs, int bits);
-int    lg_metal_expert_end(void);
 /* All experts in one dispatch (grouped GEMM). offs = E+1 row starts. */
 int    lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size_t soff,
                     void *bmap, size_t boff, void *xbuf, void *ybuf, void *offbuf,
