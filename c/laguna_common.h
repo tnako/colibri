@@ -43,6 +43,7 @@
 #include <time.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#include <sys/sysctl.h>          /* LAGUNA-FORK: hw.memsize for the GPU-expert RAM check */
 #endif
 #include "st.h"
 #include "tok.h"
@@ -812,6 +813,52 @@ static int gpu_experts_map(Model *m) {
     if (m->experts != EXP_OQ || !lg_metal_available()) return 0;
     int fm = 0; while (fm < L && !c->sparse[fm]) fm++;
     if (fm >= L) return 0;
+
+    /* PHYSICAL RAM CHECK (LAGUNA-FORK).
+     *
+     * The GPU expert kernel dequantizes the WHOLE bank once per prefill chunk,
+     * not just the tokens routed to each expert (prefill is flat in token count
+     * for exactly this reason). "Mapped zero-copy, evictable" is true, but it
+     * only helps if the pages CAN be evicted as fast as new ones are touched --
+     * which requires the bank to fit in physical RAM with room to spare for
+     * everything else running. It does not require fitting the 20 GB budget,
+     * because the mapping is correctly free against that budget; the budget was
+     * never the constraint here.
+     *
+     * Measured without this guard: Laguna-S-2.1-oQ4e-fast has a 56.8 GB bank on
+     * a 34.4 GB machine. Swap grew 1.8 -> 24.5 GB in 48 seconds, with
+     * `Pages free` near zero throughout -- genuine memory exhaustion, not a
+     * false alarm. XS (7.9 GB) and S-oQ2e-fast (28.4 GB) both fit and were
+     * measured clean; this is a real ceiling, not overcaution. */
+    double bank_bytes = 0;
+    for (int li = fm; li < L; li++) if (c->sparse[li]) {
+        char probe2[384];
+        const char *pfx2 = "";
+        snprintf(probe2, sizeof(probe2), "model.layers.%d.mlp.switch_mlp.gate_proj.weight", li);
+        if (!st_find(&m->S, probe2)) pfx2 = "language_model.";
+        const char *kind2[3] = { "gate_proj", "up_proj", "down_proj" };
+        for (int w = 0; w < 3; w++) {
+            char wn2[384];
+            snprintf(wn2,sizeof(wn2),"%smodel.layers.%d.mlp.switch_mlp.%s.weight", pfx2,li,kind2[w]);
+            st_tensor *t = st_find(&m->S, wn2);
+            if (t) bank_bytes += (double)t->nbytes;
+        }
+    }
+    double phys_ram = 0;
+    /* Use total installed RAM, not just currently-free, since the bank must
+     * coexist with everything else the OS and this process need. */
+#ifdef __APPLE__
+    { int64_t hw = 0; size_t sz = sizeof(hw);
+      if (sysctlbyname("hw.memsize", &hw, &sz, NULL, 0) == 0 && hw > 0) phys_ram = (double)hw; }
+#endif
+    if (phys_ram > 0 && bank_bytes > phys_ram * 0.85) {
+        fprintf(stderr,
+            "[mem] gpu experts: bank is %.1f GB, exceeds 85%% of %.1f GB physical RAM -> "
+            "falling back to the resident/streaming path (would swap otherwise)\n",
+            bank_bytes/1e9, phys_ram/1e9);
+        return 0;
+    }
+
     char probe[384];
     const char *pfx = "";
     snprintf(probe, sizeof(probe), "model.layers.%d.mlp.switch_mlp.gate_proj.weight", fm);
