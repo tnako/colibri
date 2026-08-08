@@ -1670,39 +1670,55 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
 
             GpuExp *G = &m->gx[(size_t)layer*3];
             /* THREE dispatches per layer, one per matrix, each covering ALL
-             * experts. Per-expert dispatches (768/layer) left the GPU idle:
-             * profiling showed 35330 samples in __psynch_cvwait at 13.8% CPU.
-             * grid.z indexes the expert and each threadgroup reads its own row
-             * range from `offs`, which is the grouped-GEMM shape the MoE
-             * literature uses. */
+             * experts via a COMPACTED TILE LIST rather than a maxrows-sized
+             * grid. An imbalanced router made the old per-expert-maxrows grid
+             * pay for the largest expert everywhere: measured on a real layer,
+             * maxrows swung 698-3863 against a mean of 128 rows/expert, a 14.7x
+             * waste factor that was nearly the entire cost of this phase. The
+             * tile list has exactly one entry per real (expert, row-tile). */
             void *ho = lg_metal_scratch(4, (size_t)(E+1)*sizeof(unsigned));
             unsigned *offs = (unsigned*)lg_metal_scratch_ptr(ho);
-            int maxrows = 0;
+            int ntiles = 0;
             if (offs) {
                 for (int e = 0; e <= E; e++) offs[e] = (unsigned)estart[e];
                 for (int e = 0; e < E; e++) {
-                    int nr = estart[e+1]-estart[e];
-                    if (nr > maxrows) maxrows = nr;
+                    int nr = estart[e+1] - estart[e];
+                    ntiles += (nr + 63) / 64;
+                }
+            }
+            void *ht = lg_metal_scratch(5, (size_t)ntiles * 2 * sizeof(unsigned));
+            unsigned *tiles = (unsigned*)lg_metal_scratch_ptr(ht);
+            if (offs && tiles) {
+                int ti = 0;
+                for (int e = 0; e < E; e++) {
+                    int nr = estart[e+1] - estart[e];
+                    for (int r0 = 0; r0 < nr; r0 += 64) {
+                        tiles[ti*2] = (unsigned)e; tiles[ti*2+1] = (unsigned)r0; ti++;
+                    }
                 }
             }
             size_t wslabGU = (size_t)G[0].N * (((size_t)D*bits+31)/32) * 4;
             size_t sslabGU = (size_t)G[0].N * (D/gs) * 2;
             size_t wslabD  = (size_t)G[2].N * (((size_t)I*bits+31)/32) * 4;
             size_t sslabD  = (size_t)G[2].N * (I/gs) * 2;
-            int ok = offs && maxrows > 0;
+            int ok = offs && tiles && ntiles > 0;
             /* Time ONLY the GPU work. The first version started the clock before
              * the gather and summed it per layer, which produced the nonsense of
              * "expert-mm 466.4s" inside a 76.1s prefill. */
             double te = now_s();
-            ok = ok && lg_metal_expert_grouped(G[0].wmap,G[0].woff,G[0].smap,G[0].soff,
-                        G[0].bmap,G[0].boff, hx,hg,ho, E,maxrows,D,I,gs,bits, wslabGU,sslabGU);
-            ok = ok && lg_metal_expert_grouped(G[1].wmap,G[1].woff,G[1].smap,G[1].soff,
-                        G[1].bmap,G[1].boff, hx,hu,ho, E,maxrows,D,I,gs,bits, wslabGU,sslabGU);
-            if (ok) {
-                for (int64_t j = 0; j < npair*I; j++) gb[j] = siluf(gb[j]) * ub[j];
-                ok = lg_metal_expert_grouped(G[2].wmap,G[2].woff,G[2].smap,G[2].soff,
-                        G[2].bmap,G[2].boff, hg,hh,ho, E,maxrows,I,D,gs,bits, wslabD,sslabD);
-            }
+            int dbg = getenv("LG_DBG_PHASE") != NULL;
+            /* ONE command buffer for gate+up+silu+down (lg_metal_moe_layer). Three
+             * separate commit+wait round trips measured 36% GPU busy -- 14.38s of
+             * real work inside 39.77s wall for 234 dispatches -- because each
+             * short kernel still pays full command-buffer scheduling cost. */
+            ok = ok && lg_metal_moe_layer(
+                    G[0].wmap,G[0].woff,G[0].smap,G[0].soff,G[0].bmap,G[0].boff,
+                    G[1].wmap,G[1].woff,G[1].smap,G[1].soff,G[1].bmap,G[1].boff,
+                    G[2].wmap,G[2].woff,G[2].smap,G[2].soff,G[2].bmap,G[2].boff,
+                    hx,hg,hu,hh,ho,ht, ntiles,(int)npair,D,I,gs,bits, wslabGU,sslabGU,wslabD,sslabD);
+            if (dbg) fprintf(stderr,
+                "[phase] L%2d moe_layer %.1fms ntiles=%d npair=%lld ok=%d\n",
+                layer, (now_s()-te)*1000, ntiles, (long long)npair, ok);
             if (ok) {
                 for (int64_t r = 0; r < npair; r++) {
                     int64_t t = vis[r];
@@ -2149,6 +2165,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     int gen = len - np;
 #ifdef LAGUNA_METAL
     lg_metal_prof_dump();
+    lg_metal_expert_prof_dump();
 #endif
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
            t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());

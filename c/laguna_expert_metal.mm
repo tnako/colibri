@@ -68,6 +68,22 @@ struct ExpArgs {
 
 static inline float deq(uint code, float s, float b) { return fma((float)code, s, b); }
 
+/* silu(gate) * up, in place on GPU. Chaining this in the SAME command buffer as
+ * gate/up/down removes the CPU sync point that forced one commit+wait per
+ * matrix per layer -- measured: 234 dispatches at 61ms GPU busy each but 170ms
+ * WALL each (36% busy overall), because each commit+wait pays full command
+ * buffer scheduling cost for a short kernel. Doing all layers in one buffer
+ * amortizes that overhead across the whole prefill chunk. */
+kernel void silu_mul(device float* G [[buffer(0)]],
+                     device const float* U [[buffer(1)]],
+                     constant uint& n [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    float g = G[gid];
+    float s = g / (1.0f + exp(-g));
+    G[gid] = s * U[gid];
+}
+
 kernel void expert_gemm(device const float*    X    [[buffer(0)]],
                         device const uint*     W    [[buffer(1)]],
                         device const ushort*   SC   [[buffer(2)]],  /* bf16 scales */
@@ -75,16 +91,22 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
                         device float*          Y    [[buffer(3)]],
                         constant ExpArgs&      a    [[buffer(4)]],
                         device const uint*     OFF  [[buffer(6)]],  /* [E+1] row starts */
+                        device const uint2*    TILES[[buffer(7)]],  /* [ntiles] (expert, r0) */
                         uint3 tg   [[threadgroup_position_in_grid]],
                         uint  sidx [[simdgroup_index_in_threadgroup]],
                         uint  lane [[thread_index_in_simdgroup]]) {
-    /* GROUPED: grid.z selects the expert, so ONE dispatch covers all of them and
-     * the GPU schedules every expert's threadgroups concurrently. Per-expert
-     * dispatches left the GPU idle (profile: 35330 samples in __psynch_cvwait). */
-    uint ex = tg.z;
+    /* COMPACTED TILE LIST (LAGUNA-FORK): the old grid was E x ceil(maxrows/TM),
+     * so an imbalanced router made every expert pay for the LARGEST expert's
+     * row count. Measured on a real Laguna-XS layer: maxrows swung 698-3863
+     * while the mean was 128 -- a 14.7x waste factor, and padding was nearly
+     * the entire cost (engine expert-mm 49.8s vs an isolated uniform-routing
+     * bench of ~11s for the same total FLOPs). grid.x now indexes a CPU-built
+     * list with exactly one entry per real (expert, row-tile) pair, so padding
+     * drops to at most TM-1 rows on the last tile of each expert. */
+    uint2 tile = TILES[tg.x];
+    uint ex = tile.x, r0 = tile.y;
     uint xs = OFF[ex], xe = OFF[ex+1];
     uint erows = xe - xs;
-    uint r0 = tg.x * TM;
     uint n0 = tg.y * TN;
     if (r0 >= erows || n0 >= a.N) return;
     /* weight slab for this expert */
@@ -174,9 +196,10 @@ typedef struct { void *buf; size_t len; } MapBuf;
 static MapBuf *g_maps = NULL;
 static int g_nmap = 0, g_capmap = 0;
 static void *g_exp_pipe = NULL;
+static void *g_silu_pipe = NULL;
 
 static int exp_pipeline(void) {
-    if (g_exp_pipe) return 1;
+    if (g_exp_pipe && g_silu_pipe) return 1;
     id<MTLDevice> d = lg_metal_device();
     if (!d) return 0;
     NSError *e = nil;
@@ -184,11 +207,20 @@ static int exp_pipeline(void) {
                                          options:nil error:&e];
     if (!lib) { fprintf(stderr, "[metal] expert compile: %s\n",
                         [[e description] UTF8String]); return 0; }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"expert_gemm"];
-    id<MTLComputePipelineState> ps = [d newComputePipelineStateWithFunction:fn error:&e];
-    if (!ps) { fprintf(stderr, "[metal] expert pipeline: %s\n",
-                       [[e description] UTF8String]); return 0; }
-    g_exp_pipe = (void*)CFBridgingRetain(ps);
+    if (!g_exp_pipe) {
+        id<MTLFunction> fn = [lib newFunctionWithName:@"expert_gemm"];
+        id<MTLComputePipelineState> ps = [d newComputePipelineStateWithFunction:fn error:&e];
+        if (!ps) { fprintf(stderr, "[metal] expert pipeline: %s\n",
+                           [[e description] UTF8String]); return 0; }
+        g_exp_pipe = (void*)CFBridgingRetain(ps);
+    }
+    if (!g_silu_pipe) {
+        id<MTLFunction> fn2 = [lib newFunctionWithName:@"silu_mul"];
+        id<MTLComputePipelineState> ps2 = [d newComputePipelineStateWithFunction:fn2 error:&e];
+        if (!ps2) { fprintf(stderr, "[metal] silu pipeline: %s\n",
+                            [[e description] UTF8String]); return 0; }
+        g_silu_pipe = (void*)CFBridgingRetain(ps2);
+    }
     return 1;
 }
 
@@ -240,17 +272,34 @@ extern "C" void *lg_metal_scratch_ptr(void *h) {
  * grouped kernel below replaced it and it was deleted rather than kept as a
  * second path. See docs/gpu-expert-grouped-gemm.md. */
 
-/* GROUPED: all E experts in ONE dispatch. `offs` is E+1 row starts into the
- * expert-sorted activation buffer; maxrows sizes the grid. */
+/* GPU busy vs wall time for expert dispatches (LAGUNA_GPU_PROF=1). */
+static double g_exp_gpu_s = 0, g_exp_wall_s = 0;
+static long   g_exp_calls = 0;
+static int exp_prof_on(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("LAGUNA_GPU_PROF") ? 1 : 0;
+    return v;
+}
+extern "C" void lg_metal_expert_prof_dump(void) {
+    if (!exp_prof_on() || g_exp_calls == 0) return;
+    fprintf(stderr, "[gpuprof] expert: %ld dispatches, GPU busy %.2fs, wall %.2fs (%.0f%% busy)\n",
+            g_exp_calls, g_exp_gpu_s, g_exp_wall_s, 100.0*g_exp_gpu_s/g_exp_wall_s);
+}
+
+/* GROUPED: all E experts in ONE dispatch, using a COMPACTED TILE LIST so an
+ * imbalanced router does not force every expert to pay for the largest one's
+ * row count (see the kernel comment above `expert_gemm`). `tiles` is built by
+ * the caller from `offs`: one (expert, row-tile-origin) pair per real tile,
+ * `ntiles` entries total. */
 extern "C" int lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size_t soff,
                     void *bmap, size_t boff, void *xbuf, void *ybuf, void *offbuf,
-                    int E, int maxrows, int Kd, int N, int gs, int bits,
+                    void *tilesbuf, int ntiles, int Kd, int N, int gs, int bits,
                     size_t wslab, size_t sslab) {
-    if (!g_exp_pipe || !wmap || !smap || !bmap || maxrows <= 0) return 0;
+    if (!g_exp_pipe || !wmap || !smap || !bmap || ntiles <= 0) return 0;
     @autoreleasepool {
         struct { unsigned Kd,N,gs,bits,rows,row0,wwords,ngroups,wslab,sslab,
                           wlo,whi,slo,shi,blo,bhi; } a;
-        a.Kd=Kd; a.N=N; a.gs=gs; a.bits=bits; a.rows=maxrows; a.row0=0;
+        a.Kd=Kd; a.N=N; a.gs=gs; a.bits=bits; a.rows=0; a.row0=0;
         a.wwords=((unsigned)Kd*(unsigned)bits+31u)/32u; a.ngroups=(unsigned)(Kd/gs);
         a.wslab=(unsigned)wslab; a.sslab=(unsigned)sslab;
         a.wlo=(unsigned)(woff & 0xffffffffu); a.whi=(unsigned)(woff >> 32);
@@ -265,12 +314,117 @@ extern "C" int lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size
         [en setBuffer:(__bridge id<MTLBuffer>)bmap   offset:0 atIndex:5];
         [en setBuffer:(__bridge id<MTLBuffer>)ybuf   offset:0    atIndex:3];
         [en setBuffer:(__bridge id<MTLBuffer>)offbuf offset:0    atIndex:6];
+        [en setBuffer:(__bridge id<MTLBuffer>)tilesbuf offset:0  atIndex:7];
         [en setBytes:&a length:sizeof(a) atIndex:4];
-        [en dispatchThreadgroups:MTLSizeMake((maxrows+63)/64, (N+31)/32, E)
+        [en dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, (NSUInteger)((N+31)/32), 1)
            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [en endEncoding];
+        double w0 = exp_prof_on() ? CFAbsoluteTimeGetCurrent() : 0;
         [cb commit];
         [cb waitUntilCompleted];
+        if (exp_prof_on()) {
+            g_exp_wall_s += CFAbsoluteTimeGetCurrent() - w0;
+            g_exp_gpu_s  += cb.GPUEndTime - cb.GPUStartTime;
+            g_exp_calls++;
+        }
+        return cb.status != MTLCommandBufferStatusError;
+    }
+}
+
+/* ONE COMMAND BUFFER for a whole MoE layer: gate, up, silu(on GPU), down.
+ * Replaces 3 separate commit+wait round trips (previously measured 36% GPU
+ * busy: 14.38s real work inside 39.77s wall for 234 dispatches, i.e. ~108ms of
+ * scheduling overhead per short kernel). One round trip per layer instead of
+ * three cuts that overhead by roughly 3x. */
+extern "C" int lg_metal_moe_layer(
+        void *gwmap, size_t gwoff, void *gsmap, size_t gsoff, void *gbmap, size_t gboff,
+        void *uwmap, size_t uwoff, void *usmap, size_t usoff, void *ubmap, size_t uboff,
+        void *dwmap, size_t dwoff, void *dsmap, size_t dsoff, void *dbmap, size_t dboff,
+        void *xbuf, void *gbuf, void *ubuf, void *ybuf, void *offbuf, void *tilesbuf,
+        int ntiles, int npair, int D, int I, int gs, int bits,
+        size_t wslabGU, size_t sslabGU, size_t wslabD, size_t sslabD) {
+    if (!g_exp_pipe || !g_silu_pipe) return 0;
+    @autoreleasepool {
+        struct { unsigned Kd,N,gs,bits,rows,row0,wwords,ngroups,wslab,sslab,
+                          wlo,whi,slo,shi,blo,bhi; } ag, au, ad;
+        auto fill = [&](decltype(ag)& a, unsigned Kd, unsigned N, size_t wslab, size_t sslab,
+                       size_t woff, size_t soff, size_t boff) {
+            a.Kd=Kd; a.N=N; a.gs=(unsigned)gs; a.bits=(unsigned)bits; a.rows=0; a.row0=0;
+            a.wwords=(Kd*(unsigned)bits+31u)/32u; a.ngroups=Kd/(unsigned)gs;
+            a.wslab=(unsigned)wslab; a.sslab=(unsigned)sslab;
+            a.wlo=(unsigned)(woff&0xffffffffu); a.whi=(unsigned)(woff>>32);
+            a.slo=(unsigned)(soff&0xffffffffu); a.shi=(unsigned)(soff>>32);
+            a.blo=(unsigned)(boff&0xffffffffu); a.bhi=(unsigned)(boff>>32);
+        };
+        fill(ag, D, I, wslabGU, sslabGU, gwoff, gsoff, gboff);
+        fill(au, D, I, wslabGU, sslabGU, uwoff, usoff, uboff);
+        fill(ad, I, D, wslabD,  sslabD,  dwoff, dsoff, dboff);
+
+        id<MTLCommandBuffer> cb = [lg_metal_queue() commandBuffer];
+        id<MTLComputePipelineState> ps = (__bridge id<MTLComputePipelineState>)g_exp_pipe;
+        id<MTLComputePipelineState> sp = (__bridge id<MTLComputePipelineState>)g_silu_pipe;
+        NSUInteger cols = (NSUInteger)((I+31)/32);
+
+        id<MTLComputeCommandEncoder> e1 = [cb computeCommandEncoder];
+        [e1 setComputePipelineState:ps];
+        [e1 setBuffer:(__bridge id<MTLBuffer>)xbuf offset:0 atIndex:0];
+        [e1 setBuffer:(__bridge id<MTLBuffer>)gwmap offset:0 atIndex:1];
+        [e1 setBuffer:(__bridge id<MTLBuffer>)gsmap offset:0 atIndex:2];
+        [e1 setBuffer:(__bridge id<MTLBuffer>)gbmap offset:0 atIndex:5];
+        [e1 setBuffer:(__bridge id<MTLBuffer>)gbuf offset:0 atIndex:3];
+        [e1 setBuffer:(__bridge id<MTLBuffer>)offbuf offset:0 atIndex:6];
+        [e1 setBuffer:(__bridge id<MTLBuffer>)tilesbuf offset:0 atIndex:7];
+        [e1 setBytes:&ag length:sizeof(ag) atIndex:4];
+        [e1 dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, cols, 1)
+           threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e1 endEncoding];
+
+        id<MTLComputeCommandEncoder> e2 = [cb computeCommandEncoder];
+        [e2 setComputePipelineState:ps];
+        [e2 setBuffer:(__bridge id<MTLBuffer>)xbuf offset:0 atIndex:0];
+        [e2 setBuffer:(__bridge id<MTLBuffer>)uwmap offset:0 atIndex:1];
+        [e2 setBuffer:(__bridge id<MTLBuffer>)usmap offset:0 atIndex:2];
+        [e2 setBuffer:(__bridge id<MTLBuffer>)ubmap offset:0 atIndex:5];
+        [e2 setBuffer:(__bridge id<MTLBuffer>)ubuf offset:0 atIndex:3];
+        [e2 setBuffer:(__bridge id<MTLBuffer>)offbuf offset:0 atIndex:6];
+        [e2 setBuffer:(__bridge id<MTLBuffer>)tilesbuf offset:0 atIndex:7];
+        [e2 setBytes:&au length:sizeof(au) atIndex:4];
+        [e2 dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, cols, 1)
+           threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e2 endEncoding];
+
+        id<MTLComputeCommandEncoder> e3 = [cb computeCommandEncoder];
+        [e3 setComputePipelineState:sp];
+        [e3 setBuffer:(__bridge id<MTLBuffer>)gbuf offset:0 atIndex:0];
+        [e3 setBuffer:(__bridge id<MTLBuffer>)ubuf offset:0 atIndex:1];
+        unsigned n = (unsigned)npair * (unsigned)I;
+        [e3 setBytes:&n length:4 atIndex:2];
+        [e3 dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e3 endEncoding];
+
+        NSUInteger colsD = (NSUInteger)((D+31)/32);
+        id<MTLComputeCommandEncoder> e4 = [cb computeCommandEncoder];
+        [e4 setComputePipelineState:ps];
+        [e4 setBuffer:(__bridge id<MTLBuffer>)gbuf offset:0 atIndex:0];
+        [e4 setBuffer:(__bridge id<MTLBuffer>)dwmap offset:0 atIndex:1];
+        [e4 setBuffer:(__bridge id<MTLBuffer>)dsmap offset:0 atIndex:2];
+        [e4 setBuffer:(__bridge id<MTLBuffer>)dbmap offset:0 atIndex:5];
+        [e4 setBuffer:(__bridge id<MTLBuffer>)ybuf offset:0 atIndex:3];
+        [e4 setBuffer:(__bridge id<MTLBuffer>)offbuf offset:0 atIndex:6];
+        [e4 setBuffer:(__bridge id<MTLBuffer>)tilesbuf offset:0 atIndex:7];
+        [e4 setBytes:&ad length:sizeof(ad) atIndex:4];
+        [e4 dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, colsD, 1)
+           threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e4 endEncoding];
+
+        double w0 = exp_prof_on() ? CFAbsoluteTimeGetCurrent() : 0;
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (exp_prof_on()) {
+            g_exp_wall_s += CFAbsoluteTimeGetCurrent() - w0;
+            g_exp_gpu_s  += cb.GPUEndTime - cb.GPUStartTime;
+            g_exp_calls++;
+        }
         return cb.status != MTLCommandBufferStatusError;
     }
 }
@@ -280,12 +434,17 @@ extern "C" int lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size
 extern "C" int lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff,
                     void *bmap, size_t boff, void *xbuf, void *ybuf,
                     int rows, int row0, int Kd, int N, int gs, int bits) {
-    static void *offh = NULL;
-    unsigned *o = NULL;
-    if (!offh) offh = lg_metal_scratch(7, 2*sizeof(unsigned));
-    o = (unsigned*)lg_metal_scratch_ptr(offh);
+    static void *offh = NULL, *tileh = NULL;
+    if (!offh) offh = lg_metal_scratch(6, 2*sizeof(unsigned));
+    unsigned *o = (unsigned*)lg_metal_scratch_ptr(offh);
     if (!o) return 0;
     o[0] = (unsigned)row0; o[1] = (unsigned)(row0 + rows);
+    int ntiles = (rows + 63) / 64;
+    if (!tileh) tileh = lg_metal_scratch(7, (size_t)4096 * 2 * sizeof(unsigned));
+    unsigned *t = (unsigned*)lg_metal_scratch_ptr(tileh);
+    if (!t) return 0;
+    for (int i = 0; i < ntiles; i++) { t[i*2] = 0; t[i*2+1] = (unsigned)(i * 64); }
     return lg_metal_expert_grouped(wmap, woff, smap, soff, bmap, boff,
-                                   xbuf, ybuf, offh, 1, rows, Kd, N, gs, bits, 0, 0);
+                                   xbuf, ybuf, offh, tileh, ntiles, Kd, N, gs, bits, 0, 0);
 }
+

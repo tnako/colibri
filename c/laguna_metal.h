@@ -49,16 +49,28 @@ size_t lg_metal_map_count(void);
 int    lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff,
                        void *bmap, size_t boff, void *xbuf, void *ybuf,
                        int rows, int row0, int Kd, int N, int gs, int bits);
-/* All experts in one dispatch (grouped GEMM). offs = E+1 row starts. */
+/* All experts in one dispatch (grouped GEMM), using a compacted tile list so an
+ * imbalanced router does not pay for the largest expert's row count everywhere.
+ * offs = E+1 row starts; tiles = ntiles x (expert, row-tile-origin) pairs. */
 int    lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size_t soff,
                     void *bmap, size_t boff, void *xbuf, void *ybuf, void *offbuf,
-                    int E, int maxrows, int Kd, int N, int gs, int bits,
+                    void *tilesbuf, int ntiles, int Kd, int N, int gs, int bits,
                     size_t wslab, size_t sslab);
+/* One MoE layer (gate, up, silu, down) in a single command buffer -- see the
+ * comment in laguna_expert_metal.mm for why this replaced 3 separate ones. */
+int    lg_metal_moe_layer(
+        void *gwmap, size_t gwoff, void *gsmap, size_t gsoff, void *gbmap, size_t gboff,
+        void *uwmap, size_t uwoff, void *usmap, size_t usoff, void *ubmap, size_t uboff,
+        void *dwmap, size_t dwoff, void *dsmap, size_t dsoff, void *dbmap, size_t dboff,
+        void *xbuf, void *gbuf, void *ubuf, void *ybuf, void *offbuf, void *tilesbuf,
+        int ntiles, int npair, int D, int I, int gs, int bits,
+        size_t wslabGU, size_t sslabGU, size_t wslabD, size_t sslabD);
 /* shared GPU scratch for the expert path */
 void  *lg_metal_scratch(int which, size_t bytes);
 void  *lg_metal_scratch_ptr(void *h);
 /* GPU busy vs wall time for the attention dispatches (LAGUNA_GPU_PROF=1). */
 void   lg_metal_prof_dump(void);
+void   lg_metal_expert_prof_dump(void);
 
 #ifdef __cplusplus
 }
