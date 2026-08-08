@@ -7,6 +7,19 @@
 
 #include <stddef.h>
 
+/* Row-tile size the GPU expert kernel groups per threadgroup (laguna_expert_metal.mm's
+ * TM, compiled at runtime as Metal Shading Language source -- this macro is NOT
+ * visible there, so that literal must be kept in sync with this one by hand).
+ * The CPU-side tile-list builder in laguna_common.h chunks experts' row ranges
+ * using THIS constant, and it must match the kernel's TM or the (expert, row0)
+ * pairs handed to the kernel won't align with what TM expects.
+ *
+ * TM=128 was tried (larger row-tile amortizes the oQ dequant over more rows)
+ * and measured WORSE: 284.6s vs 199.7s prefill wall on Laguna-S at 7370
+ * tokens -- fewer threadgroups dispatched cost more than the reduced dequant
+ * work saved. See laguna_expert_metal.mm's TM comment. Kept at 64. */
+#define LG_EXP_TM 64
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,11 +40,13 @@ int    lg_metal_gemm(void *handle, float *y, const float *x, int S);
  * Persistent per-layer f16 K/V on the GPU; append per chunk, one dispatch per
  * (layer, chunk) does scores + softmax + PV without materializing the score
  * matrix. All return 0 / do nothing when Metal is unavailable. */
-/* Bind the engine's int8 KV cache directly (zero copy). No GPU-side KV alloc. */
+/* Bind the engine's int8 KV cache directly (zero copy). No GPU-side KV alloc.
+ * `ctxcap` is the PHYSICAL per-head row stride (kvphys); `ring` is the logical
+ * ring modulus for sliding layers (0 for full/linear layers). */
 int    lg_metal_attn_bind(int layers, int layer, int kv, int ctxcap, int hd,
                           const void *kcodes, const void *vcodes,
                           const float *kscale, const float *vscale,
-                          size_t code_bytes, size_t scale_bytes);
+                          size_t code_bytes, size_t scale_bytes, int ring);
 void   lg_metal_attn_append(int layer, int pos0, int S, const float *k,
                             const float *vv, int kvdim);
 int    lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,

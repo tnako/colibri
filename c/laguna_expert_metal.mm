@@ -36,16 +36,26 @@ static const char *EXP_SRC = R"(
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-/* One threadgroup computes a 32x32 output tile for one expert.
+/* One threadgroup computes a TMxTN output tile for one expert.
  * A = x[rows, Kd] f32 (activations), B = expert weight [N, Kd] oQ-packed.
  * Output y[rows, N] f32.
  *
  * oQ layout (verified in docs/oq-format.md): codes are LSB-first packed into
- * uint32 along K; scales/biases are bf16, one pair per group of `gs` along K. */
+ * uint32 along K; scales/biases are bf16, one pair per group of `gs` along K.
+ *
+ * TM=128 was tried (to amortize the B dequant over more rows per weight-tile
+ * decode -- see the "dequant is redundant across row-tiles" note in
+ * docs/gpu-expert-grouped-gemm.md) and MEASURED WORSE: 284.6s vs 199.7s
+ * prefill wall on Laguna-S at 7370 tokens. Halving dequant work per row also
+ * halved the number of threadgroups dispatched (half as many row-tiles per
+ * expert), and the occupancy loss outweighed the compute saving -- consistent
+ * with the doc's own note that 32->64 helped but going further was untested
+ * and, now measured, does not. Reverted to 64. */
 #define TM 64
 #define TN 32
 #define TK 32
 #define NSG 8          /* simdgroups per threadgroup; each owns one 8-row band */
+#define RB (TM / (NSG * 8))  /* 8-row bands per simdgroup (1 at TM=64) */
 
 struct ExpArgs {
     uint Kd, N, gs, bits;
@@ -126,8 +136,14 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
     threadgroup float As[TM * TK];
     threadgroup float Bs[TK * TN];
 
-    simdgroup_float8x8 acc[4];
-    for (uint j = 0; j < 4; j++) acc[j] = make_filled_simdgroup_matrix<float,8,8>(0.0f);
+    /* acc[b][j]: b indexes this simdgroup's RB row-bands (each 8 rows), j
+     * indexes the 4 8-wide column tiles inside TN. Was acc[4] (RB==1) when
+     * TM==64; widening TM to amortize the B dequant (see the comment above
+     * expert_gemm) over more rows per weight-tile decode needs each
+     * simdgroup to cover RB bands instead of exactly one. */
+    simdgroup_float8x8 acc[RB][4];
+    for (uint b = 0; b < RB; b++)
+        for (uint j = 0; j < 4; j++) acc[b][j] = make_filled_simdgroup_matrix<float,8,8>(0.0f);
 
     uint tid = sidx * 32 + lane;                 /* 0..NSG*32-1 */
     uint NT  = NSG * 32;
@@ -140,7 +156,11 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
             As[e] = (gr < erows && k0+kk < a.Kd)
                   ? X[(ulong)(xs + gr) * a.Kd + k0 + kk] : 0.0f;
         }
-        /* stage B: TK x TN weights, dequantized from oQ on the fly */
+        /* stage B: TK x TN weights, dequantized from oQ on the fly. This is
+         * the expensive part (bit-unpack + bf16->f32 per element) and is now
+         * shared across RB row-bands per threadgroup instead of just one --
+         * doubling TM/RB halves how many times each weight tile gets
+         * re-dequantized across an expert's row-tiles. */
         for (uint e = tid; e < TK*TN; e += NT) {
             uint kk = e / TN, nn = e % TN;
             uint gn = n0 + nn, gk = k0 + kk;
@@ -166,28 +186,41 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        /* Each of the 4 simdgroups owns one 8-row band of the 32-row tile, and
-         * walks the 4 column tiles. acc[0][j] is that band's j-th 8x8 tile. */
+        /* Each simdgroup owns RB 8-row bands (rows [sidx*RB*8 + b*8, ...+8)
+         * for b in [0,RB)) and walks the 4 column tiles for each. */
         for (uint kk = 0; kk < TK; kk += 8) {
-            simdgroup_float8x8 ma, mb;
-            simdgroup_load(ma, As + (ulong)(sidx*8)*TK + kk, TK);
-            for (uint j = 0; j < 4; j++) {
-                simdgroup_load(mb, Bs + (ulong)kk*TN + j*8, TN);
-                simdgroup_multiply_accumulate(acc[j], ma, mb, acc[j]);
+            simdgroup_float8x8 mb[4];
+            for (uint j = 0; j < 4; j++)
+                simdgroup_load(mb[j], Bs + (ulong)kk*TN + j*8, TN);
+            for (uint b = 0; b < RB; b++) {
+                simdgroup_float8x8 ma;
+                simdgroup_load(ma, As + (ulong)(sidx*RB*8 + b*8)*TK + kk, TK);
+                for (uint j = 0; j < 4; j++)
+                    simdgroup_multiply_accumulate(acc[b][j], ma, mb[j], acc[b][j]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    /* store: simdgroup sidx owns rows [sidx*8, sidx*8+8) */
-    threadgroup float Cs[TM * TN];
-    for (uint j = 0; j < 4; j++)
-        simdgroup_store(acc[j], Cs + (ulong)(sidx*8)*TN + j*8, TN);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint e = tid; e < TM*TN; e += NT) {
-        uint rr = e / TN, nn = e % TN;
-        if (r0 + rr < erows && n0 + nn < a.N)
-            Y[(ulong)(xs + r0 + rr) * a.N + n0 + nn] = Cs[e];
+    /* store: TM*TN threadgroup memory for Cs pushed this over Metal's 32KB
+     * threadgroup-memory limit at TM=128 (36864 > 32768), which silently
+     * failed pipeline compilation and fell back to CPU experts -- caught by
+     * actually running it, not by review. Fix: Cs holds only ONE row-band
+     * per simdgroup at a time (NSG*8 rows, not TM rows), flushed to device
+     * memory and reused across the RB bands each simdgroup owns. */
+    threadgroup float Cs[NSG * 8 * TN];
+    for (uint b = 0; b < RB; b++) {
+        for (uint j = 0; j < 4; j++)
+            simdgroup_store(acc[b][j], Cs + (ulong)(sidx*8)*TN + j*8, TN);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < NSG*8*TN; e += NT) {
+            uint rr = e / TN, nn = e % TN;
+            uint sg = rr / 8, local = rr % 8;
+            uint grow = sg*RB*8 + b*8 + local;
+            if (r0 + grow < erows && n0 + nn < a.N)
+                Y[(ulong)(xs + r0 + grow) * a.N + n0 + nn] = Cs[e];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 )";
@@ -439,11 +472,11 @@ extern "C" int lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff,
     unsigned *o = (unsigned*)lg_metal_scratch_ptr(offh);
     if (!o) return 0;
     o[0] = (unsigned)row0; o[1] = (unsigned)(row0 + rows);
-    int ntiles = (rows + 63) / 64;
+    int ntiles = (rows + LG_EXP_TM - 1) / LG_EXP_TM;
     if (!tileh) tileh = lg_metal_scratch(7, (size_t)4096 * 2 * sizeof(unsigned));
     unsigned *t = (unsigned*)lg_metal_scratch_ptr(tileh);
     if (!t) return 0;
-    for (int i = 0; i < ntiles; i++) { t[i*2] = 0; t[i*2+1] = (unsigned)(i * 64); }
+    for (int i = 0; i < ntiles; i++) { t[i*2] = 0; t[i*2+1] = (unsigned)(i * LG_EXP_TM); }
     return lg_metal_expert_grouped(wmap, woff, smap, soff, bmap, boff,
                                    xbuf, ybuf, offh, tileh, ntiles, Kd, N, gs, bits, 0, 0);
 }

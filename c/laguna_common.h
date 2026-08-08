@@ -184,6 +184,12 @@ typedef struct {
      * int8 codes with one f32 scale per row (see kv_i8.h): 4x smaller than f32,
      * which is what makes 256k context fit in a 20 GB budget. */
     int8_t **K, **V; float **Ks, **Vs; int *kvcap; int kv_len, max_t;
+    /* physical row count per kv head, per layer. Equal to kvcap[i] except for
+     * sliding layers on a Metal build, where it is 2*kvcap[i] (see kv_alloc):
+     * every logical ring slot is also written at slot+kvcap[i], the standard
+     * double-mapped ring, so the GPU attention kernel can read any window-sized
+     * band as ONE contiguous row range instead of wrapping. */
+    int *kvphys;
 } Model;
 
 /* Page-aligned, page-rounded allocation. newBufferWithBytesNoCopy requires both,
@@ -206,9 +212,20 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 #endif
 /* Prefill chunk size. Defined here because both the memory budget and the
- * attention path need it; the chunking itself is in step() far below. */
+ * attention path need it; the chunking itself is in step() far below.
+ *
+ * 4096 -> 8192 (LAGUNA-FORK): the GPU expert kernel's throughput depends on
+ * rows-per-expert-per-dispatch (measured in docs/gpu-expert-grouped-gemm.md:
+ * 181.8 GFLOP/s at 32 rows, 1386.6 at 512), and rows/expert = chunk*topk/E.
+ * On Laguna-S (topk=10, E=256) that was only 160 rows/expert at chunk=4096,
+ * far short of where the kernel is efficient. Doubling the chunk collapses a
+ * 7370-token prompt from 2 chunks to 1 and roughly doubles rows/expert,
+ * measured 351.8s -> 199.7s prefill wall (1.8x) on Laguna-S-oQ2e-fast at
+ * 7370 tokens, peak RSS 11.8 -> 13.2 GB (still inside a 20 GB budget). Larger
+ * chunks were not measured to help further (16384 gave the same 198.6s) but
+ * do cost more O(chunk) scratch, so 8192 is the sweet spot found so far. */
 #ifndef LG_CHUNK
-#define LG_CHUNK 4096
+#define LG_CHUNK 8192
 #endif
 
 /* ---- per-step scratch arena (LAGUNA-FORK) ----------------------------------
@@ -1381,7 +1398,8 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     int D = c->hidden, H = c->heads[li], KV = c->n_kv, hd = c->head_dim;
     int lt = c->slide[li] ? LG_SLIDE : LG_FULL, rot = c->rope[lt].rot_dim;
     int qdim = H*hd, kvdim = KV*hd, group = H/KV;
-    int kvcap = m->kvcap[li];
+    int kvcap = m->kvcap[li];    /* ring modulus (CPU wraparound), unchanged */
+    int kvphys = m->kvphys[li];  /* physical per-head row stride, see kv_alloc */
     /* arena: single-threaded, dead at this layer's arena_reset() */
     float *q  = afloat((int64_t)S*qdim);
     float *k  = afloat((int64_t)S*kvdim);
@@ -1451,12 +1469,24 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     {
         int s0 = 0;
         if (c->slide[li] && S > kvcap) s0 = S - kvcap;
+        int is_ring = (kvphys != kvcap);   /* sliding + Metal build, see kv_alloc */
         for (int s = s0; s < S; s++) {
             int pos = pos0 + s, slot = c->slide[li] ? pos % kvcap : pos;
             for (int h = 0; h < KV; h++) {
-                int64_t r = (int64_t)h*kvcap + slot;
+                int64_t base = (int64_t)h*kvphys;
+                int64_t r = base + slot;
                 kv_i8_pack(m->K[li] + r*hd, &m->Ks[li][r], k  + (int64_t)s*kvdim + h*hd, hd);
                 kv_i8_pack(m->V[li] + r*hd, &m->Vs[li][r], vv + (int64_t)s*kvdim + h*hd, hd);
+                /* DOUBLE-MAP (LAGUNA-FORK): mirror the same row at slot+kvcap so
+                 * any window-length band starting anywhere in [0,kvcap) reads
+                 * contiguously on the GPU (see kv_alloc's kvphys comment). */
+                if (is_ring) {
+                    int64_t r2 = base + slot + kvcap;
+                    memcpy(m->K[li] + r2*hd, m->K[li] + r*hd, hd);
+                    memcpy(m->V[li] + r2*hd, m->V[li] + r*hd, hd);
+                    m->Ks[li][r2] = m->Ks[li][r];
+                    m->Vs[li][r2] = m->Vs[li][r];
+                }
             }
         }
     }
@@ -1492,12 +1522,20 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     /* Bind the int8 cache for this layer. Nothing is copied and nothing is
      * appended: the CPU already wrote these rows, and the GPU reads the same
      * pages. The append must have happened before scoring, which it has -- see
-     * the note above the append site below. */
-    int64_t kvrows = (int64_t)KV * m->kvcap[li];
+     * the note above the append site below.
+     *
+     * kvrows/the ctxcap argument use kvphys (the PHYSICAL per-head stride),
+     * not kvcap (the logical ring modulus): for sliding layers on a Metal
+     * build these differ -- see kv_alloc's comment. Passing kvcap here was
+     * the root of the bug where every sliding layer silently fell back to the
+     * CPU: L->ctxcap ended up as the small `window` ring, so `pos0+S >
+     * L->ctxcap` failed on the very first chunk of every prefill. */
+    int64_t kvrows = (int64_t)KV * m->kvphys[li];
+    int ring_mod = (c->slide[li] && m->kvphys[li] != m->kvcap[li]) ? m->kvcap[li] : 0;
     if (gpu_ok &&
-        lg_metal_attn_bind(c->n_layers, li, KV, m->kvcap[li], hd,
+        lg_metal_attn_bind(c->n_layers, li, KV, m->kvphys[li], hd,
                            m->K[li], m->V[li], m->Ks[li], m->Vs[li],
-                           (size_t)kvrows * hd, (size_t)kvrows * sizeof(float))) {
+                           (size_t)kvrows * hd, (size_t)kvrows * sizeof(float), ring_mod)) {
         int win = c->slide[li] ? c->window : 0;
         if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale, win))
             goto attn_out;   /* the output gate is applied by scatter_o */
@@ -1515,10 +1553,10 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         for (int kh = 0; kh < KV; kh++) {
             for (int sb = 0; sb < S; sb += LG_QB) {
                 int nb = S - sb < LG_QB ? S - sb : LG_QB;
-                const int8_t *Kh = m->K[li] + (int64_t)kh*kvcap*hd;
-                const int8_t *Vh = m->V[li] + (int64_t)kh*kvcap*hd;
-                const float  *Kq = m->Ks[li] + (int64_t)kh*kvcap;
-                const float  *Vq = m->Vs[li] + (int64_t)kh*kvcap;
+                const int8_t *Kh = m->K[li] + (int64_t)kh*kvphys*hd;
+                const int8_t *Vh = m->V[li] + (int64_t)kh*kvphys*hd;
+                const float  *Kq = m->Ks[li] + (int64_t)kh*kvphys;
+                const float  *Vq = m->Vs[li] + (int64_t)kh*kvphys;
                 /* Cached rows are int8; stage each score chunk to f32 once so the
                  * dot/axpy kernels below stay f32 and untouched. LG_KC rows is
                  * 32 KB at hd=128, i.e. L1-resident, so the dequant is amortized
@@ -1730,7 +1768,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 for (int e = 0; e <= E; e++) offs[e] = (unsigned)estart[e];
                 for (int e = 0; e < E; e++) {
                     int nr = estart[e+1] - estart[e];
-                    ntiles += (nr + 63) / 64;
+                    ntiles += (nr + LG_EXP_TM - 1) / LG_EXP_TM;
                 }
             }
             void *ht = lg_metal_scratch(5, (size_t)ntiles * 2 * sizeof(unsigned));
@@ -1739,7 +1777,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 int ti = 0;
                 for (int e = 0; e < E; e++) {
                     int nr = estart[e+1] - estart[e];
-                    for (int r0 = 0; r0 < nr; r0 += 64) {
+                    for (int r0 = 0; r0 < nr; r0 += LG_EXP_TM) {
                         tiles[ti*2] = (unsigned)e; tiles[ti*2+1] = (unsigned)r0; ti++;
                     }
                 }
@@ -2127,21 +2165,59 @@ static void kv_alloc(Model *m, int max_t) {
         for (int i = 0; i < c->n_layers; i++) {
             free(m->K[i]); free(m->V[i]); free(m->Ks[i]); free(m->Vs[i]);
         }
-        free(m->K); free(m->V); free(m->Ks); free(m->Vs); free(m->kvcap);
+        free(m->K); free(m->V); free(m->Ks); free(m->Vs);
+        free(m->kvcap); free(m->kvphys);
     }
     m->max_t = max_t; m->kv_len = 0;
     m->K  = calloc(c->n_layers, sizeof(int8_t*));
     m->V  = calloc(c->n_layers, sizeof(int8_t*));
     m->Ks = calloc(c->n_layers, sizeof(float*));
     m->Vs = calloc(c->n_layers, sizeof(float*));
-    m->kvcap = calloc(c->n_layers, sizeof(int));
+    m->kvcap  = calloc(c->n_layers, sizeof(int));
+    m->kvphys = calloc(c->n_layers, sizeof(int));
     for (int i = 0; i < c->n_layers; i++) {
-        /* sliding layers only ever read the last `window` positions, so the
-         * ring is exactly `window` rows — the post-scoring append in
-         * attention() is what makes that safe during prefill (PR #830). */
-        int cap = (c->slide[i] && c->window > 0 && c->window < max_t) ? c->window : max_t;
-        m->kvcap[i] = cap;
-        int64_t nrow = (int64_t)c->n_kv * cap;
+        /* sliding layers only ever read the last `window` positions, so a ring
+         * of exactly `window` rows is enough for the CPU -- the post-scoring
+         * append in attention() is what makes that safe during prefill
+         * (PR #830).
+         *
+         * GPU-SLIDE RING (LAGUNA-FORK, follow-up to the kv-bind-zero-copy
+         * fix): the GPU's banded kernel needs a CONTIGUOUS read of up to
+         * `window+chunk-1` columns for one chunk's queries (see
+         * laguna_attn_metal.mm's band comment), which is wider than the
+         * window-only ring above. A plain window-sized ring can never serve
+         * that: even double-mapped, a ring only guarantees contiguity for
+         * spans up to its OWN logical size, and window (512) is far smaller
+         * than window+chunk (4607 at the default LG_CHUNK=4096). This was
+         * silently gating sliding layers off the GPU entirely: `pos0+S >
+         * ctxcap` failed on the very first chunk, so all 36 of Laguna-S's
+         * sliding layers fell back to the CPU on every GPU prefill, with
+         * only the 12 full layers ever dispatching (measured: 24 dispatches
+         * = 12 full layers * 2 chunks, zero from sliding, on an 8k prompt).
+         *
+         * Fix: on a Metal build, size the ring to hold `window+chunk` rows
+         * instead of just `window` -- still O(1) in context, just a bigger
+         * constant -- then double-map THAT ring so any window+chunk-1-wide
+         * band starting anywhere in it is contiguous. */
+        int ring = c->window;
+#ifdef LAGUNA_METAL
+        if (c->slide[i] && c->window > 0) ring = c->window + LG_CHUNK;
+#endif
+        int cap = (c->slide[i] && c->window > 0 && ring < max_t) ? ring : max_t;
+        m->kvcap[i] = cap;   /* ring modulus: CPU wraparound (`pos % kvcap`) */
+#ifdef LAGUNA_METAL
+        int is_ring = (c->slide[i] && cap < max_t);
+        /* DOUBLE-MAPPED (LAGUNA-FORK): every logical slot `r` (0..kvcap-1) is
+         * ALSO written at `r+kvcap`, so any span up to `kvcap` columns wide,
+         * starting anywhere in [0,kvcap), is contiguous in the physical
+         * buffer -- the standard double-mapped ring. Costs 2x this (already
+         * small) ring's bytes; full layers are unaffected (kvphys==kvcap). */
+        int phys = is_ring ? 2 * cap : cap;
+#else
+        int phys = cap;
+#endif
+        m->kvphys[i] = phys;
+        int64_t nrow = (int64_t)c->n_kv * phys;
         /* PAGE ALIGNED (LAGUNA-FORK): these four buffers are handed straight to
          * Metal with newBufferWithBytesNoCopy, so the GPU attention kernel reads
          * the very same int8 cache the CPU maintains. That removes the separate

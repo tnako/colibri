@@ -238,7 +238,7 @@ static int attn_pipeline(void) {
 int lg_metal_attn_bind(int layers, int layer, int kv, int ctxcap, int hd,
                        const void *kcodes, const void *vcodes,
                        const float *kscale, const float *vscale, size_t code_bytes,
-                       size_t scale_bytes) {
+                       size_t scale_bytes, int ring) {
     if (!lg_metal_device() || !attn_pipeline()) return 0;
     if (!g_al) { g_al = (AttnLayer*)calloc(layers, sizeof(AttnLayer)); g_al_n = layers; }
     if (layer < 0 || layer >= g_al_n) return 0;
@@ -261,18 +261,23 @@ int lg_metal_attn_bind(int layers, int layer, int kv, int ctxcap, int hd,
     L->V  = (void*)CFBridgingRetain(vb);
     L->Ks = (void*)CFBridgingRetain(ks);
     L->Vs = (void*)CFBridgingRetain(vs);
-    L->kv = kv; L->ctxcap = ctxcap; L->hd = hd; L->ring = 0;
+    /* `ctxcap` here is the PHYSICAL per-head row stride (kvphys): equal to the
+     * true context cap for full (linear) layers, or a small double-mapped
+     * ring for sliding layers -- see kv_alloc's comment in laguna_common.h.
+     * `ring` is the logical ring modulus (0 for full/linear layers, > 0 for
+     * sliding layers), used below to fold an absolute band origin back into
+     * the physical buffer. */
+    L->kv = kv; L->ctxcap = ctxcap; L->hd = hd; L->ring = ring;
     return 1;
 }
 
 /* One (layer, chunk) attention: per query head, QK^T then softmax then PV, with
- * both GEMMs on MPS. win>0 restricts to a sliding window (unused for now: only
- * full-attention layers take this path). */
+ * both GEMMs on MPS. win>0 restricts to a sliding window. */
 int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                   int S, int pos0, int H, int KV, int hd, float scale, int window) {
     if (!g_al || !g_pipe_sm || layer < 0 || layer >= g_al_n) return 0;
     AttnLayer *L = &g_al[layer];
-    if (!L->K || pos0 + S > L->ctxcap) return 0;
+    if (!L->K) return 0;
     /* BANDED (LAGUNA-FORK): a sliding layer's queries in this chunk span absolute
      * positions [pos0, pos0+S), so the only keys any of them can attend are
      * [pos0-window+1, pos0+S). That band is window+S-1 wide -- CONSTANT in
@@ -281,15 +286,26 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
      * makes the GPU viable for sliding layers at all: the dense version computed
      * the whole matrix and masked it away (measured 32.4 -> 53.1 s at 6k).
      *
-     * The cache is linear per kv head, so the band is a contiguous row range and
-     * costs only an offset -- no gather. */
+     * k0/nkey below are ABSOLUTE positions, used for the causal/window mask in
+     * softmax_causal. For a full (linear) layer the cache is addressed by that
+     * same absolute position, so k0 doubles as the physical offset too. For a
+     * sliding (ring) layer the cache is only `L->ring` rows physically, so the
+     * absolute band origin is folded into the ring with k0_phys = k0 % ring --
+     * safe because the band (window+S-1 columns) is always <= L->ring by
+     * construction (see kv_alloc), so it never wraps mid-read once double-mapped. */
     int k0 = 0, nkey = pos0 + S;
-    if (nkey > L->ctxcap) return 0;
     if (window > 0) {
         k0 = pos0 - window + 1;
         if (k0 < 0) k0 = 0;
         nkey = pos0 + S - k0;
     }
+    int band = nkey - k0;
+    if (L->ring > 0) {
+        if (band > L->ring) return 0;         /* safety net; should not happen */
+    } else if (pos0 + S > L->ctxcap) {
+        return 0;                             /* full layer: linear cap check */
+    }
+    int k0_phys = (L->ring > 0) ? (k0 % L->ring) : k0;
     int group = H / KV, qdim = H * hd;
     id<MTLDevice> d = lg_metal_device();
     id<MTLCommandQueue> cq = lg_metal_queue();
@@ -358,7 +374,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
             size_t kband = (size_t)nkey*hd*4;
             for (int kh = 0; kh < KV; kh++) {
                 int kbase = kh * L->ctxcap;
-                [ed setBytes:&k0    length:4 atIndex:3];
+                [ed setBytes:&k0_phys length:4 atIndex:3];
                 [ed setBytes:&nkey  length:4 atIndex:4];
                 [ed setBytes:&hd    length:4 atIndex:5];
                 [ed setBytes:&kbase length:4 atIndex:6];
