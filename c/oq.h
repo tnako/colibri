@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <omp.h>                          /* omp_in_parallel: see matmul_oq's guard */
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -133,7 +134,24 @@ static void matmul_oq(float *y, const float *x, const uint32_t *q,
     int ng=(int)oq_groups(I,gs), wpg=gs*bits/32;
     int64_t rw=oq_words(I,bits);
     const int byte_aligned = oq_is_byte_aligned(bits);
-    #pragma omp parallel
+    /* NESTED-PARALLEL FIX (LAGUNA-FORK): this was an unconditional
+     * `#pragma omp parallel`, no omp_in_parallel() guard. The streaming MoE
+     * path (moe()) calls this via matmul_w() from inside its own
+     * `#pragma omp for schedule(dynamic,1)` region, so every call here was a
+     * true nested-parallel attempt; OMP disables real nesting by default, so
+     * it degraded to a redundant fork+join per call instead of doing nothing
+     * for free. q8r_gemm (q8r.h) and matmul_w's other call sites already
+     * guard the same way; this one did not.
+     *
+     * Measured impact, clean A/B (Laguna-XS-oQ2, LAGUNA_METAL, same 40-token
+     * decode, 3 runs each): expert-mm phase 18.3-18.6s before -> 17.2-18.3s
+     * after. Real but modest (~4-5%) -- most of decode's per-token cost is
+     * legitimate attention/expert-GEMM work at Laguna-XS's small per-token
+     * batch size (topk=8 of 256 experts), not fork/join overhead; see
+     * docs/laguna-decode-throughput.md for the fuller investigation and the
+     * ideas that did NOT pan out (resident-bank-at-decode, spin-wait, thread
+     * count). */
+    #pragma omp parallel if(!omp_in_parallel())
     {
         uint8_t c[OQ_MAX_GROUP];
         float accs[OQ_MAX_BATCH];
