@@ -1266,7 +1266,20 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 
     /* LAGUNA-FORK: when the expert bank fits, hold all of it in RAM as Q8R and
      * skip the streaming machinery. Default ON for oQ checkpoints; LAGUNA_RESIDENT=0
-     * forces the streaming path (needed for Laguna-S, which does not fit). */
+     * forces the streaming path (needed for Laguna-S, which does not fit).
+     *
+     * ALSO gated on !m->gpu_exp, and deliberately so (tried removing this and
+     * reverted -- see git history): the resident path's OMP loop below is
+     * `for (e = 0; e < E; e++)`, i.e. O(all experts) per layer per call, to
+     * find and skip the ones with zero rows this batch. That is fine for
+     * prefill (hundreds of tokens spread across most of E), but decode only
+     * ever activates topk experts (8 of 256 on Laguna-XS) -- 248 wasted
+     * iterations plus OMP dynamic-schedule dispatch overhead, per layer, per
+     * decode token. The streaming LRU path below only visits the `npair`
+     * tokens that actually routed via a pre-sorted array, so at decode's tiny
+     * batch size it is the FASTER path, not the fallback -- measured 6.1-6.6
+     * tok/s streaming vs 3.3-3.4 tok/s resident on Laguna-XS-oQ2, same prompt,
+     * same machine. Do not remove this gate without re-measuring decode. */
     if (m->experts == EXP_OQ && !m->gpu_exp) {
         {
             /* packed codes at the checkpoint's own bit width + f32 scale/bias/rsum
@@ -1729,7 +1742,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * getting this wrong: a 4-token generation spent ~390 s in the expert phase
      * against a 77 s prefill. Decode stays on the CPU UDOT path, which needs no
      * dispatch at all. LG_GPU_EXP_MIN rows is the crossover from bench_expert. */
-    if (m->gpu_exp && m->gx && S >= 64) {
+    if (m->gpu_exp && m->gx && S >= (getenv("LG_GPU_EXP_MIN") ? atoi(getenv("LG_GPU_EXP_MIN")) : 64)) {
         int64_t *vis = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
         int *cnt = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
         memset(cnt, 0, (size_t)(E + 1) * sizeof(int));
