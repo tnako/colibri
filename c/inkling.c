@@ -1838,7 +1838,22 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    if (bad) {
+        /* STRUCTURED CONTEXT_EXCEEDED (matches colibri.c/deepseek_v4.c/kimi_k3.c):
+         * `ERROR <id> CONTEXT_EXCEEDED <requested> <capacity>` is what
+         * openai_server.py's _engine_error() recognizes and turns into a clean
+         * HTTP 400. This path previously only sent the bare string above, which
+         * fell through the gateway's uncaught-exception branch into a generic
+         * 500 -- silently swallowing exactly the case a coding client's large
+         * system prompt hits at the default CTX_MAX=8192. */
+        const char *cm = getenv("CTX_MAX");
+        int ctx_max = cm ? atoi(cm) : 8192;
+        fprintf(stderr, "[serve] prompt does not fit: %d token, context is %d (CTX_MAX=%d). "
+                        "Raise it, e.g. CTX_MAX=32768 -- coding clients send large system "
+                        "prompts and tool declarations.\n", np, ctx_max, ctx_max);
+        printf("ERROR %s CONTEXT_EXCEEDED %d %d\n", q->id, np, ctx_max);
+        fflush(stdout); free(ids); return;
+    }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {

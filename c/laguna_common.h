@@ -2403,7 +2403,24 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    if (bad) {
+        /* STRUCTURED CONTEXT_EXCEEDED (LAGUNA-FORK): colibri.c, deepseek_v4.c and
+         * kimi_k3.c all emit `ERROR <id> CONTEXT_EXCEEDED <requested> <capacity>`,
+         * which openai_server.py's _engine_error() recognizes and turns into a
+         * clean HTTP 400 with a proper "shorten the conversation or raise CTX"
+         * message. This path only ever emitted the bare string above, which fell
+         * through to a generic uncaught-exception 500 -- exactly what a coding
+         * agent's large system-prompt-plus-tools request hits at the default
+         * CTX_MAX=8192. Emit both: the structured frame for the gateway, and the
+         * same operator-facing stderr hint colibri.c prints. */
+        const char *cm = getenv("CTX_MAX");
+        int ctx_max = cm ? atoi(cm) : 8192;
+        fprintf(stderr, "[serve] prompt does not fit: %d token, context is %d (CTX_MAX=%d). "
+                        "Raise it, e.g. CTX_MAX=32768 -- coding clients send large system "
+                        "prompts and tool declarations.\n", np, ctx_max, ctx_max);
+        printf("ERROR %s CONTEXT_EXCEEDED %d %d\n", q->id, np, ctx_max);
+        fflush(stdout); free(ids); return;
+    }
     kv_alloc(m, np + q->max_tok + 8);
     m->kv_len = 0;
     double t0 = now_s();

@@ -47,7 +47,12 @@ vars:
   # it in priority order. See docs/one-knob-and-chunking.md.
   MEM_GB: '{{.MEM_GB | default "20"}}'
   # Max context. Sizes the GPU attention K/V, so it is a memory decision too.
-  CTX: '{{.CTX | default "8192"}}'
+  # 262144 = 256k, the checkpoint's trained maximum (docs/laguna-s-scaling.md).
+  # At that size GPU K/V for the full-attention layers alone is ~13 GB (ring
+  # bound), so MEM_GB may need raising past its 20 GB default too -- the
+  # engine logs `[mem] gpu attention needs X GB, not affordable -> CPU` and
+  # falls back per-layer rather than failing outright if it does not fit.
+  CTX: '{{.CTX | default "262144"}}'
   # Engine suffix: '_metal' uses GPU flash attention + MPS GEMMs (3.7x on the
   # attention phase, measured). Set METAL=0 to force the pure-CPU engines.
   MSUF: '{{if eq (.METAL | default "1") "0"}}{{else}}_metal{{end}}'
@@ -263,7 +268,7 @@ tasks:
   # ---------------------------------------------------------------- serve
 
   laguna:xs:serve:
-    desc: Serve Laguna-XS on an OpenAI-compatible endpoint (port 8000). Honors Q=.
+    desc: Serve Laguna-XS on an OpenAI-compatible endpoint (port 8000). Honors Q=, CTX=, MEM_GB=.
     cmds:
       - task: build
         vars: {ENGINE: laguna_xs}
@@ -271,7 +276,7 @@ tasks:
         vars: {FAMILY: laguna-xs}
 
   laguna:s:serve:
-    desc: Serve Laguna-S on an OpenAI-compatible endpoint (port 8000). Honors Q=.
+    desc: Serve Laguna-S on an OpenAI-compatible endpoint (port 8000). Honors Q=, CTX=, MEM_GB=.
     cmds:
       - task: build
         vars: {ENGINE: laguna_s}
@@ -285,6 +290,8 @@ tasks:
         vars: {MODEL_REPO: '{{.MODEL_REPO}}', DIR: '{{.DIR}}'}
       - |
         set -e
+        echo "==> serving (mem={{.MEM_GB}}GB ctx={{.CTX}})"
+        LAGUNA_MEM_GB='{{.MEM_GB}}' CTX_MAX='{{.CTX}}' \
         exec '{{.C}}/coli' serve --model '{{.MODELS}}/{{.DIR}}'
 
   serve-resolved:
@@ -312,7 +319,8 @@ tasks:
         # inside another task's cmds is allowed to call it). `run`/`resolve-run`
         # solve the same problem the same way.
         exec task --taskfile '{{.ROOT_DIR}}/Taskfile.yml' serve \
-          ENGINE='{{.ENGINE}}' MODEL_REPO="$R" DIR="$D"
+          ENGINE='{{.ENGINE}}' MODEL_REPO="$R" DIR="$D" \
+          MEM_GB='{{.MEM_GB}}' CTX='{{.CTX}}'
 
   # ---------------------------------------------------------------- oQ tooling
 
