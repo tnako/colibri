@@ -19,7 +19,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, render_chat_kimi, serve,
+                           render_chat, render_chat_kimi, render_chat_laguna, serve,
                            split_thinking_reply, stop_policy, tune_child_env)
 
 
@@ -1172,6 +1172,65 @@ class ToolChoiceTest(unittest.TestCase):
     def test_rejects_tool_choice_without_tools(self):
         with self.assertRaises(APIError):
             generation_options({"messages": [], "tool_choice": "required"}, 128)
+
+
+class LagunaToolUseTest(unittest.TestCase):
+    """LAGUNA-FORK: render_chat_laguna used to hard-reject any request with
+    tools/tool_choice. The checkpoint's own chat_template.jinja defines a
+    tool wire format that byte-matches GLM's BOX_START/BOX_END/TR_OPEN/
+    TR_CLOSE markers, so parse_tool_calls() needs no arch-specific branch --
+    only the request-side renderer needed the missing half."""
+
+    def test_no_tools_is_unchanged(self):
+        prompt = render_chat_laguna([{"role": "user", "content": "hi"}])
+        self.assertNotIn("Tools", prompt)
+        self.assertIn("<user>hi</user>", prompt)
+
+    def test_tools_declared_in_system_block(self):
+        prompt = render_chat_laguna([{"role": "user", "content": "hi"}], tools=ORDER_TOOL)
+        self.assertIn("<system>", prompt)
+        self.assertIn("<available_tools>", prompt)
+        self.assertIn('"lookup_order"', prompt)
+        self.assertIn("</available_tools>", prompt)
+
+    def test_tool_choice_none_drops_the_block(self):
+        prompt = render_chat_laguna([{"role": "user", "content": "hi"}], tools=ORDER_TOOL,
+                                    tool_choice="none")
+        self.assertNotIn("<available_tools>", prompt)
+
+    def test_tool_choice_required_instructs_one_call(self):
+        prompt = render_chat_laguna([{"role": "user", "content": "hi"}], tools=ORDER_TOOL,
+                                    tool_choice="required")
+        self.assertIn("must call one of the functions", prompt)
+
+    def test_named_function_restricts_to_that_function(self):
+        tools = ORDER_TOOL + [{"type": "function", "function": {"name": "other", "parameters": {}}}]
+        prompt = render_chat_laguna([{"role": "user", "content": "hi"}], tools=tools,
+                                    tool_choice={"type": "function", "function": {"name": "lookup_order"}})
+        self.assertIn("must call the function `lookup_order`", prompt)
+        self.assertNotIn('"other"', prompt)
+
+    def test_assistant_tool_call_round_trips(self):
+        messages = [
+            {"role": "user", "content": "look up A-1"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"function": {"name": "lookup_order", "arguments": {"order_id": "A-1"}}}]},
+            {"role": "tool", "content": "{\"status\": \"shipped\"}"},
+        ]
+        prompt = render_chat_laguna(messages, tools=ORDER_TOOL)
+        self.assertIn("<tool_call>lookup_order", prompt)
+        self.assertIn("<arg_key>order_id</arg_key><arg_value>A-1</arg_value>", prompt)
+        self.assertIn("</tool_call>", prompt)
+        self.assertIn("<tool_response>{\"status\": \"shipped\"}</tool_response>", prompt)
+
+    def test_generated_tool_call_parses_with_the_shared_parser(self):
+        # Confirms the OUTPUT side needs no Laguna-specific code: the model's
+        # own wire format already matches parse_tool_calls()'s BOX_RE/ARG_RE.
+        reply = "<tool_call>lookup_order<arg_key>order_id</arg_key><arg_value>A-1</arg_value></tool_call>"
+        text, calls = parse_tool_calls(reply, ORDER_TOOL)
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "lookup_order")
 
 
 class AllowedHostsTest(unittest.TestCase):

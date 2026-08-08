@@ -785,22 +785,42 @@ def render_chat_laguna(messages, enable_thinking=False, reasoning_effort=None, t
     message with empty content deliberately opts out of it), each user turn as
     <user>...</user>, and each assistant turn as <assistant> followed by either
     <think>reasoning</think> or a bare </think> when thinking is off.
+
+    TOOL USE (LAGUNA-FORK): the checkpoint's own chat_template.jinja defines a
+    tool-declaration block (`### Tools` + <available_tools>) and a call/response
+    wire format (<tool_call>name<arg_key>..</arg_key><arg_value>..</arg_value>
+    </tool_call>, <tool_response>..</tool_response>) that happens to byte-match
+    what render_chat() already emits/parses for GLM (BOX_START/BOX_END/TR_OPEN/
+    TR_CLOSE), so the response-side parser needed no changes -- only this
+    renderer had to learn to emit the request-side block. Untrained behavior:
+    the base model was never evaluated against a tool-calling benchmark by this
+    fork, so treat generated calls as unverified until exercised for real.
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for Laguna yet.",
-                       "tools", "unsupported_parameter")
     eos = "\u3008|EOS|\u3009"
     default_system = ("You are a helpful, conversationally-fluent assistant made by "
                       "Poolside. You are here to be helpful to users through natural "
                       "language conversations.")
+    # Same tool_choice contract as render_chat(): a forced {"function":{"name":..}}
+    # narrows the offered set to that one tool; "none" drops the tools block
+    # entirely (the client explicitly forbade calling); "required" is passed
+    # through as a hint appended after the tool list.
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None
     body, system_message = [], default_system
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant"):
+        if role not in ("system", "developer", "user", "assistant", "tool"):
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
@@ -810,16 +830,65 @@ def render_chat_laguna(messages, enable_thinking=False, reasoning_effort=None, t
             continue
         if role == "user":
             body.append(f"<user>{text}</user>\n")
+        elif role == "tool":
+            # <tool_response>..</tool_response>, one per message (no batching
+            # wrapper in the checkpoint's own template, unlike GLM's <|observation|>).
+            body.append(f"{TR_OPEN}{text}{TR_CLOSE}\n")
         else:
             reasoning = message.get("reasoning_content")
             if reasoning is not None and not isinstance(reasoning, str):
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
             think = f"<think>{reasoning or ''}</think>" if enable_thinking else "</think>"
-            body.append(f"<assistant>{think}{text}</assistant>\n")
+            piece = [f"<assistant>{think}{text}"]
+            # AUTHORITATIVE (byte-matches chat_template.jinja's tool_call loop):
+            # <tool_call>{name}<arg_key>k</arg_key><arg_value>v</arg_value>...
+            # </tool_call>, one box per call, values passed through raw if they
+            # are already strings else JSON-encoded -- identical shape to what
+            # render_chat() does for GLM, since BOX_START/BOX_END are shared.
+            for tc in (message.get("tool_calls") or []):
+                fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                piece.append(BOX_START + (fn.get("name") or ""))
+                for key, value in (args or {}).items():
+                    piece.append(f"<arg_key>{key}</arg_key><arg_value>"
+                                 + (value if isinstance(value, str)
+                                    else json.dumps(value, ensure_ascii=False)) + "</arg_value>")
+                piece.append(BOX_END)
+            piece.append("</assistant>\n")
+            body.append("".join(piece))
     parts = [eos]
-    if system_message and system_message.strip():
-        parts.append(f"<system>{system_message.rstrip()}</system>\n")
+    has_sys = bool(system_message and system_message.strip())
+    if has_sys or tools:
+        parts.append("<system>")
+        if has_sys:
+            parts.append(system_message.rstrip())
+            if tools:
+                parts.append("\n\n")
+        if tools:
+            # AUTHORITATIVE tool-declaration block (byte-matches chat_template.jinja):
+            # one raw JSON tool spec per line inside <available_tools></available_tools>.
+            # Laguna's own template has no <tools></tools> XML wrapper like GLM's --
+            # a made-up structure here would train-mismatch the same way an invented
+            # preamble does for GLM (see render_chat's comment).
+            parts.append("### Tools\n\nYou may call functions to assist with the user "
+                         "query.\nAll available function signatures are listed below:\n"
+                         "<available_tools>\n")
+            for tool in tools:
+                fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+                clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+                parts.append(json.dumps(clean, ensure_ascii=False) + "\n")
+            parts.append("</available_tools>")
+            if forced:
+                parts.append(f"\n\nYou must call the function `{forced}`. Do not answer directly.")
+            elif tool_choice == "required":
+                parts.append("\n\nYou must call one of the functions above. Do not answer directly.")
+        parts.append("</system>\n")
     parts.extend(body)
     parts.append("<assistant>")
     parts.append("<think>" if enable_thinking else "</think>")
