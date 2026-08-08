@@ -126,7 +126,7 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
             if (gn < a.N && gk < a.Kd) {
                 uint per = 32u / a.bits;                       /* codes per word */
                 uint widx = gk / per, sh = (gk % per) * a.bits;
-                /* byte-wise: the base is unaligned, so never form a uint*/ushort* */
+                /* byte-wise reads: the base is unaligned, so never form a typed pointer */
                 device const uchar* wp = Wb + ((ulong)gn * a.wwords + widx) * 4;
                 uint word = (uint)wp[0] | ((uint)wp[1] << 8)
                           | ((uint)wp[2] << 16) | ((uint)wp[3] << 24);
