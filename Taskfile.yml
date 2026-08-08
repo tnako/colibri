@@ -278,6 +278,15 @@ tasks:
       - task: serve-resolved
         vars: {FAMILY: laguna-s}
 
+  serve:
+    desc: 'Serve a specific engine/repo on an OpenAI-compatible endpoint: task serve ENGINE=.. MODEL_REPO=.. DIR=..'
+    cmds:
+      - task: fetch
+        vars: {MODEL_REPO: '{{.MODEL_REPO}}', DIR: '{{.DIR}}'}
+      - |
+        set -e
+        exec '{{.C}}/coli' serve --model '{{.MODELS}}/{{.DIR}}'
+
   serve-resolved:
     internal: true
     cmds:
@@ -297,8 +306,13 @@ tasks:
           *) echo "unknown variant {{.FAMILY}} Q={{.Q}} (see: task quants)"; exit 1 ;;
         esac
         D=$(basename "$R")
-        task --taskfile '{{.ROOT_DIR}}/Taskfile.yml' fetch MODEL_REPO="$R" DIR="$D"
-        exec '{{.C}}/coli' serve --model '{{.MODELS}}'/"$D"
+        # Delegate to the public `serve` task rather than shelling straight to
+        # `fetch`: `fetch` is internal, and Task refuses to run an internal
+        # task from a plain CLI invocation (only the `task:` YAML directive
+        # inside another task's cmds is allowed to call it). `run`/`resolve-run`
+        # solve the same problem the same way.
+        exec task --taskfile '{{.ROOT_DIR}}/Taskfile.yml' serve \
+          ENGINE='{{.ENGINE}}' MODEL_REPO="$R" DIR="$D"
 
   # ---------------------------------------------------------------- oQ tooling
 
