@@ -10,6 +10,10 @@ desktop/src-tauri/target/
 desktop/src-tauri/gen/
 
 # binari compilati (si rigenerano con make / coli build)
+# object files never belong in the tree (laguna_attn_metal.o was tracked and is
+# now untracked; the Mac repo convention had been to commit it, so this also
+# requires a plain 'git rm --cached' one-off if it is already tracked)
+*.o
 c/colibri
 c/colibri.exe
 c/glm
