@@ -948,6 +948,9 @@ tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json
 tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_ngram_draft$(EXE): tests/test_ngram_draft.c laguna_common.h oq.h q8r.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
+	$(CC) $(CFLAGS) $(LG_ARCH) $< -o $@ $(LDFLAGS)
+
 tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

@@ -13,6 +13,7 @@ from pathlib import Path
 
 GB = 1_000_000_000
 EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _tensor_sizes(path):
@@ -234,6 +235,29 @@ def discover_gpus():
     if devices:
         return devices
     return _discover_amd_gpus()
+
+
+def detect_metal():
+    """Detect Apple Silicon Metal availability.
+
+    On macOS, the Metal engine (laguna_*_metal binary) is preferred over the
+    plain C build when present -- it uses GPU flash attention and MPS GEMMs
+    (measured 3.7x on the attention phase). This mirrors the engine_for()
+    detection in the `coli` launcher script.
+
+    Returns True if we're on macOS AND a Metal binary is present in the build
+    directory (or COLI_NO_METAL is unset and a Metal binary exists in libexec).
+    """
+    if not sys.platform == "darwin":
+        return False
+    if os.environ.get("COLI_NO_METAL"):
+        return False
+    # LAGUNA-fork only; Metal is not built for GLM/Inkling/Kimi
+    for name in ("laguna_s", "laguna_xs"):
+        mt = os.path.join(HERE, name + "_metal")
+        if os.path.exists(mt):
+            return True
+    return False
 
 
 def _discover_nvidia_gpus():
@@ -619,7 +643,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         bottleneck_class = "memory"
 
     tune = _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets,
-                      plan_has_metal=False)
+                      plan_has_metal=detect_metal())
     probe_state, probe_gbs = ssd_probe_state(info["path"])
 
     return {
@@ -644,6 +668,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "expected_bottleneck": bottleneck,
         "bottleneck_class": bottleneck_class,
         "projected_hit_rate": round(projected_hit, 4),
+        "plan_has_metal": detect_metal(),
         "tune": tune,
         "decisions": [
             {"target": "VRAM", "reason": "profile-ranked hot experts"},
@@ -725,6 +750,8 @@ def format_plan(plan):
         names = ", ".join(f"{gpu['index']}:{gpu['name']}" for gpu in vram["devices"])
         lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
                      f"~{vram['expert_capacity']} experts · {names}")
+    elif plan.get("plan_has_metal"):
+        lines.append("VRAM   no NVIDIA/AMD device · Metal (GPU) path")
     else:
         lines.append("VRAM   no NVIDIA device detected · CPU path")
     if plan.get("ssd_probe_gbs") is not None:

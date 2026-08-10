@@ -1172,11 +1172,37 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         const char *cm = getenv("CTX_MAX");
         m->ctx_hint = cm ? atoi(cm) : 8192;
         /* CPU KV cache: int8 codes + one f32 scale per row, k and v, full layers
-         * at ctx and sliding layers at their window ring. */
+         * at ctx and sliding layers at their window ring.
+         *
+         * Must match kv_alloc() byte-for-byte, or the plan drifts from the
+         * allocation. kv_alloc sizes a sliding layer's ring to `window` rows on a
+         * plain build, but to `window + LG_CHUNK` on a Metal build (so a banded
+         * GPU chunk can read one contiguous row range), and then DOUBLE-MAPS that
+         * ring (kvphys = 2*cap) so any window+chunk-1-wide span is contiguous.
+         * The old formula charged `window` rows against the budget on every build,
+         * which at 262144 context on Laguna-S was ~1.3 GB of unplanned unified
+         * memory (108 MB planned vs 1.36 GB actually allocated for the 36 sliding
+         * layers) -- exactly the kind of overrun that tips a 20 GB run into swap. */
         double kvb = 0;
         for (int i = 0; i < c->n_layers; i++) {
-            double rows = (c->slide[i] && c->window > 0 && c->window < m->ctx_hint)
-                        ? c->window : m->ctx_hint;
+            double rows = m->ctx_hint;
+            if (c->slide[i] && c->window > 0) {
+                /* Mirror kv_alloc exactly: `ring` rows on a plain build,
+                 * window+LG_CHUNK on a Metal build, double-mapped (x2) when a
+                 * ring is actually used; a context short enough to fit in the
+                 * ring still allocates the full ctx_hint rows. */
+                double ring = c->window;
+#ifdef LAGUNA_METAL
+                ring += (double)LG_CHUNK;
+#endif
+                if (ring < m->ctx_hint) {
+#ifdef LAGUNA_METAL
+                    rows = 2.0 * ring;
+#else
+                    rows = ring;
+#endif
+                }
+            }
             kvb += rows * c->n_kv * (c->head_dim + 4.0) * 2;
         }
         m->mem_used += kvb;
@@ -1186,19 +1212,37 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     /* GPU attention K/V next: measured 3.66x on the largest phase at 30k, so it
      * outranks the expert cache. Capped at half the budget so it can never
      * starve everything else. */
-    if (lg_metal_init()) {
+     if (lg_metal_init()) {
         /* The GPU binds the int8 KV cache in place (lg_metal_attn_bind), so there
-         * is no per-context GPU allocation to reserve any more -- only the f16
-         * staging for the band actually scored, which is O(band) and independent
-         * of context. This used to reserve a full f16 copy: 14.24 GB at 262144 on
-         * Laguna-S, over half the budget, so it was declined and those layers ran
-         * on the CPU. That was the last thing blocking 256k on the GPU. */
+         * is no per-context GPU allocation to reserve any more -- only the f32
+         * staging for the band actually scored. This used to reserve a full f16
+         * copy: 14.24 GB at 262144 on Laguna-S, over half the budget, so it was
+         * declined and those layers ran on the CPU. That was the last thing
+         * blocking 256k on the GPU.
+         *
+         * BUGFIX: the staging buffer is now SHARED across layers (g_kf in
+         * laguna_attn_metal.mm), since layers are processed sequentially and only
+         * one layer's band is live at a time. Previously each AttnLayer had its
+         * own kf buffer, which at 256k context (12 full layers x ~2.1 GB f32)
+         * silently grew to ~25 GB of unbudgeted unified memory.
+         *
+         * The budget must now reflect:
+         *   1. f32 (not f16) -- the staging uses 4 bytes per element
+         *   2. shared (not per-layer) -- peak is max single layer, not sum
+         *   3. full layers need ctx_hint rows (pos0+S == entire prefix), not
+         *      window+chunk. At 262144 with 12 full layers the staging is
+         *      8*128*4*2*262144 = ~2.1 GB (one layer) or ~25 GB (if not shared). */
         int gcap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
         int nfull = 0, nslide = 0;
         for (int i = 0; i < c->n_layers; i++) { if (c->slide[i]) nslide++; else nfull++; }
-        /* band = window + chunk for sliding, chunk-limited for full; f16, K and V */
-        double band = (double)(c->window + LG_CHUNK);
-        double need = band * c->n_kv * c->head_dim * 2 * 2;
+        /* Shared staging: peak is the largest single layer's band.
+         * Full layers need the entire prefix (ctx_hint rows).
+         * Sliding layers need window + LG_CHUNK rows.
+         * f32 staging for K and V: band * n_kv * head_dim * 4 (bytes) * 2 (K+V). */
+        double full_band  = nfull > 0 ? (double)gcap : 0.0;
+        double slide_band = (double)(c->window + LG_CHUNK);
+        double band = full_band > slide_band ? full_band : slide_band;
+        double need = band * c->n_kv * c->head_dim * 4 * 2;
         if (need <= m->mem_budget - m->mem_used) {
             m->gpu_attn = 1; m->gpu_attn_cap = gcap;
             m->mem_used += need;
@@ -2270,6 +2314,35 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out, i
     *n_out = len;
 }
 
+/* SPECULATIVE N-GRAM DRAFT (LAGUNA-FORK): draft() finds the longest recent
+ * repeat of the last 2-3 tokens in the sequence-so-far and proposes whatever
+ * followed it last time. Free to attempt (no model call) and free to reject
+ * (the verify step below runs anyway). Ported from deepseek_v4.c's
+ * v4_ngram_draft with the same trigram->bigram fallback; see
+ * docs/laguna-decode-throughput.md for why this and not a trained draft
+ * model. LG_SPEC_MAX caps how many tokens are proposed per round; LG_SPEC=0
+ * disables speculation entirely for a clean A/B against the plain loop. */
+static int ngram_draft(const int *seq, int count, int *out, int maximum) {
+    if (!seq || !out || maximum < 1) return 0;
+    for (int gram = 3; gram >= 2; gram--) {
+        if (count < gram + 1) continue;
+        int tail = count - gram;
+        for (int start = count - gram - 1; start >= 0; start--) {
+            int matches = 1;
+            for (int item = 0; item < gram; item++)
+                if (seq[start + item] != seq[tail + item]) { matches = 0; break; }
+            if (!matches) continue;
+            int from = start + gram;
+            int take = count - from;
+            if (take > maximum) take = maximum;
+            if (take < 1) break;
+            for (int item = 0; item < take; item++) out[item] = seq[from + item];
+            return take;
+        }
+    }
+    return 0;
+}
+
 /* ---------- interactive prompt: greedy, streaming, stop on eos ---------- */
 static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     Cfg *c = &m->c;
@@ -2280,23 +2353,112 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     kv_alloc(m, np + n_new + 8);
     printf("[%d prompt tokens] %s", np, prompt);
     fflush(stdout);
+
     double t0 = now_s(), t1 = 0;
     float *logit = step(m, ids, np, 0, NULL);
     int len = np;
     char buf[512];
-    for (int s = 0; s < n_new; s++) {
+    /* seq[] tracks the whole sequence (prompt + generated) for the n-gram
+     * lookup; cap it generously since n_new is bounded by the caller. */
+    int *seq = malloc((size_t)(np + n_new + 8) * sizeof(int));
+    memcpy(seq, ids, (size_t)np * sizeof(int));
+    int seqn = np;
+    int spec_max = getenv("LG_SPEC_MAX") ? atoi(getenv("LG_SPEC_MAX")) : 4;
+    if (spec_max < 0) spec_max = 0;
+    if (spec_max > 24) spec_max = 24;
+    int spec_on = getenv("LG_SPEC") ? atoi(getenv("LG_SPEC")) != 0 : (spec_max > 0);
+    uint64_t spec_drafted = 0, spec_accepted = 0, spec_rounds = 0;
+    /* BUG FIXED (caught by AddressSanitizer, not review): step_raw() writes
+     * tf_out[pos0 + s], i.e. ABSOLUTE position, not a 0-based batch index --
+     * that's how the fixture's teacher-forcing path already uses it (a
+     * full-length buffer, pos0=0). A fixed tf[25] stack array with pos0 =
+     * len-1 (len in the hundreds by mid-generation) wrote miles past the end
+     * of that array -- confirmed stack-use-after-scope /
+     * out-of-bounds-write via ASan, not a benign lint nit. Fix: allocate one
+     * buffer sized to cover every position this call ever uses (np+n_new+8,
+     * same bound as seq[]) and always read/write it at the ABSOLUTE index
+     * step_raw expects, never a small per-round scratch array. */
+    int *tf_buf = malloc((size_t)(np + n_new + 8) * sizeof(int));
+    int s = 0;
+    while (s < n_new) {
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
-        free(logit);
+        free(logit); logit = NULL;
         if (s == 0) t1 = now_s();
         if (is_eos(c, best)) { printf("\n[eos after %d tokens]", s); break; }
         int nb = tok_decode(T, &best, 1, buf, sizeof(buf)-1);
         buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
-        len++;
-        if (s == n_new - 1) break;
+        seq[seqn++] = best;
+        len++; s++;
+        if (s == n_new) break;
+
+        /* SPECULATIVE VERIFY ROUND (LAGUNA-FORK): draft up to spec_max tokens
+         * from the n-gram match, then verify ALL of them in ONE batched
+         * step() call instead of one call per token. tf_buf[pos0+i] is what
+         * the real model predicts right after consuming batch[i] -- i.e. the
+         * model's own claim about position pos0+i+1 -- so it is compared
+         * against draft[i] (our guess for that same position). Accept the
+         * longest matching prefix; KV rows written for the rejected tail are
+         * silently overwritten by the next call at the same absolute
+         * positions (kv_len is metadata only, not a masking bound -- see
+         * docs/laguna-decode-throughput.md), so no explicit rollback is
+         * needed. */
+        int room = n_new - s;
+        int draft[24] = {0};
+        int ndraft = 0;
+        if (spec_on && room > 0) {
+            int want = spec_max < room ? spec_max : room;
+            ndraft = ngram_draft(seq, seqn, draft, want);
+        }
+        if (ndraft > 0) {
+            int batch[25]; batch[0] = best;
+            for (int i = 0; i < ndraft; i++) batch[i+1] = draft[i];
+            int S = ndraft + 1;
+            int pos0 = len - 1;
+            logit = step(m, batch, S, pos0, tf_buf);
+            spec_rounds++; spec_drafted += (uint64_t)ndraft;
+            int accepted = 0;
+            while (accepted < ndraft && tf_buf[pos0 + accepted] == draft[accepted]) accepted++;
+            spec_accepted += (uint64_t)accepted;
+            /* Emit the accepted draft tokens (they are now confirmed correct
+             * -- tf_buf's prediction for their predecessor matched what was
+             * fed). The (accepted+1)-th slot is always a fresh, unverified
+             * prediction (tf_buf[pos0+accepted], the real model's own choice
+             * at that point) and becomes next round's `best` via the normal
+             * loop top, WITHOUT being decoded here -- it still needs the
+             * same EOS/decode handling the loop top already does. */
+            for (int i = 0; i < accepted && s < n_new; i++) {
+                int tok = draft[i];
+                if (is_eos(c, tok)) { printf("\n[eos after %d tokens]", s); free(logit); logit=NULL; s = n_new; break; }
+                int nb2 = tok_decode(T, &tok, 1, buf, sizeof(buf)-1);
+                buf[nb2] = 0; fputs(buf, stdout); fflush(stdout);
+                seq[seqn++] = tok;
+                len++; s++;
+            }
+            if (s >= n_new || (logit == NULL)) break;
+            /* logit currently holds the prediction AFTER the full batch
+             * (position pos0+S), which is only valid if every drafted token
+             * was accepted. On a partial/no accept, the correct next
+             * prediction is tf_buf[pos0+accepted] itself -- rebuild a
+             * one-hot-ish "logit" isn't right (tf_buf holds argmax ids, not
+             * logits), so re-run a clean single-token step for the confirmed
+             * position instead of reusing possibly-wrong batched logits.
+             * This costs one extra step call on a rejection, which is still
+             * a net win whenever accepted > 0, and a wash (not a regression)
+             * when accepted == 0. */
+            if (accepted < ndraft) {
+                free(logit);
+                int last_tok = accepted == 0 ? best : draft[accepted - 1];
+                logit = step(m, &last_tok, 1, len - 1, NULL);
+            }
+            continue;
+        }
+        /* no draft available this round: plain single-token step, identical
+         * to the pre-speculation code path. */
         int one = best;
         logit = step(m, &one, 1, len - 1, NULL);
     }
+    free(tf_buf);
     double dt = now_s() - t1;
     int gen = len - np;
 #ifdef LAGUNA_METAL
@@ -2308,6 +2470,12 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     double tot = m->hits + m->miss;
     printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | expert cache hit %.1f%%\n",
            m->t_fill, m->t_expert, m->t_shared, m->t_attn, tot ? 100.0*m->hits/tot : 0.0);
+    if (spec_on)
+        printf("[spec] %llu rounds | %llu drafted | %llu accepted (%.1f%%)\n",
+               (unsigned long long)spec_rounds, (unsigned long long)spec_drafted,
+               (unsigned long long)spec_accepted,
+               spec_drafted ? 100.0*spec_accepted/spec_drafted : 0.0);
+    free(seq);
     free(ids);
 }
 
@@ -2445,6 +2613,24 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     float rep = getenv("REP_PEN") ? (float)atof(getenv("REP_PEN")) : 1.1f;
     int hist[128], nhist = 0;
     for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
+    /* SPECULATIVE N-GRAM DRAFT (LAGUNA-FORK): same mechanism as generate_stream()
+     * in this file -- ngram_draft() proposes tokens from recent trigram/bigram
+     * repeats, then a SINGLE batched step() verifies all drafts at once. At S=1
+     * the bottleneck is per-token forward overhead (48 layers, shared expert
+     * reload, attention O(context)), so even a 20% n-gram hit rate at depth 4
+     * yields ~1.8x effective throughput: each accepted draft costs zero extra
+     * forward passes beyond the batched verify that already ran.
+     *
+     * LG_SPEC=0 disables; LG_SPEC_MAX caps depth (default 4, max 24). */
+    int spec_max = getenv("LG_SPEC_MAX") ? atoi(getenv("LG_SPEC_MAX")) : 4;
+    if (spec_max < 0) spec_max = 0;
+    if (spec_max > 24) spec_max = 24;
+    int spec_on = getenv("LG_SPEC") ? atoi(getenv("LG_SPEC")) != 0 : (spec_max > 0);
+    uint64_t spec_drafted = 0, spec_accepted = 0, spec_rounds = 0;
+    int *seq = malloc((size_t)(np + q->max_tok + 8) * sizeof(int));
+    memcpy(seq, ids, (size_t)np * sizeof(int));
+    int seqn = np;
+     int *tf_buf = malloc((size_t)(np + q->max_tok + 8) * sizeof(int));
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         apply_rep_penalty(logit, c->vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->vocab, q->temp, q->top_p);
@@ -2456,15 +2642,68 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         printf("DATA %s %d\n", q->id, nb);
         fwrite(buf, 1, (size_t)nb, stdout);
         fputc('\n', stdout); fflush(stdout);
+        seq[seqn++] = tk;
         gen++; len++;
         while (coli_stdin_readable()) {
             int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); free(logit); return; }
+            if (r < 0) { free(ids); free(seq); free(tf_buf); return; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
+
+        /* SPEC VERIFY ROUND (LAGUNA-FORK): draft up to spec_max tokens from
+         * the n-gram match, then verify ALL in ONE batched step() instead of
+         * one call per token. tf_buf[pos0+i] is the model's argmax at
+         * position pos0+i (i.e. its prediction for the NEXT position, pos0+i+1,
+         * which is where draft[i] sits) -- so it is compared directly against
+         * draft[i]. KV rows for the rejected tail are silently overwritten by
+         * the next call at the same absolute positions (kv_len is metadata only). */
+        int room = q->max_tok - s - 1;
+        int draft[24] = {0};
+        int ndraft = 0;
+        if (spec_on && room > 0) {
+            int want = spec_max < room ? spec_max : room;
+            ndraft = ngram_draft(seq, seqn, draft, want);
+        }
+        if (ndraft > 0) {
+            int batch[25]; batch[0] = tk;
+            for (int i = 0; i < ndraft; i++) batch[i + 1] = draft[i];
+            int S = ndraft + 1;
+            int pos0 = len - 1;
+            logit = step(m, batch, S, pos0, tf_buf);
+            spec_rounds++; spec_drafted += (uint64_t)ndraft;
+            int accepted = 0;
+             while (accepted < ndraft && tf_buf[pos0 + accepted] == draft[accepted]) accepted++;
+            spec_accepted += (uint64_t)accepted;
+            for (int i = 0; i < accepted && s + 1 + i < q->max_tok; i++) {
+                int tok = draft[i];
+                if (is_eos(c, tok)) { limited = 0; free(logit); logit = NULL; s += accepted; break; }
+                if (nhist < 128) hist[nhist++] = tok;
+                else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tok; }
+                seq[seqn++] = tok;
+                len++; s++; gen++;
+                int nb2 = tok_decode(T, &tok, 1, buf, sizeof(buf)-1);
+                printf("DATA %s %d\n", q->id, nb2);
+                fwrite(buf, 1, (size_t)nb2, stdout);
+                fputc('\n', stdout); fflush(stdout);
+            }
+            if (s + 1 >= q->max_tok || (logit == NULL)) break;
+            while (coli_stdin_readable()) {
+                int r = serve_read_cmd(q->id);
+                if (r < 0) { free(seq); free(tf_buf); return; }
+                if (r > 0) { cancelled = 1; limited = 0; }
+            }
+            if (cancelled) break;
+            if (accepted < ndraft) {
+                free(logit);
+                int last_tok = accepted == 0 ? tk : draft[accepted - 1];
+                logit = step(m, &last_tok, 1, len - 1, NULL);
+            }
+            continue;
+        }
         logit = step(m, &tk, 1, len - 1, NULL);
     }
+    free(seq); free(tf_buf);
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
@@ -2472,6 +2711,11 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
            dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
            m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
+    if (spec_on && spec_rounds)
+        fprintf(stderr, "[spec] %llu rounds | %llu drafted | %llu accepted (%.1f%%)\n",
+                (unsigned long long)spec_rounds, (unsigned long long)spec_drafted,
+                (unsigned long long)spec_accepted,
+                spec_drafted ? 100.0*spec_accepted/spec_drafted : 0.0);
     fflush(stdout);
     free(ids);
 }

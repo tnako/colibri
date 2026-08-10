@@ -134,8 +134,6 @@ kernel void scatter_o(device const float* OT [[buffer(0)]],
 typedef struct {
     void *K, *V;          /* int8 codes  [KV][ctxcap][hd], bound zero-copy */
     void *Ks, *Vs;        /* f32 scales  [KV][ctxcap],     bound zero-copy */
-    void *kf, *vf;        /* f16 staging for the band actually scored      */
-    size_t kflen;
     int kv, ctxcap, hd;
     int ring;             /* kept for the sliding path; 0 = linear         */
 } AttnLayer;
@@ -157,6 +155,8 @@ typedef struct {
 static void *g_pipe_sm = NULL, *g_pipe_gq = NULL, *g_pipe_so = NULL, *g_pipe_dq = NULL;
 static void *g_qt = NULL, *g_sc = NULL, *g_ot = NULL;
 static size_t g_qtcap = 0, g_sccap = 0, g_otcap = 0;
+static void *g_kf = NULL;  /* f32 K+V staging for the band actually scored */
+static size_t g_kfcap = 0;
 
 static id<MTLComputePipelineState> mk_pipe(id<MTLLibrary> lib, const char *name) {
     NSError *e = nil;
@@ -321,18 +321,13 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         if (!ensure(&qsrc, &qsc, (size_t)S*qdim*4)) return 0;
         if (!ensure(&odst, &odc, (size_t)S*qdim*4)) return 0;
         if (!ensure(&gsrc, &gsc, (size_t)S*H*4))    return 0;
-        /* f16 staging for the band of K and V actually scored this chunk. This is
-         * the ONLY GPU-side KV memory now: O(band), not O(context). */
-        /* All KV heads staged ONCE per chunk. Doing it inside the query-head loop
-          * dequantized each kv head `group` times over (6x on Laguna-S) and cost
-          * attention 22.2 -> 43.4 s at 262144 context. */
-        /* f32 staging, deliberately. Dequantizing int8 -> f16 stacked a second
-         * rounding on top of the cache's own 8-bit quantization and cost
-         * token-exactness: Laguna-S went 208/208 -> 207/208, isolated to this
-         * path (experts and the CPU build were both exact). The old code kept a
-         * separate f16 K/V copy, so it only ever rounded once. f32 here restores
-         * the single-rounding budget; MPS runs the GEMMs in f32 to match. */
-        if (!ensure(&L->kf, &L->kflen, (size_t)KV*nkey*hd*4*2)) return 0;
+        /* f32 staging for the band of K and V actually scored this chunk. This is
+         * the ONLY GPU-side KV memory now: O(band), not O(context).
+         * Shared across layers -- layers are processed sequentially, so only one
+         * layer's staging is live at a time. Previously each AttnLayer held its
+         * own kf buffer, which at 256k on Laguna-S (12 full layers x ~2.1 GB
+         * each) silently grew to 25 GB of unbudgeted unified memory. */
+        if (!ensure(&g_kf, &g_kfcap, (size_t)KV*nkey*hd*4*2)) return 0;
         memcpy([(__bridge id<MTLBuffer>)qsrc contents], q,  (size_t)S*qdim*4);
         memcpy([(__bridge id<MTLBuffer>)gsrc contents], gt, (size_t)S*H*4);
 
@@ -380,12 +375,12 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                 [ed setBytes:&kbase length:4 atIndex:6];
                 [ed setBuffer:(__bridge id<MTLBuffer>)L->K  offset:0 atIndex:0];
                 [ed setBuffer:(__bridge id<MTLBuffer>)L->Ks offset:0 atIndex:1];
-                [ed setBuffer:(__bridge id<MTLBuffer>)L->kf offset:(size_t)kh*kband atIndex:2];
+                [ed setBuffer:(__bridge id<MTLBuffer>)g_kf offset:(size_t)kh*kband atIndex:2];
                 [ed dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)nkey, 1)
               threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
                 [ed setBuffer:(__bridge id<MTLBuffer>)L->V  offset:0 atIndex:0];
                 [ed setBuffer:(__bridge id<MTLBuffer>)L->Vs offset:0 atIndex:1];
-                [ed setBuffer:(__bridge id<MTLBuffer>)L->kf
+                [ed setBuffer:(__bridge id<MTLBuffer>)g_kf
                        offset:(size_t)KV*kband + (size_t)kh*kband atIndex:2];
                 [ed dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)nkey, 1)
               threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
@@ -394,7 +389,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
         }
         for (int hq = 0; hq < H; hq++) {
             int kh = hq / group, off = hq * hd;
-            id<MTLBuffer> KF = (__bridge id<MTLBuffer>)L->kf;
+            id<MTLBuffer> KF = (__bridge id<MTLBuffer>)g_kf;
             size_t kband = (size_t)nkey*hd*4;
             size_t koff  = (size_t)kh * kband;              /* this head's K tile */
             size_t voff  = (size_t)KV * kband + koff;       /* V tiles follow K   */

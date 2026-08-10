@@ -8,11 +8,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import resource_plan
 from resource_plan import (
     GB,
     analyze_model,
     build_plan,
     cpu_socket_count,
+    detect_metal,
     environment_for_plan,
     format_plan,
     memory_available,
@@ -440,6 +442,61 @@ class ResourcePlanTest(unittest.TestCase):
                          ["VRAM", "RAM", "Disk"])
         self.assertIn("quality-preserving yes", format_plan(plan))
         self.assertIn("expected_bottleneck", plan)
+
+
+class DetectMetalTest(unittest.TestCase):
+    """Tests for Metal (Apple Silicon GPU) detection in resource_plan.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.model = Path(self.tmp.name)
+        (self.model / "config.json").write_text(json.dumps({
+            "num_hidden_layers": 2, "n_routed_experts": 2,
+            "kv_lora_rank": 4, "qk_rope_head_dim": 2,
+            "qk_nope_head_dim": 3, "v_head_dim": 5, "num_attention_heads": 2,
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("model.embed_tokens.weight", 100),
+            ("model.layers.0.self_attn.q_a_proj.weight", 200),
+            ("model.layers.1.mlp.experts.0.gate_proj.weight", 30),
+            ("model.layers.1.mlp.experts.1.gate_proj.weight", 30),
+        ])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_metal_not_detected_on_linux(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertFalse(detect_metal())
+
+    def test_metal_not_detected_when_no_binary(self):
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(os.path, "exists", return_value=False):
+            self.assertFalse(detect_metal())
+
+    def test_metal_detected_on_macos_with_binary(self):
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(os.path, "exists", return_value=True):
+            self.assertTrue(detect_metal())
+
+    def test_metal_not_detected_when_no_metal_env_set(self):
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.dict(os.environ, {"COLI_NO_METAL": "1"}, clear=False), \
+             mock.patch.object(os.path, "exists", return_value=True):
+            self.assertFalse(detect_metal())
+
+    def test_metal_enables_omp_no_tune(self):
+        """COLI_NO_OMP_TUNE must be in tune when Metal is detected."""
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(resource_plan, "detect_metal", return_value=True):
+            plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                              gpus=[], physical_cpus=8, cpu_sockets=1)
+            self.assertIn("COLI_NO_OMP_TUNE", plan["tune"])
+            env = environment_for_plan(plan)
+            self.assertEqual(env["COLI_NO_OMP_TUNE"], "1")
 
 
 class PhysicalCpuCountTest(unittest.TestCase):

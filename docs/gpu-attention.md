@@ -60,8 +60,11 @@ GEMM rather than to write a better loop.
 
 480 GFLOP/s is still only 3% of the MPS ceiling, because at chunk=256 the GEMMs are
 small and there are three dispatches per head per chunk (48 heads x 3 = 144 command
-encoders per layer per chunk). Batching all heads into one MPS batched GEMM is the
-obvious next step and was not done.
+encoders per layer per chunk). Batching all heads into one MPS batched GEMM was
+**tried and measured slower** (37.6 s and 38.2 s batched vs 32.4 s per-head at 6k,
+77% GPU occupancy already — see gpu-profiling-and-cleanup.md), and was reverted
+rather than kept behind a flag. The encoder count is not the bottleneck; a bigger
+chunk (LG_CHUNK=8192) amortizes the same dispatches over far larger GEMMs.
 
 ## Correctness
 
@@ -87,10 +90,9 @@ RSS is flat across a 15x context range. Note it now sits near 20 GB rather than 
 
 ## Still open
 
-- **Batch the per-head GEMMs.** 144 command encoders per layer per chunk is the
-  main reason this reaches 3% rather than 30% of the MPS ceiling.
-- **Expert path is now co-dominant** (228.3 s vs attention's 229.7 s). The batched
+- **Sliding layers at 30k+**: the banded kernel keeps them O(S·window), but the
+  fixed per-chunk cost still outweighs the narrow band until context is long
+  (~4x the window, measured in laguna_common.h's attention comment). Before that
+  crossover they run on the CPU where they are already cheap.
+- **Expert path is co-dominant** (228.3 s vs attention's 229.7 s at 30k). The batched
   GPU expert dispatch exists but only 1-4 layers fit in the budget at f16.
-- **256k**: memory fits (7.94 GiB dirty for Laguna-S), and the time projection
-  improves from ~18 h to roughly 5 h with this change. Still not practical, and
-  still bounded by O(S²) on the full-attention layers.
