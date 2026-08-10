@@ -544,6 +544,43 @@ POLICIES = {
 }
 
 
+# LG_CHUNK (laguna_common.h:227-228). The engine's Metal KV-staging budget and
+# the CPU ring both key off it; the planner must track it. Keep in sync by hand.
+LG_CHUNK = 8192
+
+
+def laguna_kv_bytes(cfg, context, metal=False):
+    """LAGUNA-FORK: per-layer int8 KV cache bytes, mirroring the single-source
+    budget loop in laguna_common.h:1186-1207 byte-for-byte.
+
+    One row is head_dim int8 codes + one f32 scale, for K and for V:
+    `rows * n_kv * (head_dim + 4) * 2`. `rows` is the PHYSICAL row count:
+      - full-attention layers: the whole context (ctx_hint).
+      - sliding layers: a `window`-row ring on a plain build; on the Metal build
+        the ring is widened to `window + LG_CHUNK` (so one contiguous banded GPU
+        read fits) and DOUBLE-MAPPED (each slot written at r and r+ring, so any
+        window+chunk-1 span is contiguous) => 2*(window+LG_CHUNK) rows. A
+        context short enough to fit in the ring still allocates the full
+        ctx_hint rows (kv_alloc semantics).
+    Pass metal=True when the Metal engine is the deployment target.
+    """
+    layers = int(cfg.get("num_hidden_layers") or 0)
+    n_kv = int(cfg.get("num_key_value_heads") or cfg.get("num_attention_heads") or 0)
+    hd = int(cfg.get("head_dim") or 0)
+    window = int(cfg.get("sliding_window") or 0)
+    types = cfg.get("layer_types") or []
+    total = 0.0
+    for i in range(layers):
+        is_slide = i < len(types) and types[i] and "sliding" in types[i]
+        rows = context
+        if is_slide and window > 0:
+            ring = window + (LG_CHUNK if metal else 0)
+            if ring < context:
+                rows = 2.0 * ring if metal else float(ring)
+        total += rows * n_kv * (hd + 4.0) * 2
+    return total
+
+
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
                policy="quality", physical_cpus=None, cpu_sockets=None):
@@ -570,8 +607,16 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         ram_budget = 8 * GB
     typical = info["typical_expert_bytes"]
     layers = int(cfg.get("num_hidden_layers") or 0) + 1
-    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
-                                   int(cfg.get("qk_rope_head_dim") or 0)) * 4
+    if cfg.get("layer_types"):
+        # Laguna (LAGUNA-FORK): the generic kv_lora_rank/qk_rope_head_dim MLA
+        # formula holds no bytes for these keys, so the planner silently
+        # printed 0 B of KV for the one family whose KV is 6 GB CPU + 13 GB
+        # GPU ring at 256k. Use the per-layer formula that mirrors the engine's
+        # single-source budget (laguna_common.h:1186-1207).
+        kv_bytes = laguna_kv_bytes(cfg, context, metal=detect_metal())
+    else:
+        kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
+                                       int(cfg.get("qk_rope_head_dim") or 0)) * 4
     kv_buffer = context * int(cfg.get("num_attention_heads") or 0) * (
         int(cfg.get("qk_nope_head_dim") or 0) + int(cfg.get("v_head_dim") or 0)) * 4
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * typical + kv_bytes + kv_buffer)

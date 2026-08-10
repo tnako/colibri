@@ -444,6 +444,86 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertIn("expected_bottleneck", plan)
 
 
+def write_laguna_model(tmp, layer_types, n_kv=8, hd=128, heads=48, window=512):
+    """Write a minimal Laguna-shaped model dir (config with layer_types + a
+    shard carrying an expert tensor for per_cap_bytes)."""
+    model = Path(tmp)
+    (model / "config.json").write_text(json.dumps({
+        "num_hidden_layers": len(layer_types),
+        "num_key_value_heads": n_kv,
+        "num_attention_heads": heads,
+        "head_dim": hd,
+        "sliding_window": window,
+        "layer_types": layer_types,
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+    }))
+    write_shard(model / "model.safetensors", [
+        ("model.embed_tokens.weight", 100),
+        ("model.layers.0.self_attn.q_proj.weight", 200),
+        ("model.layers.1.mlp.experts.0.gate_proj.weight", 30),
+        ("model.layers.1.mlp.experts.1.gate_proj.weight", 30),
+        ("model.layers.2.mlp.experts.0.gate_proj.weight", 30),
+        ("model.layers.2.mlp.experts.1.gate_proj.weight", 30),
+        ("model.layers.3.mlp.experts.0.gate_proj.weight", 30),
+        ("model.layers.3.mlp.experts.1.gate_proj.weight", 30),
+    ])
+    return model
+
+
+class LagunaKvBytesTest(unittest.TestCase):
+    """LAGUNA-FORK: the planner must model Laguna KV or it silently prints 0 B
+    of cache. These pin the exact formula from laguna_common.h:1186-1207."""
+
+    def test_laguna_kv_bytes_hand_computed(self):
+        # 4 layers, 2 full + 2 sliding, window 512, n_kv 8, hd 128 at 256k.
+        # Full: rows = context = 262144.
+        #   per layer: 262144 * 8 * (128+4) * 2 = 1,107,296,256 (K+V)
+        # Sliding (Metal): ring = 512 + LG_CHUNK(8192) = 8704 < context,
+        #   double-mapped => rows = 2*8704 = 17408.
+        #   per layer: 17408 * 8 * 132 * 2 = 73,531,392
+        cfg = {"num_hidden_layers": 4, "num_key_value_heads": 8,
+               "num_attention_heads": 48, "head_dim": 128,
+               "sliding_window": 512,
+               "layer_types": ["full_attention", "sliding_attention",
+                               "sliding_attention", "full_attention"]}
+        expected = 2 * 262144 * 8 * 132 * 2 + 2 * 17408 * 8 * 132 * 2
+        self.assertEqual(resource_plan.laguna_kv_bytes(cfg, 262144, metal=True),
+                         expected)
+        # Plain build: sliding ring is window rows (not double-mapped).
+        plain = 2 * 262144 * 8 * 132 * 2 + 2 * 512 * 8 * 132 * 2
+        self.assertEqual(resource_plan.laguna_kv_bytes(cfg, 262144, metal=False),
+                         plain)
+        # A context that fits inside the ring still allocates the full rows.
+        self.assertEqual(resource_plan.laguna_kv_bytes(cfg, 512, metal=True),
+                         4 * 512 * 8 * 132 * 2)
+
+    def test_plan_reports_nonzero_kv_for_laguna(self):
+        model = write_laguna_model(
+            self._tmp(), ["full_attention", "sliding_attention",
+                          "sliding_attention", "full_attention"])
+        with mock.patch.object(resource_plan, "detect_metal", return_value=True):
+            plan = build_plan(model, context=262144, available_memory=16 * GB,
+                              available_disk=1, gpus=[], physical_cpus=8,
+                              cpu_sockets=1)
+        cfg = json.loads((model / "config.json").read_text())
+        kv = resource_plan.laguna_kv_bytes(cfg, 262144, metal=True)
+        # kv_bytes feeds runtime_bytes; assert it made it into the plan non-zero.
+        self.assertEqual(plan["tiers"]["ram"]["runtime_bytes"]
+                         - int(1.2 * GB + 2.5 * GB
+                               + 64 * plan["model"]["typical_expert_bytes"]),
+                         kv)
+        self.assertGreater(kv, 0)
+        # And it must not exceed the RAM budget -- the whole point of modeling it.
+        self.assertLessEqual(plan["tiers"]["ram"]["runtime_bytes"],
+                             plan["tiers"]["ram"]["budget_bytes"])
+
+    def _tmp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        return self._tmpdir.name
+
+
 class DetectMetalTest(unittest.TestCase):
     """Tests for Metal (Apple Silicon GPU) detection in resource_plan.py."""
 
