@@ -175,6 +175,12 @@ typedef struct {
      * is allowed to engage (LG_SEL_MIN, default 16384) so short fixture runs
      * stay on the full-attention path. */
     int sel, sel_cap, sel_min;
+    /* PHASE 3 selection pass results, per full-attention layer per KV head
+     * (heads capped at 32): sorted absolute positions of the selected KV rows
+     * and their count. Only the FIRST full-attention layer's index is filled
+     * by sel_pass(); every full layer shares it (layer-wise index reuse). */
+    int   sel_n[LG_MAXL][32];
+    int  *sel_idx[LG_MAXL][32];
     OQMap oq;                      /* per-tensor bits/group_size from config */
     int   oq_tensors;              /* weights read oQ-packed                 */
     Wt embed, lm_head;
@@ -2492,6 +2498,82 @@ static int is_eos(Cfg *c, int tok) {
     return 0;
 }
 
+static int int_cmp(const void *a, const void *b) {
+    int x = *(const int*)a, y = *(const int*)b;
+    return (x > y) - (x < y);
+}
+
+/* ---------- PHASE 3 selection pass (SAGE-KV / SnapKV style) ----------------
+ * Runs ONCE after prefill (called from generate_stream) on the FIRST
+ * full-attention layer only: its pooled attention scores decide the KV set
+ * that ALL full layers share (layer-wise index reuse, per the design doc).
+ *
+ * Score = the pooled L2 norm of the K rows in a trailing observation window
+ * (the last `sel_min` positions), averaged per LG_KC-sized block. Blocks fully
+ * outside the window score 0. The top `sel_cap` POSITIONS per KV head are kept
+ * (whole blocks chosen by block score first), sorted ascending, stored in
+ * m->sel_idx[li][h] / m->sel_n[li][h]. */
+static void sel_pass(Model *m) {
+    Cfg *c = &m->c;
+    if (!m->sel || m->kv_len < m->sel_min) return;
+    int li = -1;
+    for (int i = 0; i < c->n_layers; i++) if (!c->slide[i]) { li = i; break; }
+    if (li < 0) return;                      /* no full-attention layer */
+    int KV = c->n_kv; if (KV > 32) KV = 32;
+    int hd = c->head_dim, S = m->kv_len;
+    int kvphys = m->kvphys[li];
+    int w0 = S - m->sel_min; if (w0 < 0) w0 = 0;    /* obs window start */
+    #define SEL_BLK 64                        /* == LG_KC block size */
+    int nb = (S + SEL_BLK - 1) / SEL_BLK;
+    /* free any prior allocation; guards a second call from reallocating */
+    for (int h = 0; h < KV; h++) {
+        free(m->sel_idx[li][h]);
+        m->sel_idx[li][h] = NULL;
+        m->sel_n[li][h] = 0;
+    }
+    for (int h = 0; h < KV; h++) {
+        const int8_t *K  = m->K[li]  + (int64_t)h*kvphys*hd;
+        const float  *Ks = m->Ks[li] + (int64_t)h*kvphys;
+        /* pooled L2 of each K row in the window: ||q||_2 * scale */
+        float *l2 = calloc((size_t)S, sizeof(float));
+        for (int p = w0; p < S; p++) {
+            const int8_t *row = K + (int64_t)p*hd;
+            float s = Ks[p];
+            if (s == 0.f) continue;
+            double a = 0;
+            for (int d = 0; d < hd; d++) { int v = row[d]; a += (double)v*v; }
+            l2[p] = s * (float)sqrt(a);
+        }
+        /* per-block score: mean pooled L2 over the block's window positions */
+        float *bs = calloc((size_t)nb, sizeof(float));
+        for (int b = 0; b < nb; b++) {
+            int p0 = b*SEL_BLK, p1 = p0 + SEL_BLK; if (p1 > S) p1 = S;
+            float sum = 0.f;
+            for (int p = p0; p < p1; p++) sum += l2[p];
+            bs[b] = sum / SEL_BLK;
+        }
+        /* pick the top `sel_cap` positions: whole blocks by score, desc */
+        int cap = m->sel_cap; if (cap < 1) cap = 1;
+        int *sel = malloc((size_t)cap * sizeof(int));
+        int cnt = 0;
+        while (cnt < cap) {
+            int best = -1; float bv = -1.f;
+            for (int b = 0; b < nb; b++) if (bs[b] > bv) { bv = bs[b]; best = b; }
+            if (best < 0 || bv <= 0.f) break;    /* nothing left / all zero */
+            int p0 = best*SEL_BLK, p1 = p0 + SEL_BLK; if (p1 > S) p1 = S;
+            for (int p = p0; p < p1 && cnt < cap; p++) sel[cnt++] = p;
+            bs[best] = -1.f;                     /* consume the block */
+        }
+        if (cnt > cap) cnt = cap;
+        qsort(sel, (size_t)cnt, sizeof(int), int_cmp);
+        m->sel_idx[li][h] = sel;
+        m->sel_n[li][h]   = cnt;
+        free(bs); free(l2);
+    }
+    printf("[sel] cap=%d from %d keys\n", m->sel_cap, S);
+    #undef SEL_BLK
+}
+
 /* greedy generation into out[] (prompt copied in first) */
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out, int *n_out) {
     for (int i = 0; i < np; i++) out[i] = prompt[i];
@@ -2552,6 +2634,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
 
     double t0 = now_s(), t1 = 0;
     float *logit = step(m, ids, np, 0, NULL);
+    sel_pass(m);
     int len = np;
     char buf[512];
     /* seq[] tracks the whole sequence (prompt + generated) for the n-gram
