@@ -228,6 +228,21 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #define LG_CHUNK 8192
 #endif
 
+/* Runtime override (LAGUNA-FORK): the LG_CHUNK env var wins over the
+ * compile-time macro. Resolved once so step(), kv_alloc() and the memory
+ * budget all see the same chunk; c/tools/tune_chunk.sh used to recompile per
+ * sweep point, this lets a sweep swap the chunk without a rebuild. */
+static int lg_chunk(void) {
+    static int v = 0;
+    if (v == 0) {
+        const char *e = getenv("LG_CHUNK");
+        v = (e && *e) ? atoi(e) : LG_CHUNK;
+        if (v < 1) v = LG_CHUNK;
+        if (e && *e) fprintf(stderr, "[chunk] LG_CHUNK=%d\n", v);
+    }
+    return v;
+}
+
 /* ---- per-step scratch arena (LAGUNA-FORK) ----------------------------------
  * attention() and moe() allocate ~26 S-sized buffers per layer with malloc and
  * free them again. Over 40 layers per pass that churns thousands of large
@@ -1286,7 +1301,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                  * ring still allocates the full ctx_hint rows. */
                 double ring = c->window;
 #ifdef LAGUNA_METAL
-                ring += (double)LG_CHUNK;
+                ring += (double)lg_chunk();
 #endif
                 if (ring < m->ctx_hint) {
 #ifdef LAGUNA_METAL
@@ -1342,18 +1357,18 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         }
         hgt = c->n_kv > 0 ? c->n_kv : 1;
         double g_ = hmax / (double)hgt;
-        double rows = g_ * LG_CHUNK;
+        double rows = g_ * lg_chunk();
         double kt = ((384.0 * 1048576.0) / (rows * 4.0));
         if (kt < 256) kt = 256;
         if (kt > 65536) kt = 65536;
         if (kt > gcap) kt = gcap;
         if (kt < 1) kt = 1;
         double need = rows * c->head_dim * 4.0                  /* stacked Q     */
-                    + hmax * LG_CHUNK * c->head_dim * 4.0        /* AC            */
+                    + hmax * lg_chunk() * c->head_dim * 4.0      /* AC            */
                     + rows * kt * 4.0                            /* score tile    */
                     + kt * c->head_dim * 8.0                     /* K/V tile      */
-                    + hmax * LG_CHUNK * 8.0                      /* max/den       */
-                    + 2.0 * LG_CHUNK * hmax * c->head_dim * 4.0; /* q + out copies */
+                    + hmax * lg_chunk() * 8.0                    /* max/den       */
+                    + 2.0 * lg_chunk() * hmax * c->head_dim * 4.0; /* q + out copies */
         if (need <= m->mem_budget - m->mem_used) {
             m->gpu_attn = 1; m->gpu_attn_cap = gcap;
             m->mem_used += need;
@@ -2374,15 +2389,27 @@ static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
  * every scratch buffer is O(chunk). The goal is long context inside a fixed
  * budget, so take the smallest chunk that costs no speed. */
 
+/* Per-chunk phase trace (LG_TRACE_CHUNK=1): the engine's [phases] line is the
+ * session aggregate; this attributes the prefill wall time and its
+ * attn/expert-mm/fill/shared components to each chunk, so a LG_CHUNK sweep can
+ * see how per-chunk fixed cost amortizes (or not) as the chunk grows. */
 static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
-    if (S <= LG_CHUNK) return step_raw(m, ids, S, pos0, tf_out);
+    int chunk = lg_chunk();
+    if (S <= chunk) return step_raw(m, ids, S, pos0, tf_out);
     float *logit = NULL;
-    for (int off = 0; off < S; off += LG_CHUNK) {
-        int n = S - off < LG_CHUNK ? S - off : LG_CHUNK;
+    int trace = getenv("LG_TRACE_CHUNK") != NULL;
+    for (int off = 0; off < S; off += chunk) {
+        int n = S - off < chunk ? S - off : chunk;
+        double w0 = trace ? now_s() : 0;
+        double a0 = m->t_attn, e0 = m->t_expert, f0 = m->t_fill, s0 = m->t_shared;
         free(logit);
         /* tf_out (teacher-forcing argmax per position) is filled per chunk at the
          * matching offset so chunking is invisible to the fixtures. */
         logit = step_raw(m, ids + off, n, pos0 + off, tf_out ? tf_out + off : NULL);
+        if (trace)
+            fprintf(stderr, "[chunk] %d/%d pos %d..%d n=%d prefill %.1fs attn %.1fs expert-mm %.1fs fill %.1fs shared %.1fs\n",
+                    off / chunk + 1, (S + chunk - 1) / chunk, pos0 + off, pos0 + off + n - 1, n,
+                    now_s() - w0, m->t_attn - a0, m->t_expert - e0, m->t_fill - f0, m->t_shared - s0);
     }
     return logit;
 }
@@ -2430,7 +2457,7 @@ static void kv_alloc(Model *m, int max_t) {
          * band starting anywhere in it is contiguous. */
         int ring = c->window;
 #ifdef LAGUNA_METAL
-        if (c->slide[i] && c->window > 0) ring = c->window + LG_CHUNK;
+        if (c->slide[i] && c->window > 0) ring = c->window + lg_chunk();
 #endif
         int cap = (c->slide[i] && c->window > 0 && ring < max_t) ? ring : max_t;
         m->kvcap[i] = cap;   /* ring modulus: CPU wraparound (`pos % kvcap`) */
