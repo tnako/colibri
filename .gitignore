@@ -110,3 +110,6 @@ models/
 laguna_metal.o
 laguna_*_metal
 laguna_expert_metal.o
+
+# opencode phase worktrees (parallel phase agents) — never a repo artifact
+.worktrees/
