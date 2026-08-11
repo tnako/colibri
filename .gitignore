@@ -113,3 +113,4 @@ laguna_expert_metal.o
 
 # opencode phase worktrees (parallel phase agents) — never a repo artifact
 .worktrees/
+c/decode_parity_test
