@@ -1,7 +1,9 @@
 # Phase 3 — Post-prefill selection pass (bounded effective KV for full layers)
 
-Design draft for `phase3/sparse-attn`. Status: **config platform in; pass not yet
-implemented** (this document is the contract the implementation follows).
+Design draft for `phase3/sparse-attn`. Status: **config platform in; selection
+pass + decode walk implemented** (`sel_pass` in `laguna_common.h`, CPU decode
+walk honors the shared index; prefill tile-skip is exempt per §5 and lands with
+Phase 4's selective propagation).
 
 ## 1. Why
 
@@ -73,6 +75,9 @@ importance[kh][p] = Σ_{q ∈ last LG_SEL_OBW queries} softmax_w(q, p, kh)
    tokens dominate attention and decoding starts there) and the observation
    window itself.
 3. Union + clamp to `cap`, sort ascending → the **selection index**.
+
+`cap >= context length` selects **every** position for every head group (no
+sparsification), making full-cap runs byte-exact vs selection off.
 
 ### Index location and layout
 

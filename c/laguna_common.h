@@ -181,6 +181,8 @@ typedef struct {
      * by sel_pass(); every full layer shares it (layer-wise index reuse). */
     int   sel_n[LG_MAXL][32];
     int  *sel_idx[LG_MAXL][32];
+    int   sel_base;                /* first full-attention layer index, -1 unset */
+    int   sel_full;                /* cap >= context: no sparsification, byte-exact */
     OQMap oq;                      /* per-tensor bits/group_size from config */
     int   oq_tensors;              /* weights read oQ-packed                 */
     Wt embed, lm_head;
@@ -1205,6 +1207,8 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         if (ec) { int v = atoi(ec); if (v > 0) m->sel_cap = v; }
         const char *em = getenv("LG_SEL_MIN");
         if (em) { int v = atoi(em); if (v > 0) m->sel_min = v; }
+        m->sel_base = -1;
+        m->sel_full = 0;
     }
 
     m->embed      = load_w(m, "model.embed_tokens.weight");
@@ -1677,6 +1681,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * scratch stops growing with prompt length. */
     #define LG_QB 8
     #define LG_KC 64
+    #ifndef LAGUNA_METAL
+    #define LG_DEC_SMAX 25        /* decode batch bound, Metal-only upstream */
+    #endif
 
     /* APPEND FIRST (LAGUNA-FORK). The GPU path now reads this int8 cache in
      * place rather than a separate f16 copy, so this chunk's own K/V must be in
@@ -1801,21 +1808,34 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     for (int b = 0; b < nb; b++)
                         memcpy(qt + (int64_t)b*hd, q + (int64_t)(sb+b)*qdim + hq*hd,
                                (size_t)hd*sizeof(float));
-                    for (int tc = t0; tc <= hi; tc += LG_KC) {
-                        int tn = hi - tc + 1; if (tn > LG_KC) tn = LG_KC;
+                    /* PHASE 3 (LAGUNA-FORK): selection-walk. When the post-prefill
+                     * selection pass is on and this is a decode batch on a full
+                     * layer, iterate ONLY the selected KV positions (from the
+                     * first full layer's shared index) instead of the whole
+                     * history. Sorted ascending, all < pos0 for a decode batch,
+                     * so the causal mask below leaves them all in range. */
+                    int sel_use = m->sel && !c->slide[li] && m->sel_base >= 0 &&
+                                  S <= LG_DEC_SMAX && !m->sel_full &&
+                                  m->sel_n[m->sel_base][kh] > 0;
+                    const int *tlist = sel_use ? m->sel_idx[m->sel_base][kh] : NULL;
+                    int nrows = sel_use ? m->sel_n[m->sel_base][kh] : (hi - t0 + 1);
+                    for (int r0 = 0; r0 < nrows; r0 += LG_KC) {
+                        int tn = nrows - r0; if (tn > LG_KC) tn = LG_KC;
                         /* Dequantize the cached part of this chunk once. Rows at
                          * t >= pos0 are this batch's own k/vv, still f32, and are
                          * read directly by the macros. */
                         for (int j = 0; j < tn; j++) {
-                            int t = tc + j;
+                            int t = sel_use ? tlist[r0 + j] : (t0 + r0 + j);
                             if (t >= pos0) break;
                             int64_t sl = LG_KSLOT(t);
                             kv_i8_unpack(kstage + (int64_t)j*hd, Kh + sl*hd, Kq[sl], hd);
                             kv_i8_unpack(vstage + (int64_t)j*hd, Vh + sl*hd, Vq[sl], hd);
                         }
                         for (int j = 0; j < tn; j++) {
-                            const float *kv = LG_KROW(tc + j);
-                            int t = tc + j;
+                            int t = sel_use ? tlist[r0 + j] : (t0 + r0 + j);
+                            const float *kv = t >= pos0
+                                ? k  + (int64_t)(t-pos0)*kvdim + kh*hd
+                                : kstage + (int64_t)j*hd;
                             /* one K row, all nb queries: K stays in L1 across
                              * the whole inner loop instead of being re-fetched */
                             for (int b = 0; b < nb; b++) {
@@ -1846,7 +1866,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                                 if (row[j] == -INFINITY) continue;
                                 float w = expf(row[j] - mx[b]);
                                 den[b] += w;
-                                axpy_f32(ac, w, LG_VROW(tc + j), hd);
+                                int t = sel_use ? tlist[r0 + j] : (t0 + r0 + j);
+                                const float *vr = t >= pos0
+                                    ? vv + (int64_t)(t-pos0)*kvdim + kh*hd
+                                    : vstage + (int64_t)j*hd;
+                                axpy_f32(ac, w, vr, hd);
                             }
                         }
                     }
@@ -2519,6 +2543,7 @@ static void sel_pass(Model *m) {
     int li = -1;
     for (int i = 0; i < c->n_layers; i++) if (!c->slide[i]) { li = i; break; }
     if (li < 0) return;                      /* no full-attention layer */
+    m->sel_base = li;
     int KV = c->n_kv; if (KV > 32) KV = 32;
     int hd = c->head_dim, S = m->kv_len;
     int kvphys = m->kvphys[li];
@@ -2531,6 +2556,20 @@ static void sel_pass(Model *m) {
         m->sel_idx[li][h] = NULL;
         m->sel_n[li][h] = 0;
     }
+    /* cap >= context length means "no sparsification": keep every position
+     * for every KV head so full-cap runs stay byte-exact vs selection off. */
+    if (m->sel_cap >= S) {
+        m->sel_full = 1;
+        for (int h = 0; h < KV; h++) {
+            int *sel = malloc((size_t)S * sizeof(int));
+            for (int p = 0; p < S; p++) sel[p] = p;
+            m->sel_idx[li][h] = sel;
+            m->sel_n[li][h]   = S;
+        }
+        printf("[sel] cap=%d from %d keys\n", m->sel_cap, S);
+        return;
+    }
+    m->sel_full = 0;
     for (int h = 0; h < KV; h++) {
         const int8_t *K  = m->K[li]  + (int64_t)h*kvphys*hd;
         const float  *Ks = m->Ks[li] + (int64_t)h*kvphys;
@@ -2629,12 +2668,11 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
     if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); free(ids); return; }
     kv_alloc(m, np + n_new + 8);
-    printf("[%d prompt tokens] %s", np, prompt);
-    fflush(stdout);
-
     double t0 = now_s(), t1 = 0;
     float *logit = step(m, ids, np, 0, NULL);
     sel_pass(m);
+    printf("[%d prompt tokens] %s", np, prompt);
+    fflush(stdout);
     int len = np;
     char buf[512];
     /* seq[] tracks the whole sequence (prompt + generated) for the n-gram
