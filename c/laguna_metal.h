@@ -87,6 +87,58 @@ void  *lg_metal_scratch_ptr(void *h);
 void   lg_metal_prof_dump(void);
 void   lg_metal_expert_prof_dump(void);
 
+/* ---- persistent decode GEMV path (LAGUNA-FORK, Phase 2) ---------------------
+ * Decode is a per-token memory-bound GEMV stream over the resident oQ2/Q8R
+ * weights (attention projections + shared expert + routed experts), so running
+ * it through the prefill GEMM path (gated S>=64) or the f16 MPS uploads is
+ * wrong twice over. This is a small batch of GEMVs per layer, all encoded into
+ * ONE command buffer so the CPU pays a single commit+wait per layer instead of
+ * one round trip per matrix (measured ~0.33 ms each on M5 -- at 40 layers that
+ * is the entire 140 tok/s budget, which is why per-matrix is banned).
+ *
+ * The session owns nothing but the pipeline and a cache of host-memory
+ * MTLBuffer wraps. The C engine declares persistent page-aligned output regions
+ * (lg_decode_region), then per layer begins a session, enqueues one GEMV per
+ * matrix with lg_decode_gemv, and commits with lg_decode_run. Every entry point
+ * returns 0 / does nothing when Metal is unavailable so the CPU path is the
+ * floor; a failed gemv is reported so the caller can fall back per matrix. */
+typedef struct LgDecode LgDecode;
+LgDecode   *lg_decode_new(void);
+void        lg_decode_free(LgDecode *d);
+/* Declare a persistent output region hosted at page-aligned `host` (bytes).
+ * Returns a small non-negative slot id, or -1. The GPU kernel writes into the
+ * region by slot; the CPU reads `host` directly after the commit. */
+int         lg_decode_region(LgDecode *d, float *host, size_t bytes);
+/* Start a layer's session for S rows. CPU may write x / read stale regions
+ * until lg_decode_run(). */
+void        lg_decode_begin(LgDecode *d, int S);
+/* One matrix: y[ry + rOff*4 bytes, S*N] = x[S,K] @ dequant(W)^T.
+ *   W/Sc/Bi are HOST base pointers (wrapped and cached); woff/soff/boff are
+ *   byte offsets into them (expert slabs). For dense weights pass Sc=Bi=NULL,
+ *   fmt=LG_DEC_F32 / LG_DEC_BF16 and bits=0. bit-exactness matches matmul_oq
+ *   (affine group factorisation: sc*dot + bi*xsum). Returns 1 if enqueued,
+ *   0 if the matrix shape/dtype is not representable (caller runs CPU). */
+enum {
+    LG_DEC_OQF32  = 0,   /* oQ codes, f32 scales/biases (Wt from oq_load) */
+    LG_DEC_OQBF16 = 1,   /* oQ codes, bf16 scales/biases (mmap'd gx slabs) */
+    LG_DEC_F32    = 2,   /* dense f32 weights */
+    LG_DEC_BF16   = 3,   /* dense bf16 weights */
+};
+int         lg_decode_gemv(LgDecode *d, int ry, size_t rOff,
+                           const float *x,
+                           const void *W, size_t woff,
+                           const void *Sc, size_t soff, const void *Bi, size_t boff,
+                           int N, int K, int bits, int gs, int fmt);
+/* Enqueue an elementwise gate*up -> (silu) fusion in place on gb (S*I floats). */
+int         lg_decode_silu(LgDecode *d, float *gb, size_t gboff, size_t n);
+/* Commit the session's command buffer and wait. Returns 1 on success. */
+int         lg_decode_run(LgDecode *d);
+/* Per-region host pointer (for the engine to address outputs after a run). */
+float      *lg_decode_region_ptr(LgDecode *d, int ry);
+/* Total bytes declared; decode is zero-cost until the engine declares regions. */
+size_t      lg_decode_bytes(LgDecode *d);
+int         lg_decode_active(LgDecode *d);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,5 +1,13 @@
 # Laguna-S 256k rework plan: goal, phases, and verification
 
+> **Status (updated by the assistant, as of this session):**
+> - ✅ **Phase 0 — done** (commit `7101974`)
+> - ✅ **Phase 1 — done** (commit `2581a9f`)
+> - 🚧 **Phase 2 — in progress**: API contract for the persistent decode GEMV path is
+>   drafted and awaiting implementation (`c/laguna_metal.h` `lg_decode_*`, working
+>   tree, uncommitted). Implementation and wiring are the current next step.
+> - ⬜ Phases 3-6 not started.
+
 Targets (user-set):
 
 | metric | target |
@@ -71,7 +79,13 @@ For each phase, from a clean tree:
 4. Commit per phase with a `perf:`/`feat:` subject + the "measured" table in
    the body, mirroring the repo's style (see `git log --oneline -20`).
 
-## Phase 0 — Baseline rig + memory accounting (no behaviour change)
+## Phase 0 — Baseline rig + memory accounting (no behaviour change) — ✅ DONE
+
+Status: `perf:`/`feat:` commit `7101974`. `c/resource_plan.py` now models Laguna KV
+(S KV @256k = 7.97 GB Metal / 6.68 GB CPU); `test_resource_plan.py` 44/44;
+`docs/benchmarks/256k-baseline.md` records the fresh baselines (XS 2k prefill ~68.8 s
+attn-dominated, decode XS 6.1 tok/s @1869, S 0.86 tok/s @800, both Metal builds).
+Ritual gates green (fixtures on xs_metal/s_metal, test_ngram_draft, test_kv_alloc).
 
 Goal: one reproducible command that reports every number the targets need, and
 a planner that models Laguna KV correctly.
@@ -90,7 +104,7 @@ a planner that models Laguna KV correctly.
 Acceptance: same numbers as the docs within noise; planner prints non-zero KV
 for Laguna; all gates pass.
 
-## Phase 1 — Kill the 13 GB GPU KV ring for the 12 full layers (FlashAttention-style tiled prefill)
+## Phase 1 — Kill the 13 GB GPU KV ring for the 12 full layers (FlashAttention-style tiled prefill) — ✅ DONE
 
 Target memory: < 20 GB @256k. This is the single highest-value change.
 
@@ -115,9 +129,25 @@ Verify (phase ritual + specifically):
   RSS for a 256k (or the longest feasible) padded run inside 20 GB.
 - Attention phase time after the change vs. before at 6k and 30k.
 
-## Phase 2 — Decode on Metal: batched GEMV for projections + experts
+Status: `perf:` commit `2581a9f`. Tiled online-softmax prefill in
+`c/laguna_attn_metal.mm` for full layers (`gather_g`, `init_md`, `online_chunk`,
+`fin_scatter` kernels; tile ~384 MiB; `LG_KTILE` override). The S×nkey score
+matrix (8.6 GB at the last 256k chunk) is never materialized; staging is now
+tile-sized (1.25 GB fixed at `CTX_MAX=262144`, peak RSS 7.9 GB). Parity harness
+`c/tests/attn_tiled_parity.mm` + `test_gpu_attn_parity.py` (max |diff| 2.4e-4 at
+H=48 KV=8 hd=128 S=256). Sliding layers keep the banded path. Fixtures green on
+xs_metal/s_metal. XS Metal @6k: prefill 67.9 s / attn 28.5 s / RSS 7.5 GB.
+
+## Phase 2 — Decode on Metal: batched GEMV for projections + experts — 🚧 IN PROGRESS
 
 Target: 140 tok/s decode.
+
+Status: the API contract is drafted in `c/laguna_metal.h` (working tree,
+uncommitted) — `LgDecode` session, `lg_decode_new/free/region/begin/gemv/silu/run/
+region_ptr/bytes/active`, formats `LG_DEC_OQF32/OQBF16/F32/BF16`. NOT yet
+implemented in `c/laguna_metal.mm` and NOT yet wired into `c/laguna_common.h`
+(attention projections / shared expert / routed experts / spec-verify batched
+forward). Decode still runs the CPU `matmul_oq`/UDOT path per token.
 
 - Current decode runs CPU per-token (`S=1`); GPU dispatch is gated off at
   `S < 64` (`LG_GPU_EXP_MIN`) because per-row round trips are catastrophic
@@ -138,7 +168,7 @@ Verify: decode tok/s on XS and S at each context size; phase time budget
 (full-layer decode attention must read a bounded KV set once Phase 1/3 make it
 so).
 
-## Phase 3 — Sparse/selective attention for the full layers (bounded effective KV)
+## Phase 3 — Sparse/selective attention for the full layers (bounded effective KV) — ⬜ NOT STARTED
 
 Target: keep the quadratic term from growing with context and cap triple
 decode attention traffic + KV memory.
@@ -157,7 +187,7 @@ decode attention traffic + KV memory.
 Verify: accuracy gate on the fixtures + a real long-context sample (padded
 prompt baseline before/after token agreement); memory + prefill wall at 65k/256k.
 
-## Phase 4 — Prefill linear-term reduction + big-chunk amortization
+## Phase 4 — Prefill linear-term reduction + big-chunk amortization — ⬜ NOT STARTED
 
 Target: shrink the ~200 ms/token linear expert term and attention fixed cost.
 
@@ -176,7 +206,7 @@ Target: shrink the ~200 ms/token linear expert term and attention fixed cost.
 Verify: prefill wall and per-phase split at 6k/30k/65k (+256k if safely
 run); memory must stay <20 GB.
 
-## Phase 5 — Full-Metal migration (only if the above cannot meet targets)
+## Phase 5 — Full-Metal migration (only if the above cannot meet targets) — ⬜ NOT STARTED
 
 The user has pre-authorized: "You can always fully migrate to metal if this
 requires."
@@ -192,7 +222,7 @@ requires."
   compute-bound prefill through matmul engines, keeping memory-bound decode on
   tuned memory kernels).
 
-## Phase 6 — 256k hardening + release gate
+## Phase 6 — 256k hardening + release gate — ⬜ NOT STARTED
 
 - Full 256k prefill+decode run on `Laguna-S-2.1-oQ2e-fast`, inside 20 GB,
   measured decode 140 tok/s target + TTFT.
