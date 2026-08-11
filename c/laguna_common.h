@@ -167,6 +167,14 @@ typedef struct {
     int gpu_exp;
     int ctx_hint;                  /* max context, for KV headroom accounting */
     int gpu_attn, gpu_attn_cap;    /* GPU flash attention for full layers      */
+    /* PHASE 3 config platform: post-prefill selection pass (SAGE-KV/SnapKV
+     * style) that caps the full-attention layers' effective KV. `sel` is the
+     * master switch (LG_SEL, default 0 = off -> byte-exact full attention);
+     * `sel_cap` is the max selected positions per head group (LG_SEL_CAP,
+     * default 8192); `sel_min` is the context threshold above which selection
+     * is allowed to engage (LG_SEL_MIN, default 16384) so short fixture runs
+     * stay on the full-attention path. */
+    int sel, sel_cap, sel_min;
     OQMap oq;                      /* per-tensor bits/group_size from config */
     int   oq_tensors;              /* weights read oQ-packed                 */
     Wt embed, lm_head;
@@ -1176,6 +1184,22 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     Cfg *c = &m->c;
     int D = c->hidden;
     double t0 = now_s();
+
+    /* PHASE 3 config platform: post-prefill selection pass knobs (SAGE-KV /
+     * SnapKV style). Default OFF so the engine's full-attention path is
+     * byte-exact until a run opts in; even when ON, the pass only engages for
+     * prompts longer than sel_min (default 16384) so short fixture runs stay
+     * byte-exact. sel_cap is the effective-KV ceiling per head group. */
+    {
+        const char *es = getenv("LG_SEL");
+        m->sel = es ? atoi(es) != 0 : 0;
+        m->sel_cap = 8192;
+        m->sel_min = 16384;
+        const char *ec = getenv("LG_SEL_CAP");
+        if (ec) { int v = atoi(ec); if (v > 0) m->sel_cap = v; }
+        const char *em = getenv("LG_SEL_MIN");
+        if (em) { int v = atoi(em); if (v > 0) m->sel_min = v; }
+    }
 
     m->embed      = load_w(m, "model.embed_tokens.weight");
     m->final_norm = load_t(m, "model.norm.weight");
@@ -2939,6 +2963,9 @@ static void print_cfg(Model *m) {
                m->oq.bits, m->oq.gs, m->oq.n,
                m->experts == EXP_OQ ? ", experts packed (switch_mlp)"
                                     : " (expert layout probed at load)");
+    if (m->sel)
+        printf("     sel: ON cap=%d min=%d (post-prefill selection pass, engages when prompt > min)\n",
+               m->sel_cap, m->sel_min);
 }
 
 int main(int argc, char **argv) {
