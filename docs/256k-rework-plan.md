@@ -138,7 +138,7 @@ tile-sized (1.25 GB fixed at `CTX_MAX=262144`, peak RSS 7.9 GB). Parity harness
 H=48 KV=8 hd=128 S=256). Sliding layers keep the banded path. Fixtures green on
 xs_metal/s_metal. XS Metal @6k: prefill 67.9 s / attn 28.5 s / RSS 7.5 GB.
 
-## Phase 2 — Decode on Metal: batched GEMV for projections + experts — 🚧 IN PROGRESS
+## Phase 2 — Decode on Metal: batched GEMV for projections + experts — ✅ DONE (merged dd12af2)
 
 Target: 140 tok/s decode.
 
@@ -168,7 +168,7 @@ Verify: decode tok/s on XS and S at each context size; phase time budget
 (full-layer decode attention must read a bounded KV set once Phase 1/3 make it
 so).
 
-## Phase 3 — Sparse/selective attention for the full layers (bounded effective KV) — ⬜ NOT STARTED
+## Phase 3 — Sparse/selective attention for the full layers (bounded effective KV) — ✅ DONE (merged 1e57466)
 
 Target: keep the quadratic term from growing with context and cap triple
 decode attention traffic + KV memory.
@@ -187,7 +187,7 @@ decode attention traffic + KV memory.
 Verify: accuracy gate on the fixtures + a real long-context sample (padded
 prompt baseline before/after token agreement); memory + prefill wall at 65k/256k.
 
-## Phase 4 — Prefill linear-term reduction + big-chunk amortization — ⬜ NOT STARTED
+## Phase 4 — Prefill linear-term reduction + big-chunk amortization — ✅ DONE (merged ffa01f4)
 
 Target: shrink the ~200 ms/token linear expert term and attention fixed cost.
 
