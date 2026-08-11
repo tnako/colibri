@@ -30,6 +30,11 @@
 extern id<MTLDevice>       lg_metal_device(void);
 extern id<MTLCommandQueue> lg_metal_queue(void);
 
+/* Mirrors LG_ATTN_CHUNK in laguna_common.h (max tokens scored in one prefill call).
+ * The budget loop in the engine uses its own LG_ATTN_CHUNK for the same number;
+ * byte-exact agreement is not required, keeping it within ~1 chunk is. */
+#define LG_ATTN_CHUNK 8192
+
 static const char *ATTN_SRC = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -129,6 +134,154 @@ kernel void scatter_o(device const float* OT [[buffer(0)]],
     float gate = g > 20.0f ? g : log(1.0f + exp(g));
     O[(long)s*qdim + off + d] = OT[(long)s*hd + d] * gate;
 }
+
+/* --------------------------------------------------------------------------
+ * PHASE 1 (256k-rework): tiled online-softmax kernels for FULL layers.
+ *
+ * The banded path above sizes one score tile as S x nkey -- 8.6 GB at the
+ * last 256k chunk -- so full layers stream keys in tiles of `kt` columns
+ * instead. Each tile contributes through the flash-attention recurrence
+ * (online softmax), so no full score matrix ever exists:
+ *
+ *   scores[tile] = Q @ K_tile^T            (MPS, alpha = scale)
+ *   online_chunk: cmax over the tile, rescale running AC/MD, write e = exp,
+ *                 fold the tile's exp-sum into the running denominator
+ *   AC          += e @ V_tile               (MPS, beta = 1)
+ *   fin_scatter: out = AC * softplus(gate) / den
+ *
+ * Query heads of one kv head (the "group") are stacked into [G*S, hd] rows so
+ * the K/V tile, which all G heads share, is fetched and staged once per tile.
+ * AC/MD accumulate across tiles for the whole group before the final divide.
+ */
+
+/* Stacked gather: rows [G*S, hd] = q[s*qdim + (hq0+g)*hd + d], g = row/S. */
+kernel void gather_g(device const float* Q  [[buffer(0)]],
+                     device float*       QT [[buffer(1)]],
+                     constant int&       qdim [[buffer(2)]],
+                     constant int&       hd   [[buffer(3)]],
+                     constant int&       S    [[buffer(4)]],
+                     constant int&       hq0  [[buffer(5)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    int r = int(gid.y), d = int(gid.x);
+    if (d >= hd) return;
+    int g = r / S, s = r % S;
+    int hq = hq0 + g;
+    QT[(long)r*hd + d] = Q[(long)s*qdim + (long)hq*hd + d];
+}
+
+/* One AC/MD row: AC[row*hd..] = 0, MD[2*row] = -INF, MD[2*row+1] = 0.
+ * Run once per lg_metal_attn before the first group's tiles. */
+kernel void init_md(device float* AC [[buffer(0)]],
+                    device float* MD [[buffer(1)]],
+                    constant int& rows [[buffer(2)]],
+                    constant int& hd   [[buffer(3)]],
+                    uint2 gid [[thread_position_in_grid]]) {
+    int r = int(gid.y), d = int(gid.x);
+    if (r >= rows) return;
+    MD[(long)r*2 + 0] = -INFINITY;
+    MD[(long)r*2 + 1] = 0.0f;
+    if (d < hd) AC[(long)r*hd + d] = 0.0f;
+}
+
+/* Online-softmax update for one score tile [rows, ktile] (in place -> e).
+ * One threadgroup per row; `kabs` is the absolute column of score column 0.
+ * `kt2` is the actual number of valid columns in this tile (== ktile except the
+ * last, partial tile). A row's valid tile columns are [0, qc] where
+ * qc = qpos - kabs (qpos = pos0 + row%S, causal); all other columns become
+ * e = 0 so PV ignores them. Rows with no valid column in this tile (qc < 0)
+ * have their whole row zeroed too -- otherwise the following PV GEMM would
+ * accumulate raw, non-softmax scores for those rows. */
+kernel void online_chunk(device float* Sc  [[buffer(0)]],
+                         device float* AC  [[buffer(1)]],
+                         device float* MD  [[buffer(2)]],
+                         constant int& rows [[buffer(3)]],
+                         constant int& kt   [[buffer(4)]],
+                         constant int& kabs [[buffer(5)]],
+                         constant int& pos0 [[buffer(6)]],
+                         constant int& S    [[buffer(7)]],
+                         constant int& hd   [[buffer(8)]],
+                         constant int& kt2  [[buffer(9)]],
+                         uint  r    [[threadgroup_position_in_grid]],
+                         uint  lane [[thread_position_in_threadgroup]],
+                         uint  W    [[threads_per_threadgroup]]) {
+    if (r >= (uint)rows) return;
+    device float* sc = Sc + (long)r * kt;
+    int s = int(r) % S;
+    int qc = (pos0 + s) - kabs;          /* last valid tile column (inclusive) */
+    if (qc < 0) {                         /* no valid key in this tile          */
+        for (int c = int(lane); c < kt; c += int(W)) sc[c] = 0.0f;
+        return;
+    }
+    if (qc >= kt2) qc = kt2 - 1;
+
+    threadgroup float red[1024];
+    float cmax = -INFINITY;
+    for (int c = int(lane); c <= qc; c += int(W)) if (sc[c] > cmax) cmax = sc[c];
+    red[lane] = cmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) { float g = -INFINITY;
+        for (uint i = 0; i < W; i++) if (red[i] > g) g = red[i];
+        red[0] = g; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    cmax = red[0];
+    if (!(cmax > -1.0e35f)) return;       /* nothing valid in this tile        */
+
+    float m = MD[(long)r*2 + 0], d = MD[(long)r*2 + 1];
+    float nm = m > cmax ? m : cmax;
+    if (nm != m) {
+        float rs = (m == -INFINITY) ? 0.0f : exp(m - nm);
+        if (rs == 0.0f) {
+            for (int j = int(lane); j < hd; j += int(W)) AC[(long)r*hd + j] = 0.0f;
+            d = 0.0f;
+        } else {
+            for (int j = int(lane); j < hd; j += int(W)) AC[(long)r*hd + j] *= rs;
+            d *= rs;
+        }
+        m = nm;
+    }
+    float sacc = 0.0f;
+    for (int c = int(lane); c < kt; c += int(W)) {
+        if (c <= qc) { float e = exp(sc[c] - m); sc[c] = e; sacc += e; }
+        else         sc[c] = 0.0f;
+    }
+    red[lane] = sacc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) { float g = 0.0f;
+        for (uint i = 0; i < W; i++) g += red[i];
+        red[0] = g; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    MD[(long)r*2 + 0] = m;
+    MD[(long)r*2 + 1] = d + red[0];
+}
+
+/* Finalize one group's accumulated rows: out[s*qdim + hq*hd + d] =
+ * AC[row*hd+d] * softplus(gate) / den, matching the CPU path's gate+divide. */
+kernel void fin_scatter(device const float* AC [[buffer(0)]],
+                        device const float* MD [[buffer(1)]],
+                        device const float* GT [[buffer(2)]],
+                        device float*       O  [[buffer(3)]],
+                        constant int& qdim [[buffer(4)]],
+                        constant int& hd   [[buffer(5)]],
+                        constant int& S    [[buffer(6)]],
+                        constant int& H    [[buffer(7)]],
+                        constant int& hq0  [[buffer(8)]],
+                        constant int& rbase [[buffer(9)]],
+                        constant int& rows [[buffer(10)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    int r = int(gid.y), d = int(gid.x);
+    if (d >= hd) return;
+    long row = r;              /* AC/MD are bound at rbase already */
+    int s = r % S, g = r / S;
+    int hq = hq0 + g;
+    float den = MD[(long)row*2 + 1];
+    float v = AC[(long)row*hd + d];
+    if (den > 0.0f) {
+        float gg = GT[(long)s*H + hq];
+        float gate = gg > 20.0f ? gg : log(1.0f + exp(gg));
+        v = v * gate / den;
+    } else v = 0.0f;
+    O[(long)s*qdim + (long)hq*hd + d] = v;
+}
 )";
 
 typedef struct {
@@ -136,6 +289,7 @@ typedef struct {
     void *Ks, *Vs;        /* f32 scales  [KV][ctxcap],     bound zero-copy */
     int kv, ctxcap, hd;
     int ring;             /* kept for the sliding path; 0 = linear         */
+    int hheads;           /* query heads, learned at first lg_metal_attn   */
 } AttnLayer;
 
 /* A sliding layer only ever reads the last `window` positions, so its GPU cache
@@ -153,10 +307,13 @@ typedef struct {
  * one-thread-per-query kernel (the first version of this file). Only the softmax
  * and the gather/scatter need custom shaders. */
 static void *g_pipe_sm = NULL, *g_pipe_gq = NULL, *g_pipe_so = NULL, *g_pipe_dq = NULL;
+static void *g_pipe_gg = NULL, *g_pipe_init = NULL, *g_pipe_oc = NULL, *g_pipe_fin = NULL;
 static void *g_qt = NULL, *g_sc = NULL, *g_ot = NULL;
 static size_t g_qtcap = 0, g_sccap = 0, g_otcap = 0;
 static void *g_kf = NULL;  /* f32 K+V staging for the band actually scored */
 static size_t g_kfcap = 0;
+static void *g_md = NULL;  /* online-softmax running max/den [H*S][2] */
+static size_t g_mdcap = 0;
 
 static id<MTLComputePipelineState> mk_pipe(id<MTLLibrary> lib, const char *name) {
     NSError *e = nil;
@@ -220,6 +377,15 @@ static int attn_pipeline(void) {
     g_pipe_sm = (void*)CFBridgingRetain(sm);
     g_pipe_gq = (void*)CFBridgingRetain(gq);
     g_pipe_so = (void*)CFBridgingRetain(so);
+    id<MTLComputePipelineState> gg = mk_pipe(lib, "gather_g");
+    id<MTLComputePipelineState> im = mk_pipe(lib, "init_md");
+    id<MTLComputePipelineState> oc = mk_pipe(lib, "online_chunk");
+    id<MTLComputePipelineState> fs = mk_pipe(lib, "fin_scatter");
+    if (!gg || !im || !oc || !fs) return 0;
+    g_pipe_gg  = (void*)CFBridgingRetain(gg);
+    g_pipe_init = (void*)CFBridgingRetain(im);
+    g_pipe_oc   = (void*)CFBridgingRetain(oc);
+    g_pipe_fin  = (void*)CFBridgingRetain(fs);
     return 1;
 }
 
@@ -278,6 +444,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
     if (!g_al || !g_pipe_sm || layer < 0 || layer >= g_al_n) return 0;
     AttnLayer *L = &g_al[layer];
     if (!L->K) return 0;
+    if (!L->hheads) L->hheads = H;
     /* BANDED (LAGUNA-FORK): a sliding layer's queries in this chunk span absolute
      * positions [pos0, pos0+S), so the only keys any of them can attend are
      * [pos0-window+1, pos0+S). That band is window+S-1 wide -- CONSTANT in
@@ -307,6 +474,249 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
     }
     int k0_phys = (L->ring > 0) ? (k0 % L->ring) : k0;
     int group = H / KV, qdim = H * hd;
+    if (getenv("LG_DUMP")) fprintf(stderr, "entry: layer=%d S=%d pos0=%d H=%d KV=%d hd=%d window=%d L->ctxcap=%d L->ring=%d group=%d nkey=%d k0=%d\n",
+            layer, S, pos0, H, KV, hd, window, L->ctxcap, L->ring, group, nkey, k0);
+
+    /* ---- PHASE 1 tiled path: FULL layers only (window == 0) ---------------
+     * Full layers score the whole prefix, so a banded tile would be the whole
+     * S x nkey matrix (8.6 GB at the last 256k chunk). Instead stream keys in
+     * tiles of `ktile` columns: per tile a score GEMM, an online-softmax update
+     * (rescale the running AC/MD in device memory), and a PV GEMM with beta=1.
+     * Peak GPU staging is then O(S*hd*H + S*ktile), independent of context.
+     * Sliding layers below keep the existing banded path (window > 0). */
+    if (window == 0) {
+        id<MTLDevice> d2 = lg_metal_device();
+        id<MTLCommandQueue> cq2 = lg_metal_queue();
+        @autoreleasepool {
+            long rows = (long)group * S;            /* stacked head-group rows */
+            long ktile = ((384LL << 20) / (rows * 4));   /* ~384 MiB score tile */
+            { const char *e = getenv("LG_KTILE");
+              if (e) { long v = atol(e); if (v > 0) ktile = v;
+                       if (getenv("LG_DUMP")) fprintf(stderr, "tiled: env[%s]=%ld\n", e, v); } }
+            if (ktile < 256) ktile = 256;
+            if (ktile > 65536) ktile = 65536;
+            if (ktile > nkey) ktile = nkey;
+            if (ktile < 1) ktile = 1;
+            if (getenv("LG_DUMP")) fprintf(stderr, "tiled: ktile=%ld\n", ktile);
+
+            if (!ensure(&g_qt, &g_qtcap, (size_t)rows * hd * 4)) { fprintf(stderr, "tiled: g_qt fail rows=%ld hd=%d dev=%s\n", rows, hd, lg_metal_device()? "yes":"nil"); return 0; }
+            if (!ensure(&g_sc, &g_sccap, (size_t)rows * ktile * 4)) { fprintf(stderr, "tiled: g_sc fail\n"); return 0; }
+            if (!ensure(&g_ot, &g_otcap, (size_t)H * S * hd * 4)) { fprintf(stderr, "tiled: g_ot fail\n"); return 0; }
+            if (!ensure(&g_md, &g_mdcap, (size_t)H * S * 8)) { fprintf(stderr, "tiled: g_md fail\n"); return 0; }
+            if (!ensure(&g_kf, &g_kfcap, (size_t)ktile * hd * 4 * 2)) { fprintf(stderr, "tiled: g_kf fail\n"); return 0; }
+            static void *qs2 = NULL, *od2 = NULL, *gs2 = NULL;
+            static size_t qsc2 = 0, odc2 = 0, gsc2 = 0;
+            if (!ensure(&qs2, &qsc2, (size_t)S * qdim * 4)) { fprintf(stderr, "tiled: qs2 fail\n"); return 0; }
+            if (!ensure(&od2, &odc2, (size_t)S * qdim * 4)) { fprintf(stderr, "tiled: od2 fail\n"); return 0; }
+            if (!ensure(&gs2, &gsc2, (size_t)S * H * 4)) { fprintf(stderr, "tiled: gs2 fail\n"); return 0; }
+            memcpy([(__bridge id<MTLBuffer>)qs2 contents], q,  (size_t)S*qdim*4);
+            memcpy([(__bridge id<MTLBuffer>)gs2 contents], gt, (size_t)S*H*4);
+
+            id<MTLBuffer> QS = (__bridge id<MTLBuffer>)qs2;
+            id<MTLBuffer> OD = (__bridge id<MTLBuffer>)od2;
+            id<MTLBuffer> GS = (__bridge id<MTLBuffer>)gs2;
+            id<MTLBuffer> QT = (__bridge id<MTLBuffer>)g_qt;
+            id<MTLBuffer> SC = (__bridge id<MTLBuffer>)g_sc;
+            id<MTLBuffer> AC = (__bridge id<MTLBuffer>)g_ot;
+            id<MTLBuffer> MD = (__bridge id<MTLBuffer>)g_md;
+            id<MTLBuffer> KF = (__bridge id<MTLBuffer>)g_kf;
+            long KVD = (long)ktile * hd * 4;            /* V tile byte offset */
+
+            MPSMatrixDescriptor *dq = [MPSMatrixDescriptor matrixDescriptorWithRows:rows columns:hd
+                                        rowBytes:(size_t)hd*4 dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *dk = [MPSMatrixDescriptor matrixDescriptorWithRows:ktile columns:hd
+                                        rowBytes:(size_t)hd*4 dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *ds = [MPSMatrixDescriptor matrixDescriptorWithRows:rows columns:ktile
+                                        rowBytes:(size_t)ktile*4 dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *dv = [MPSMatrixDescriptor matrixDescriptorWithRows:ktile columns:hd
+                                        rowBytes:(size_t)hd*4 dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *da = [MPSMatrixDescriptor matrixDescriptorWithRows:rows columns:hd
+                                        rowBytes:(size_t)hd*4 dataType:MPSDataTypeFloat32];
+            MPSMatrixMultiplication *qk =
+                [[MPSMatrixMultiplication alloc] initWithDevice:d2 transposeLeft:NO transposeRight:YES
+                    resultRows:rows resultColumns:ktile interiorColumns:hd alpha:scale beta:0.0];
+            MPSMatrixMultiplication *pv =
+                [[MPSMatrixMultiplication alloc] initWithDevice:d2 transposeLeft:NO transposeRight:NO
+                    resultRows:rows resultColumns:hd interiorColumns:ktile alpha:1.0 beta:1.0];
+
+            id<MTLComputePipelineState> pgg  = (__bridge id<MTLComputePipelineState>)g_pipe_gg;
+            id<MTLComputePipelineState> pinit= (__bridge id<MTLComputePipelineState>)g_pipe_init;
+            id<MTLComputePipelineState> poc  = (__bridge id<MTLComputePipelineState>)g_pipe_oc;
+            id<MTLComputePipelineState> pfin = (__bridge id<MTLComputePipelineState>)g_pipe_fin;
+            id<MTLComputePipelineState> pdeq = (__bridge id<MTLComputePipelineState>)g_pipe_dq;
+
+            id<MTLCommandBuffer> cb = [cq2 commandBuffer];
+            int ninit = H * S;
+            {   /* one online-softmax state per (head, row): m=-INF, d=0, AC=0 */
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:pinit];
+                [e setBuffer:AC offset:0 atIndex:0];
+                [e setBuffer:MD offset:0 atIndex:1];
+                [e setBytes:&ninit length:4 atIndex:2];
+                [e setBytes:&hd   length:4 atIndex:3];
+                [e dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)ninit, 1)
+              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [e endEncoding];
+            }
+            for (int kh = KV - 1; kh >= 0; kh--) {
+                int hq0 = kh * group;               /* first query head of group */
+                long rbase = (long)hq0 * S;         /* AC/MD row base            */
+
+                {   /* stack this group's query heads: [G*S, hd] */
+                    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                    [e setComputePipelineState:pgg];
+                    [e setBuffer:QS offset:0 atIndex:0];
+                    [e setBuffer:QT offset:0 atIndex:1];
+                    [e setBytes:&qdim length:4 atIndex:2];
+                    [e setBytes:&hd   length:4 atIndex:3];
+                    [e setBytes:&S    length:4 atIndex:4];
+                    [e setBytes:&hq0  length:4 atIndex:5];
+                    [e dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)rows, 1)
+                  threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
+                    [e endEncoding];
+                }
+                int kbase = kh * L->ctxcap;
+                for (long t = 0; t < nkey; t += ktile) {
+                    long kt = nkey - t; if (kt > ktile) kt = ktile;
+                    int kabs = (int)(k0 + t);
+                    /* dequantize this tile's K and V into the tile staging */
+                    for (int rep = 0; rep < 2; rep++) {
+                    id<MTLComputeCommandEncoder> ed = [cb computeCommandEncoder];
+                    [ed setComputePipelineState:pdeq];
+                    [ed setBuffer:(__bridge id<MTLBuffer>)L->K  offset:0 atIndex:0];
+                    [ed setBuffer:(__bridge id<MTLBuffer>)L->Ks offset:0 atIndex:1];
+                    [ed setBuffer:KF offset:0 atIndex:2];
+                    [ed setBytes:&kabs length:4 atIndex:3];
+                    int kth = (int)kt;
+                    [ed setBytes:&kth  length:4 atIndex:4];
+                    [ed setBytes:&hd   length:4 atIndex:5];
+                    [ed setBytes:&kbase length:4 atIndex:6];
+                    [ed dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)kt, 1)
+                  threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
+                    [ed setBuffer:(__bridge id<MTLBuffer>)L->V  offset:0 atIndex:0];
+                    [ed setBuffer:(__bridge id<MTLBuffer>)L->Vs offset:0 atIndex:1];
+                    [ed setBuffer:KF offset:(NSUInteger)KVD atIndex:2];
+                    [ed dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)kt, 1)
+                  threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
+                    [ed endEncoding];
+                    }
+                    if (getenv("LG_DUMP_STEP")) {
+                        [cb commit];
+                        [cb waitUntilCompleted];
+                        if (!getenv("LG_KF_LATE")) {
+                        char pth[1024];
+                        snprintf(pth, sizeof pth, "%s/LG_kf_t%ld_kh%d.bin", getenv("LG_DUMP_STEP"), t, kh);
+                        FILE *f = fopen(pth, "wb"); if (f) { fwrite([KF contents], 1, (size_t)ktile*hd*4*2, f); fclose(f); }
+                        }
+                        cb = [cq2 commandBuffer];
+                    }
+
+                    MPSMatrix *mq = [[MPSMatrix alloc] initWithBuffer:QT descriptor:dq];
+                    MPSMatrix *mk = [[MPSMatrix alloc] initWithBuffer:KF descriptor:dk];
+                    MPSMatrix *ms = [[MPSMatrix alloc] initWithBuffer:SC descriptor:ds];
+                    [qk encodeToCommandBuffer:cb leftMatrix:mq rightMatrix:mk resultMatrix:ms];
+                    if (getenv("LG_DUMP_STEP")) {
+                        [cb commit];
+                        [cb waitUntilCompleted];
+                        fprintf(stderr, "qk t=%ld kh=%d cb.status=%ld\n", t, kh, (long)cb.status);
+                        cb = [cq2 commandBuffer];
+                        char pth[1024];
+                        snprintf(pth, sizeof pth, "%s/LG_kf_t%ld_kh%d.bin", getenv("LG_DUMP_STEP"), t, kh);
+                        FILE *f = fopen(pth, "wb"); if (f) { fwrite([KF contents], 1, (size_t)ktile*hd*4*2, f); fclose(f); }
+                        snprintf(pth, sizeof pth, "%s/LG_qk_t%ld_kh%d.bin", getenv("LG_DUMP_STEP"), t, kh);
+                        f = fopen(pth, "wb"); if (f) { fwrite([SC contents], 1, (size_t)rows*ktile*4, f); fclose(f); }
+                    }
+
+                    int rrows = (int)rows;
+                    id<MTLComputeCommandEncoder> eo = [cb computeCommandEncoder];
+                    [eo setComputePipelineState:poc];
+                    [eo setBuffer:SC offset:0 atIndex:0];
+                    [eo setBuffer:AC offset:(NSUInteger)(rbase*hd*4) atIndex:1];
+                    [eo setBuffer:MD offset:(NSUInteger)(rbase*8) atIndex:2];
+                    int ktl = (int)ktile;
+                    [eo setBytes:&rrows length:4 atIndex:3];
+                    [eo setBytes:&ktl  length:4 atIndex:4];
+                    [eo setBytes:&kabs length:4 atIndex:5];
+                    [eo setBytes:&pos0 length:4 atIndex:6];
+                    [eo setBytes:&S    length:4 atIndex:7];
+                    [eo setBytes:&hd   length:4 atIndex:8];
+                    int kt2 = (int)kt;
+                    [eo setBytes:&kt2  length:4 atIndex:9];
+                    [eo dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    [eo endEncoding];
+
+                    MPSMatrix *me = [[MPSMatrix alloc] initWithBuffer:SC descriptor:ds];
+                    MPSMatrix *mv = [[MPSMatrix alloc] initWithBuffer:KF offset:(NSUInteger)KVD descriptor:dv];
+                    MPSMatrix *ma = [[MPSMatrix alloc] initWithBuffer:AC offset:(NSUInteger)(rbase*hd*4) descriptor:da];
+                    [pv encodeToCommandBuffer:cb leftMatrix:me rightMatrix:mv resultMatrix:ma];
+                    if (getenv("LG_DUMP_STEP")) {
+                        [cb commit];
+                        [cb waitUntilCompleted];
+                        cb = [cq2 commandBuffer];
+                        char pth[1024];
+                        snprintf(pth, sizeof pth, "%s/LG_sc_t%ld_kh%d.bin", getenv("LG_DUMP_STEP"), t, kh);
+                        FILE *f = fopen(pth, "wb"); if (f) { fwrite([SC contents], 1, (size_t)rows*ktile*4, f); fclose(f); }
+                        snprintf(pth, sizeof pth, "%s/LG_md_t%ld_kh%d.bin", getenv("LG_DUMP_STEP"), t, kh);
+                        f = fopen(pth, "wb"); if (f) { fwrite([MD contents], 1, (size_t)H*S*8, f); fclose(f); }
+                    }
+                }
+                {   /* finalize: out = AC * softplus(gate) / den, straight to ctx */
+                    int rrows = (int)rows;
+                    id<MTLComputeCommandEncoder> ef = [cb computeCommandEncoder];
+                    [ef setComputePipelineState:pfin];
+                    [ef setBuffer:AC offset:(NSUInteger)(rbase*hd*4) atIndex:0];
+                    [ef setBuffer:MD offset:(NSUInteger)(rbase*8) atIndex:1];
+                    [ef setBuffer:GS offset:0 atIndex:2];
+                    [ef setBuffer:OD offset:0 atIndex:3];
+                    [ef setBytes:&qdim  length:4 atIndex:4];
+                    [ef setBytes:&hd    length:4 atIndex:5];
+                    [ef setBytes:&S     length:4 atIndex:6];
+                    [ef setBytes:&H     length:4 atIndex:7];
+                    [ef setBytes:&hq0   length:4 atIndex:8];
+                    long rb = rbase;
+                    [ef setBytes:&rb    length:8 atIndex:9];
+                    [ef setBytes:&rrows length:4 atIndex:10];
+                    [ef dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)rows, 1)
+                  threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
+                    [ef endEncoding];
+                }
+            }
+            double w0 = prof_on() ? CFAbsoluteTimeGetCurrent() : 0;
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status == MTLCommandBufferStatusError) {
+                fprintf(stderr, "tiled: cb error\n");
+                return 0;
+            }
+            if (prof_on()) {
+                g_wall_s += CFAbsoluteTimeGetCurrent() - w0;
+                g_gpu_s  += cb.GPUEndTime - cb.GPUStartTime;
+                g_calls++;
+            }
+            memcpy(ctx_out, [OD contents], (size_t)S*qdim*4);
+            if (getenv("LG_DUMP")) {
+                const char *dir = getenv("LG_DUMP");
+                char path[1024];
+                snprintf(path, sizeof path, "%s/LG_qt.bin", dir);
+                FILE *f = fopen(path, "wb"); if (f) { fwrite([QT contents], 1, (size_t)rows*hd*4, f); fclose(f); }
+                snprintf(path, sizeof path, "%s/LG_kf.bin", dir);
+                f = fopen(path, "wb"); if (f) { fwrite([KF contents], 1, (size_t)ktile*hd*4*2, f); fclose(f); }
+                snprintf(path, sizeof path, "%s/LG_sc.bin", dir);
+                f = fopen(path, "wb"); if (f) { fwrite([SC contents], 1, (size_t)rows*ktile*4, f); fclose(f); }
+                snprintf(path, sizeof path, "%s/LG_md.bin", dir);
+                f = fopen(path, "wb"); if (f) { fwrite([MD contents], 1, (size_t)H*S*8, f); fclose(f); }
+                snprintf(path, sizeof path, "%s/LG_ac.bin", dir);
+                f = fopen(path, "wb"); if (f) { fwrite([AC contents], 1, (size_t)H*S*hd*4, f); fclose(f); }
+                snprintf(path, sizeof path, "%s/LG_od.bin", dir);
+                f = fopen(path, "wb"); if (f) { fwrite([OD contents], 1, (size_t)S*qdim*4, f); fclose(f); }
+                snprintf(path, sizeof path, "%s/LG_gt.bin", dir);
+                f = fopen(path, "wb"); if (f) { fwrite([GS contents], 1, (size_t)S*H*4, f); fclose(f); }
+            }
+        }
+        return 1;
+    }
+
     id<MTLDevice> d = lg_metal_device();
     id<MTLCommandQueue> cq = lg_metal_queue();
 
@@ -455,5 +865,16 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
 
 size_t lg_metal_attn_bytes(int layer) {
     if (!g_al || layer < 0 || layer >= g_al_n || !g_al[layer].K) return 0;
-    return (size_t)g_al[layer].kv * g_al[layer].ctxcap * g_al[layer].hd * 2 * 2;
+    /* Phase 1: the GPU attention footprint is bounded by the chunk, not the
+     * context (see the budget formula in laguna_common.h) and shared across
+     * layers, so this is the same tiled peak the budget reserves. */
+    long H = g_al[layer].hheads ? g_al[layer].hheads : (long)g_al[layer].kv;
+    long hd = g_al[layer].hd;
+    double g_ = H / (double)(g_al[layer].kv ? g_al[layer].kv : 1);
+    double rows = g_ * LG_ATTN_CHUNK;
+    double kt = (384.0 * 1048576.0) / (rows * 4.0);
+    if (kt < 256) kt = 256;
+    if (kt > 65536) kt = 65536;
+    return (size_t)(rows * hd * 4 + H * LG_ATTN_CHUNK * hd * 4 + rows * kt * 4 +
+                    kt * hd * 8 + H * LG_ATTN_CHUNK * 8 + 2.0 * LG_ATTN_CHUNK * H * hd * 4);
 }

@@ -1228,25 +1228,43 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
          *
          * The budget must now reflect:
          *   1. f32 (not f16) -- the staging uses 4 bytes per element
-         *   2. shared (not per-layer) -- peak is max single layer, not sum
-         *   3. full layers need ctx_hint rows (pos0+S == entire prefix), not
-         *      window+chunk. At 262144 with 12 full layers the staging is
-         *      8*128*4*2*262144 = ~2.1 GB (one layer) or ~25 GB (if not shared). */
+         *   2. shared (not per-layer) -- peak is max single layer, not sum.
+         * PHASE 1 (256k-rework): full layers stream keys through the online-
+         * softmax recurrence instead of materializing the whole S x nkey score
+         * matrix, so both the score tile and the K/V staging are bounded by the
+         * CHUNK size, not the context. Sliding layers keep the banded path,
+         * which was already O(window). Peak shared staging is now:
+         *    stacked Q   G*S*hd*4    AC           H*S*hd*4
+         *    score tile  G*S*ktile*4 K/V tile     ktile*hd*4*2
+         *    max/den     H*S*8       q+out copies 2*S*H*hd*4
+         * with ktile clamped so the score tile is ~384 MiB regardless of S.
+         * (The sliding window band is narrower than every term here, so the
+         * same figure covers it; the banded kernels share these buffers.) */
         int gcap = m->ctx_hint > 0 ? m->ctx_hint : 8192;
         int nfull = 0, nslide = 0;
-        for (int i = 0; i < c->n_layers; i++) { if (c->slide[i]) nslide++; else nfull++; }
-        /* Shared staging: peak is the largest single layer's band.
-         * Full layers need the entire prefix (ctx_hint rows).
-         * Sliding layers need window + LG_CHUNK rows.
-         * f32 staging for K and V: band * n_kv * head_dim * 4 (bytes) * 2 (K+V). */
-        double full_band  = nfull > 0 ? (double)gcap : 0.0;
-        double slide_band = (double)(c->window + LG_CHUNK);
-        double band = full_band > slide_band ? full_band : slide_band;
-        double need = band * c->n_kv * c->head_dim * 4 * 2;
+        int hmax = 0, hgt;
+        for (int i = 0; i < c->n_layers; i++) {
+            if (c->slide[i]) nslide++; else nfull++;
+            if (c->heads[i] > hmax) hmax = c->heads[i];
+        }
+        hgt = c->n_kv > 0 ? c->n_kv : 1;
+        double g_ = hmax / (double)hgt;
+        double rows = g_ * LG_CHUNK;
+        double kt = ((384.0 * 1048576.0) / (rows * 4.0));
+        if (kt < 256) kt = 256;
+        if (kt > 65536) kt = 65536;
+        if (kt > gcap) kt = gcap;
+        if (kt < 1) kt = 1;
+        double need = rows * c->head_dim * 4.0                  /* stacked Q     */
+                    + hmax * LG_CHUNK * c->head_dim * 4.0        /* AC            */
+                    + rows * kt * 4.0                            /* score tile    */
+                    + kt * c->head_dim * 8.0                     /* K/V tile      */
+                    + hmax * LG_CHUNK * 8.0                      /* max/den       */
+                    + 2.0 * LG_CHUNK * hmax * c->head_dim * 4.0; /* q + out copies */
         if (need <= m->mem_budget - m->mem_used) {
             m->gpu_attn = 1; m->gpu_attn_cap = gcap;
             m->mem_used += need;
-            fprintf(stderr, "[mem] gpu attention %.2f GB staging (%d full + %d sliding, ctx %d, KV bound in place)\n",
+            fprintf(stderr, "[mem] gpu attention %.2f GB staging (tiled: %d full + %d sliding, ctx %d, KV bound in place)\n",
                     need/1e9, nfull, nslide, gcap);
         } else {
             fprintf(stderr, "[mem] gpu attention needs %.2f GB, not affordable -> CPU\n",
