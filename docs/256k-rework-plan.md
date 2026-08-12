@@ -206,10 +206,21 @@ Target: shrink the ~200 ms/token linear expert term and attention fixed cost.
 Verify: prefill wall and per-phase split at 6k/30k/65k (+256k if safely
 run); memory must stay <20 GB.
 
-## Phase 5 — Full-Metal migration (only if the above cannot meet targets) — ⬜ NOT STARTED
+## Phase 5 — Full-Metal migration (only if the above cannot meet targets) — ✅ INVESTIGATED / DONE (merged bd04e23)
 
 The user has pre-authorized: "You can always fully migrate to metal if this
 requires."
+
+Status: routed experts were migrated to the persistent decode session, but the
+measured result is a regression on this hardware — kept opt-in behind
+`LG_DEC_EXP_ON=1`. At S≤25 (spec batch) rows/expert stays ~1, the TM=64
+simdgroup tile wastes 64x GPU FLOPs, and ~150 ms commit+wait per layer cannot
+amortize across layers (measured default spec-on 12.28 tok/s vs opt-in 0.49).
+The migration's real value landed as three pre-existing decode-path bug fixes
+(`dec_batch_end` silent no-op, `dec_reg_for` 4096→16384 alignment masking the
+whole path, `dec_bind` heap-use-after-free). Decode stays on the CPU oQ-cache
+path; projections/shared expert already ride the persistent Metal GEMV behind
+`LAGUNA_DEC_GPU`.
 
 - If CPU lanes still cap decode (<140 tok/s) or the chunked CPU paths cap
   prefill, move the remaining per-token CPU work (rmsnorm, rope, gate, output
