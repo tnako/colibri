@@ -407,6 +407,10 @@ static int dec_pipeline(void) {
 
 static void *dec_hold(LgDecode *d, void *buf) {
     if (!buf) return NULL;
+    if (getenv("LG_DBG_DEC2")) {
+        const void *isa = *(const void *const *)buf;
+        fprintf(stderr, "[dec] hold %p isa=%p\n", buf, isa);
+    }
     if (d->nrefs == d->cref) {
         int nc = d->cref ? d->cref * 2 : 16;
         void **nr = (void**)realloc(d->refs, (size_t)nc * sizeof(void*));
@@ -416,6 +420,24 @@ static void *dec_hold(LgDecode *d, void *buf) {
     void *h = (void*)CFBridgingRetain((__bridge id<MTLBuffer>)buf);
     d->refs[d->nrefs++] = h;
     return h;
+}
+
+/* Hand a wrap buffer's OWNERSHIP (a CFBridgingRetain'd MTLBuffer) to the
+ * session's refs list so it is released only when the current batch commits.
+ * The wrap cache is keyed by the shard base pointer and a single gemv binds
+ * the same base as W, Sc AND Bi with GROWING byte ranges; growing must not
+ * release a buffer an earlier bind of the same base already returned to the
+ * caller (that pointer would dangle in the pending DecOp). Moving it to refs
+ * keeps every handed-out pointer alive until run(). */
+static void dec_relinquish(LgDecode *d, void *buf) {
+    if (!buf) return;
+    if (d->nrefs == d->cref) {
+        int nc = d->cref ? d->cref * 2 : 16;
+        void **nr = (void**)realloc(d->refs, (size_t)nc * sizeof(void*));
+        if (!nr) { CFRelease((CFTypeRef)buf); return; }
+        d->refs = nr; d->cref = nc;
+    }
+    d->refs[d->nrefs++] = buf;
 }
 
 static DecOp *dec_op(LgDecode *d) {
@@ -437,9 +459,14 @@ static DecOp *dec_op(LgDecode *d) {
  * `write` requests a buffer that reflects GPU writes back to host: only region
  * or no-copy binds qualify. Volatile (per-layer) content is copied in run()
  * so it is still current after the last CPU write before the commit. */
+static int dec_seq = 0;
 static int dec_bind(LgDecode *d, const void *ptr, size_t bytes, int vol, int write,
                     void **buf, size_t *off, int *copy_needed) {
     *buf = NULL; *off = 0; *copy_needed = 0;
+    int seq = ++dec_seq;
+    if (getenv("LG_DBG_DEC2")) fprintf(stderr,
+        "[dec] seq=%d %s ptr=%p bytes=%zu vol=%d write=%d nreg=%d\n",
+        seq, write && vol ? "REGION" : "bind", ptr, bytes, vol, write, d->nreg);
     for (int i = 0; i < d->nreg; i++) {
         DecRegion *r = &d->regs[i];
         uintptr_t b = (uintptr_t)r->host, p = (uintptr_t)ptr;
@@ -449,6 +476,9 @@ static int dec_bind(LgDecode *d, const void *ptr, size_t bytes, int vol, int wri
     }
     int wi = -1;
     for (int i = 0; i < d->nwrap; i++) if (d->wraps[i].ptr == ptr) { wi = i; break; }
+    if (getenv("LG_DBG_DEC2")) fprintf(stderr,
+        "[dec] seq=%d res ptr=%p bytes=%zu nwrap=%d hit=%d\n",
+        seq, ptr, bytes, d->nwrap, wi);
     if (wi < 0) {
         if (d->nwrap == d->cwrap) {
             int nc = d->cwrap ? d->cwrap * 2 : 8;
@@ -467,7 +497,7 @@ static int dec_bind(LgDecode *d, const void *ptr, size_t bytes, int vol, int wri
         id<MTLBuffer> b = [lg_metal_device() newBufferWithBytesNoCopy:(void*)ptr length:len
                                     options:MTLResourceStorageModeShared deallocator:nil];
         if (b) {
-            if (w->buf) CFRelease((CFTypeRef)w->buf);
+            dec_relinquish(d, w->buf);
             w->buf = (void*)CFBridgingRetain(b);
             w->cap = len; w->nocopy = 1; w->copied = 0;
         }
@@ -478,7 +508,7 @@ static int dec_bind(LgDecode *d, const void *ptr, size_t bytes, int vol, int wri
             id<MTLBuffer> b = [lg_metal_device() newBufferWithBytesNoCopy:(void*)ptr length:len
                                         options:MTLResourceStorageModeShared deallocator:nil];
             if (!b) return 0;
-            if (w->buf) CFRelease((CFTypeRef)w->buf);
+            dec_relinquish(d, w->buf);
             w->buf = (void*)CFBridgingRetain(b);
             w->cap = len; w->copied = 0;
         }
@@ -489,7 +519,7 @@ static int dec_bind(LgDecode *d, const void *ptr, size_t bytes, int vol, int wri
         id<MTLBuffer> b = [lg_metal_device() newBufferWithLength:bytes
                                     options:MTLResourceStorageModeShared];
         if (!b) return 0;
-        if (w->buf) CFRelease((CFTypeRef)w->buf);
+        dec_relinquish(d, w->buf);
         w->buf = (void*)CFBridgingRetain(b);
         w->cap = bytes; w->copied = 0;
     }
@@ -597,11 +627,22 @@ int lg_decode_gemv(LgDecode *d, int ry, size_t rOff,
     DecOp *o = dec_op(d);
     if (!o) return 0;
     o->kind = 0;
+    if (getenv("LG_DBG_DEC")) fprintf(stderr,
+        "[dec] gemv ry=%d rOff=%zu x=%p W=%p N=%d K=%d bits=%d gs=%d "
+        "wneed=%zu woff=%zu woff2=%zu wb=%p\n",
+        ry, rOff, x, W, N, K, bits, gs, wneed, woff, woff2, wb);
+    if (getenv("LG_DBG_DEC")) fprintf(stderr,
+        "[dec] pre-hold xb=%p yb=%p wb=%p sb=%p bb=%p ry=%d wbisa=%p\n",
+        xb, (void*)d->regs[ry].buf, wb, sb, bb, ry,
+        wb ? *(void *const *)wb : NULL);
     o->xb = dec_hold(d, xb); if (!o->xb) return 0;
     o->yb = dec_hold(d, d->regs[ry].buf); if (!o->yb) return 0;
     o->wb = dec_hold(d, wb); if (!o->wb) return 0;
     if (sb) { o->sb = dec_hold(d, sb); if (!o->sb) return 0; }
     if (bb) { o->bb = dec_hold(d, bb); if (!o->bb) return 0; }
+    if (getenv("LG_DBG_DEC")) fprintf(stderr,
+        "[dec] dib xb=%p yb=%p wb=%p sb=%p bb=%p ry=%d\n",
+        o->xb, (void*)d->regs[ry].buf, wb, sb, bb, ry);
     o->xoff = xoff; o->yoff = rOff;
     o->woff = woff2 + woff; o->soff = soff2 + soff; o->boff = boff2 + boff;
     o->S = (unsigned)d->S; o->N = (unsigned)N; o->K = (unsigned)K;
@@ -682,6 +723,9 @@ int lg_decode_run(LgDecode *d) {
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
+            if (cb.status == MTLCommandBufferStatusError)
+                fprintf(stderr, "[dec] command buffer error: %s\n",
+                        cb.error ? [[cb.error localizedDescription] UTF8String] : "?");
             ok = (cb.status != MTLCommandBufferStatusError) ? 1 : 0;
         }
         for (int i = 0; i < d->nrefs; i++) CFRelease((CFTypeRef)d->refs[i]);
