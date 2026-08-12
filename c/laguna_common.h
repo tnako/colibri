@@ -468,7 +468,6 @@ static DecReg dec_regs[512]; static int n_dec_regs = 0;
 typedef struct { float *y; float *host; size_t bytes; } DecCopy;
 static DecCopy dec_copies[64]; static int n_dec_copies = 0;
 static int dec_batch_open = 0;
-static int dec_exp_ops = 0;      /* pending routed-expert gemvs (no dec_copies entry) */
 
 static void dec_init(void) {
     if (g_dec) return;
@@ -526,10 +525,9 @@ static int dec_batch_add(float *y, const float *x, const Wt *W, int S, int I, in
 
 /* Commit the batch (ONE command buffer) and copy every enqueued result back. */
 static int dec_batch_end(void) {
-    int n = n_dec_copies + dec_exp_ops;
+    int n = n_dec_copies;
     int ncop = n_dec_copies;
     n_dec_copies = 0;
-    dec_exp_ops = 0;
     dec_batch_open = 0;
     if (n == 0) return 1;
     if (!lg_decode_run(g_dec)) return 0;
@@ -542,59 +540,6 @@ static int dec_batch_end(void) {
 static int dec_mm(float *y, const float *x, const Wt *W, int S, int I, int O) {
     if (!dec_batch_add(y, x, W, S, I, O)) return 0;
     return dec_batch_end();
-}
-
-/* ---- Phase 5: routed experts on the persistent decode session --------------
- * Each decode token routes to topk DISTINCT experts; a token's expert rows are
- * one (token, expert) pair each. So every gemv below is S=1: one begin/run
- * carries gate+up for ALL pairs of the layer, silu is fused CPU-side (same
- * siluf(g)*u as the CPU path), then a second begin/run does the downs. One
- * commit+wait per layer instead of one per expert, and the oQ codes are read
- * straight out of the mmap'd gx slabs (page cache, no slot cache, no fill). */
-static float *dec_exp_host[4]; static size_t dec_exp_cap[4]; static int dec_exp_ry[4];
-static int dec_exp_good = 0;
-/* Allocate+register the 4 scratch regions lazily: [0]=xgather (gtx rows),
- * [1]=gate, [2]=up, [3]=down. maxrows bounds every region. */
-static int dec_exp_alloc(Model *m, int maxrows) {
-    if (dec_exp_good) return 1;
-    int D = m->c.hidden, I = m->c.moe_inter;
-    size_t need[4];
-    need[0] = (size_t)maxrows * D * 4;
-    need[1] = (size_t)maxrows * I * 4;
-    need[2] = (size_t)maxrows * I * 4;
-    need[3] = (size_t)maxrows * D * 4;
-    for (int i = 0; i < 4; i++) {
-        void *p = NULL;
-        if (posix_memalign(&p, 16384, need[i])) return 0;
-        int ry = lg_decode_region(g_dec, (float*)p, need[i]);
-        if (ry < 0) { free(p); return 0; }
-        dec_exp_host[i] = (float*)p; dec_exp_cap[i] = need[i]; dec_exp_ry[i] = ry;
-    }
-    dec_exp_good = 1;
-    return 1;
-}
-/* Enqueue one routed-expert gemv at S=1 into the open decode batch. Output goes
- * to region ry at byte offset rOff (per-pair slot); x must point at a row of
- * the region-0 gather host. Uses the bf16-scale OQBF16 slab layout (gx). */
-static int dec_exp_add(int ry, size_t rOff, const float *x,
-                       const void *W, size_t woff, const void *Sc, size_t soff,
-                       const void *Bi, size_t boff, int N, int K, int bits, int gs) {
-    /* Wrap page-ALIGNED bases so dec_bind's no-copy path engages (a shard-base
-     * wrap sized to the full tensor offset made 3GB no-copy buffers that OOM'd
-     * the command buffer; a bare tensor-start wrap is unaligned and fell into
-     * the copy path, re-copying MBs per gemv). Fold the alignment delta into
-     * each offset so the effective address is unchanged. */
-    uintptr_t wp = (uintptr_t)W, sp = (uintptr_t)Sc, bp = (uintptr_t)Bi;
-    uintptr_t pg = (uintptr_t)getpagesize();
-    uintptr_t wpad = wp & (pg - 1), spad = sp & (pg - 1), bpad = bp & (pg - 1);
-    if (!dec_batch_open) { lg_decode_begin(g_dec, 1); dec_batch_open = 1; }
-    if (!lg_decode_gemv(g_dec, ry, rOff, x,
-                        (const void*)(wp - wpad), woff + wpad,
-                        (const void*)(sp - spad), soff + spad,
-                        (const void*)(bp - bpad), boff + bpad,
-                        N, K, bits, gs, LG_DEC_OQBF16)) return 0;
-    dec_exp_ops++;
-    return 1;
 }
 #endif
 
@@ -2059,30 +2004,28 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int64_t npair = (int64_t)S*K;
     int64_t *visit = NULL;         /* streaming visit order; NULL on the resident path */
 
-    /* ---- ROUTED EXPERTS ON THE PERSISTENT DECODE SESSION (Phase 5) ---------
-     * Experimental (opt-in LG_DEC_EXP_ON=1), DECODE-ONLY (S==1): routes the
-     * routed-expert work through the SAME LgDecode session as attention/shared.
-     * Each (token,expert) pair is one S=1 gemv into the pair-covered scratch
-     * regions, the oQ codes are read straight out of the mmap'd gx slabs (page
-     * cache, no slot cache, no fill), gate+up run in one commit, silu is fused
-     * CPU-side (siluf(g)*u, exactly as the CPU path), and down runs in a second
-     * commit. Falls back to the CPU paths below on any failure.
+    /* ---- BATCHED ROUTED-EXPERT DECODE (Phase 5) -----------------------------
+     * Experimental (opt-in LG_DEC_EXP_ON=1), DECODE-ONLY (S==1): routes a
+     * layer's routed-expert pairs through the same one-dispatch-per-matrix
+     * kernel as prefill (lg_metal_moe_layer): pairs sorted by expert, ONE
+     * compacted tile list, gate+up+silu+down in ONE command buffer, one
+     * commit+wait per layer instead of 24 tiny S=1 gemvs + 2 waits. The oQ
+     * codes are read straight out of the mmap'd gx slabs (page cache, no slot
+     * cache, no fill). Falls back to the CPU paths below on any failure.
      *
-     * MEASURED 2026-08-12 (Laguna-XS-2.1-oQ2, 40-token decode A/B): this path
-     * is a THROUGHPUT REGRESSION vs the CPU oQ-cache path -- 1.88 vs 3.25 tok/s,
-     * expert-mm 15.2s vs 3.8s, despite fill collapsing 4.1s->1.6s. At S=1 with
-     * topk=8 the layer has 24 tiny scalar gemvs and two commit+wait rounds per
-     * layer (x39 layers x per token), which is precisely the S=1 worst regime
-     * the grouped GPU path below documents against (31 GFLOP/s at 8 rows). The
-     * CPU path wins because its slot cache is resident-hot at decode. Kept
-     * opt-in behind LG_DEC_EXP_ON pending a batched multi-row kernel. */
+     * MEASURED 2026-08-12 (Laguna-XS-2.1-oQ2, 40-token decode A/B): the old
+     * per-pair S=1 loop was a THROUGHPUT REGRESSION vs the CPU oQ-cache path
+     * (1.88 vs 3.25 tok/s). The batched kernel is identical in shape to
+     * prefill, so rows/expert stays ~topk at pure S=1 (the kernel's 31 GFLOP/s
+     * worst regime) -- the win only appears when the ngram spec-verify batch
+     * (LG_SPEC_MAX=24 tokens) rides the same path and rows/expert reach TM=64.
+     * Kept opt-in behind LG_DEC_EXP_ON. */
 #ifdef LAGUNA_METAL
     if (m->gx && m->experts == EXP_OQ && g_dec_on && !omp_in_parallel() &&
         S == 1 && npair <= 4096 && getenv("LG_DEC_EXP_ON")) {
         int bits = m->oq.bits ? m->oq.bits : 2, gs = m->oq.gs ? m->oq.gs : 64;
         if (bits >= 1 && bits <= 8 && (gs * bits) % 32 == 0 &&
-            D % gs == 0 && I % gs == 0 &&
-            dec_exp_alloc(m, (int)npair)) {
+            D % gs == 0 && I % gs == 0) {
             int64_t *vis = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
             int *cnt = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
             memset(cnt, 0, (size_t)(E + 1) * sizeof(int));
@@ -2092,74 +2035,65 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             memcpy(estart, cnt, (size_t)(E + 1) * sizeof(int));
             for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
 
-            double te = now_s();
-            int dbg = getenv("LG_DBG_PHASE") != NULL;
-            /* gather each pair's token row, ordered by expert (visit order) */
-            for (int64_t r = 0; r < npair; r++) {
-                int64_t t = vis[r];
-                memcpy(dec_exp_host[0] + (size_t)r * D, x + (t / K) * D,
-                       (size_t)D * sizeof(float));
-            }
             GpuExp *G = &m->gx[(size_t)layer * 3];
-            size_t wwordsGU = ((size_t)D * bits + 31) / 32;
-            size_t nggU = (size_t)(D / gs);
-            size_t wslabGU = (size_t)G[0].N * wwordsGU * 4;
-            size_t sslabGU = (size_t)G[0].N * nggU * 2;
-            size_t wwordsD = ((size_t)I * bits + 31) / 32;
-            size_t nggD = (size_t)(I / gs);
-            size_t wslabD = (size_t)G[2].N * wwordsD * 4;
-            size_t sslabD = (size_t)G[2].N * nggD * 2;
-/* runs 1+2: gate and up for every pair (S=1 each) */
-            int ok = 1;
-            dec_batch_end();                 /* clear any partial batch */
-            for (int64_t r = 0; r < npair && ok; r++) {
-                int64_t t = vis[r];
-                int eid = idx[t];
-                const float *xr = dec_exp_host[0] + (size_t)r * D;
-                ok = dec_exp_add(dec_exp_ry[1], (size_t)r * I * 4, xr,
-                                 (const char*)G[0].wbase + G[0].woff, (size_t)eid * wslabGU,
-                                 (const char*)G[0].sbase + G[0].soff, (size_t)eid * sslabGU,
-                                 (const char*)G[0].bbase + G[0].boff, (size_t)eid * sslabGU,
-                                 (int)G[0].N, D, bits, gs) &&
-                     dec_exp_add(dec_exp_ry[2], (size_t)r * I * 4, xr,
-                                 (const char*)G[1].wbase + G[1].woff, (size_t)eid * wslabGU,
-                                 (const char*)G[1].sbase + G[1].soff, (size_t)eid * sslabGU,
-                                 (const char*)G[1].bbase + G[1].boff, (size_t)eid * sslabGU,
-                                 (int)G[1].N, D, bits, gs);
+            void *hx = lg_metal_scratch(0, (size_t)npair * D * sizeof(float));
+            void *hg = lg_metal_scratch(1, (size_t)npair * I * sizeof(float));
+            void *hu = lg_metal_scratch(2, (size_t)npair * I * sizeof(float));
+            void *hh = lg_metal_scratch(3, (size_t)npair * D * sizeof(float));
+            float *xb = (float*)lg_metal_scratch_ptr(hx);
+            float *gb = (float*)lg_metal_scratch_ptr(hg);
+            float *ub = (float*)lg_metal_scratch_ptr(hu);
+            float *hb = (float*)lg_metal_scratch_ptr(hh);
+            void *ho = lg_metal_scratch(4, (size_t)(E + 1) * sizeof(unsigned));
+            unsigned *offs = (unsigned*)lg_metal_scratch_ptr(ho);
+            int ntiles = 0;
+            if (offs) {
+                for (int e = 0; e <= E; e++) offs[e] = (unsigned)estart[e];
+                for (int e = 0; e < E; e++)
+                    ntiles += (estart[e+1] - estart[e] + LG_EXP_TM - 1) / LG_EXP_TM;
             }
-            ok = ok && dec_batch_end();
-            if (ok) {
-                /* silu fusion in place on the gate region */
-                for (int64_t i = 0; i < npair * I; i++)
-                    dec_exp_host[1][i] = siluf(dec_exp_host[1][i]) * dec_exp_host[2][i];
-                /* run 3: down for every pair (x = fused gate, S=1 each) */
-                for (int64_t r = 0; r < npair && ok; r++) {
-                    int64_t t = vis[r];
-                    int eid = idx[t];
-                    const float *xr = dec_exp_host[1] + (size_t)r * I;
-                    ok = dec_exp_add(dec_exp_ry[3], (size_t)r * D * 4, xr,
-                                     (const char*)G[2].wbase + G[2].woff, (size_t)eid * wslabD,
-                                     (const char*)G[2].sbase + G[2].soff, (size_t)eid * sslabD,
-                                     (const char*)G[2].bbase + G[2].boff, (size_t)eid * sslabD,
-                                     (int)G[2].N, I, bits, gs);
+            void *ht = lg_metal_scratch(5, (size_t)ntiles * 2 * sizeof(unsigned));
+            unsigned *tiles = (unsigned*)lg_metal_scratch_ptr(ht);
+            if (offs && tiles) {
+                int ti = 0;
+                for (int e = 0; e < E; e++) {
+                    int nr = estart[e+1] - estart[e];
+                    for (int r0 = 0; r0 < nr; r0 += LG_EXP_TM) {
+                        tiles[ti*2] = (unsigned)e; tiles[ti*2+1] = (unsigned)r0; ti++;
+                    }
                 }
-                ok = ok && dec_batch_end();
             }
-            if (dbg) fprintf(stderr,
-                "[phase] L%2d dec-exp %.1fms npair=%lld ok=%d\n",
-                layer, (now_s()-te)*1000, (long long)npair, ok);
-            if (ok) {
-                for (int64_t r = 0; r < npair; r++) {
-                    int64_t t = vis[r];
-                    int s = (int)(t / K), kk = (int)(t % K);
-                    float sc = wgt[(int64_t)s*K + kk];
-                    float *os = out + (int64_t)s*D, *hr = dec_exp_host[3] + (size_t)r * D;
-                    for (int d = 0; d < D; d++) os[d] += sc * hr[d];
+            if (xb && gb && ub && hb && offs && tiles && ntiles > 0) {
+                for (int64_t r = 0; r < npair; r++)
+                    memcpy(xb + r*D, x + (vis[r]/K)*D, (size_t)D*sizeof(float));
+                size_t wslabGU = (size_t)G[0].N * (((size_t)D*bits+31)/32) * 4;
+                size_t sslabGU = (size_t)G[0].N * (D/gs) * 2;
+                size_t wslabD  = (size_t)G[2].N * (((size_t)I*bits+31)/32) * 4;
+                size_t sslabD  = (size_t)G[2].N * (I/gs) * 2;
+                double te = now_s();
+                int dbg = getenv("LG_DBG_PHASE") != NULL;
+                int ok = lg_metal_moe_layer(
+                        G[0].wmap,G[0].woff,G[0].smap,G[0].soff,G[0].bmap,G[0].boff,
+                        G[1].wmap,G[1].woff,G[1].smap,G[1].soff,G[1].bmap,G[1].boff,
+                        G[2].wmap,G[2].woff,G[2].smap,G[2].soff,G[2].bmap,G[2].boff,
+                        hx,hg,hu,hh,ho,ht, ntiles,(int)npair,D,I,gs,bits,
+                        wslabGU,sslabGU,wslabD,sslabD);
+                if (dbg) fprintf(stderr,
+                    "[phase] L%2d dec-moe %.1fms ntiles=%d npair=%lld ok=%d\n",
+                    layer, (now_s()-te)*1000, ntiles, (long long)npair, ok);
+                if (ok) {
+                    for (int64_t r = 0; r < npair; r++) {
+                        int64_t t = vis[r];
+                        int s = (int)(t / K), kk = (int)(t % K);
+                        float sc = wgt[(int64_t)s*K + kk];
+                        float *os = out + (int64_t)s*D, *hr = hb + r*D;
+                        for (int d = 0; d < D; d++) os[d] += sc * hr[d];
+                    }
+                    m->t_expert += now_s() - te;
+                    m->hits += npair;
+                    visit = NULL;
+                    goto moe_shared;
                 }
-                m->t_expert += now_s() - te;
-                m->hits += npair;
-                visit = NULL;
-                goto moe_shared;
             }
             memset(out, 0, (size_t)S*D*sizeof(float));
         }
