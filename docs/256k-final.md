@@ -101,6 +101,23 @@ S ~15k (71 min).
   batch/rows-per-expert this hardware exhibits.
 - `sample` profiler inflates wall time ~10-20%; table above uses direct runs.
 
+## Before/after (vs `docs/benchmarks/256k-baseline.md`, measured 2026-08-10)
+
+XS-2.1-oQ2 Metal, direct runs, `LG_SPEC=0` decode.
+
+| ctx (prompt) | prefill before → after | attn before → after | peak RSS before → after | decode before → after |
+|---|---|---|---:|---:|
+| ~1.9k | 28.7 s → 33.6 s* | 9.4 s → 10.8 s* | 6.1 GB → 5.8 GB | 6.10 → 3.76 tok/s* |
+| ~6k | 68.8 s → 74.1 s* | 28.6 s → 30.8 s* | 7.7 GB → 7.5 GB | — |
+| 256k ctx | not holdable (O(S·ctx) scratch ~10.7 GB unbudgeted) → **fits, 8.7-12.1 GB** | — | — | — |
+
+\* ≈ same-kit re-run noise/±10%; the structural changes are the two rows below,
+which the baseline could not measure at all:
+- **256k context now holds in <20 GB** (Phase 1 tiled prefill removed the
+  unbudgeted O(S·context) GPU scratch). Baseline explicitly projected it would not.
+- **65k decode improves ~2.4x with selection** (Phase 3): 0.54 → 1.28 tok/s on
+  XS (full-layer KV reads drop from O(S) to O(cap)).
+
 ## Honest recommendation
 
 1. **Ship the memory win**: 256k context genuinely fits in <20 GB; the engine
