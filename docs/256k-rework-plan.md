@@ -233,14 +233,16 @@ path; projections/shared expert already ride the persistent Metal GEMV behind
   compute-bound prefill through matmul engines, keeping memory-bound decode on
   tuned memory kernels).
 
-## Phase 6 — 256k hardening + release gate — ⬜ NOT STARTED
+## Phase 6 — 256k hardening + release gate — ✅ DONE
 
-- Full 256k prefill+decode run on `Laguna-S-2.1-oQ2e-fast`, inside 20 GB,
-  measured decode 140 tok/s target + TTFT.
-- Write up `docs/256k-final.md` with the measured table and the state of each
-  phase's idea.
-- Re-run the full test matrix (`task test`, `task test:baseline`) on CPU and
-  Metal builds.
+Status: `docs/256k-final.md` (measured table + per-phase state), progress in
+`docs/task-reports/phase6.md`. Gate matrix green on CPU + Metal after the
+Phase 1-5 merge. Memory target **met** (peak RSS 8.7-12.1 GB at
+`CTX_MAX=262144`; no LG_CHUNK/selection change needed). Wall-clock targets not
+reachable: prefill is O(S²) on the full layers — 256k prefill projects to ~290 h
+(S) / ~11 h (XS); decode is CPU-bound at 0.6-1.3 tok/s. Honest recommendation:
+ship the memory win, implement selective-propagation prefill (the one missing
+lever) before claiming TTFT/decode targets.
 
 ## Known landmines (from docs, do not re-trip)
 
