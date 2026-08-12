@@ -96,7 +96,8 @@ typedef struct {
 /* One expert weight tensor mapped for the GPU: the whole [E, N, K] slab, plus
  * its bf16 scales and biases. Nothing is copied; these are addresses inside the
  * mmap'd shard. */
-typedef struct { void *wmap, *smap, *bmap; size_t woff, soff, boff; int N, Kd; } GpuExp;
+typedef struct { void *wmap, *smap, *bmap; size_t woff, soff, boff; int N, Kd;
+                 void *wbase, *sbase, *bbase; } GpuExp;
 
 typedef struct {
     int hidden, n_layers, vocab;
@@ -462,7 +463,7 @@ static int g_dec_on = 0;
 #define LG_DEC_SMAX 25          /* spec batch (LG_SPEC_MAX=24) + 1 */
 
 typedef struct { const Wt *w; float *host; int ry; } DecReg;
-static DecReg dec_regs[64]; static int n_dec_regs = 0;
+static DecReg dec_regs[512]; static int n_dec_regs = 0;
 
 typedef struct { float *y; float *host; size_t bytes; } DecCopy;
 static DecCopy dec_copies[64]; static int n_dec_copies = 0;
@@ -478,14 +479,22 @@ static void dec_init(void) {
     if (g_dec_on) fprintf(stderr, "[metal] decode GEMV path active (LAGUNA_DEC_GPU=1)\n");
 }
 
-/* One persistent page-aligned region per oQ weight, lazily. */
+/* One persistent page-aligned region per oQ weight, lazily. The cache is keyed
+ * on the OWNER's Wt* (&l->q etc.), not a by-value copy: dec_batch_add used to
+ * take Wt by value and key on &local, which every call site mapped to the same
+ * stack slot, so q/k/v/gt shared one region and silently overwrote each other
+ * (Phase 2's parity .mm bypassed dec_reg_for with an explicit ry, so it never
+ * caught this -- end-to-end decode was garbage but "parity green"). */
 static int dec_reg_for(const Wt *w, int Smax, int *ry, float **host) {
     for (int i = 0; i < n_dec_regs; i++)
         if (dec_regs[i].w == w) { *ry = dec_regs[i].ry; *host = dec_regs[i].host; return 1; }
-    if (n_dec_regs == 64) return 0;
+    if (n_dec_regs == 512) return 0;
     size_t bytes = (size_t)Smax * w->rows * 4;
     void *p = NULL;
-    if (posix_memalign(&p, 4096, bytes)) return 0;
+    /* lg_decode_region demands NSPageSize() alignment (16384 on arm64, 4096 on
+     * x86); anything less is rejected and the matrix silently falls back to
+     * CPU. 16384-aligned covers both. */
+    if (posix_memalign(&p, 16384, bytes)) return 0;
     int r = lg_decode_region(g_dec, (float*)p, bytes);
     if (r < 0) { free(p); return 0; }
     dec_regs[n_dec_regs].w = w; dec_regs[n_dec_regs].host = (float*)p; dec_regs[n_dec_regs].ry = r;
@@ -496,17 +505,18 @@ static int dec_reg_for(const Wt *w, int Smax, int *ry, float **host) {
 /* Enqueue y[S,O] = x @ dequant(W)^T into the current layer batch. Returns 1 if
  * enqueued (caller must dec_batch_end to run + copy back), 0 if this matrix
  * must stay on the CPU matmul_oq path (no Metal, flag off, not oQ, shape not
- * representable, or this would be the 65th matrix of the batch). */
-static int dec_batch_add(float *y, const float *x, Wt W, int S, int I, int O) {
-    if (!g_dec_on || !W.qbits) return 0;
+ * representable, or this would be the 65th matrix of the batch). W is a
+ * STABLE pointer to the caller's matrix (e.g. &l->q), used as the region key. */
+static int dec_batch_add(float *y, const float *x, const Wt *W, int S, int I, int O) {
+    if (!g_dec_on || !W->qbits) return 0;
     if (S < 1 || S > LG_DEC_SMAX) return 0;
-    if (I != W.in || O != W.rows) return 0;
+    if (I != W->in || O != W->rows) return 0;
     if (n_dec_copies == 64) return 0;
     int ry; float *host;
-    if (!dec_reg_for(&W, LG_DEC_SMAX, &ry, &host)) return 0;
+    if (!dec_reg_for(W, LG_DEC_SMAX, &ry, &host)) return 0;
     if (!dec_batch_open) { lg_decode_begin(g_dec, S); dec_batch_open = 1; }
-    if (!lg_decode_gemv(g_dec, ry, 0, x, W.q32, 0, W.qs, 0, W.qb, 0,
-                        W.rows, W.in, W.qbits, W.gs, LG_DEC_OQF32)) return 0;
+    if (!lg_decode_gemv(g_dec, ry, 0, x, W->q32, 0, W->qs, 0, W->qb, 0,
+                        W->rows, W->in, W->qbits, W->gs, LG_DEC_OQF32)) return 0;
     dec_copies[n_dec_copies].y = y; dec_copies[n_dec_copies].host = host;
     dec_copies[n_dec_copies].bytes = (size_t)S * O * 4;
     n_dec_copies++;
@@ -516,17 +526,18 @@ static int dec_batch_add(float *y, const float *x, Wt W, int S, int I, int O) {
 /* Commit the batch (ONE command buffer) and copy every enqueued result back. */
 static int dec_batch_end(void) {
     int n = n_dec_copies;
+    int ncop = n_dec_copies;
     n_dec_copies = 0;
     dec_batch_open = 0;
     if (n == 0) return 1;
     if (!lg_decode_run(g_dec)) return 0;
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < ncop; i++)
         memcpy(dec_copies[i].y, dec_copies[i].host, dec_copies[i].bytes);
     return 1;
 }
 
 /* Convenience: one matrix through the decode path (run immediately). */
-static int dec_mm(float *y, const float *x, Wt W, int S, int I, int O) {
+static int dec_mm(float *y, const float *x, const Wt *W, int S, int I, int O) {
     if (!dec_batch_add(y, x, W, S, I, O)) return 0;
     return dec_batch_end();
 }
@@ -1026,6 +1037,7 @@ static int gpu_experts_map(Model *m) {
             g->bmap = lg_metal_map(bb, bl);
             if (!g->wmap || !g->smap || !g->bmap) { free(m->gx); m->gx=NULL; return 0; }
             g->woff = wo; g->soff = so; g->boff = bo;
+            g->wbase = wb; g->sbase = sb; g->bbase = bb;
             st_tensor *t = st_find(&m->S, wn);
             g->N  = (int)t->shape[1];
             g->Kd = w == 2 ? c->moe_inter : c->hidden;
@@ -1630,10 +1642,10 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * CPU path (parity-tested in c/tests/decode_gemv_parity.mm). */
 #ifdef LAGUNA_METAL
     if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on &&
-        dec_batch_add(q, x, l->q, S, D, qdim) &&
-        dec_batch_add(k, x, l->k, S, D, kvdim) &&
-        dec_batch_add(vv, x, l->v, S, D, kvdim) &&
-        dec_batch_add(gt, x, l->g, S, D, H)) {
+        dec_batch_add(q, x, &l->q, S, D, qdim) &&
+        dec_batch_add(k, x, &l->k, S, D, kvdim) &&
+        dec_batch_add(vv, x, &l->v, S, D, kvdim) &&
+        dec_batch_add(gt, x, &l->g, S, D, H)) {
         dec_batch_end();
     } else {
         dec_batch_end();                     /* clear any partial batch */
@@ -1911,7 +1923,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
 attn_out: ;   /* empty statement: a label must precede a statement, not a decl */
 #endif
 #ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(out, ctx, l->o, S, qdim, D)) {
+    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(out, ctx, &l->o, S, qdim, D)) {
         /* o_proj ran on the decode path */
     } else
 #endif
@@ -1925,8 +1937,8 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
 #ifdef LAGUNA_METAL
     if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on &&
-        dec_batch_add(g, x, l->dg, S, D, I) &&
-        dec_batch_add(u, x, l->du, S, D, I)) {
+        dec_batch_add(g, x, &l->dg, S, D, I) &&
+        dec_batch_add(u, x, &l->du, S, D, I)) {
         dec_batch_end();
     } else {
         dec_batch_end();
@@ -1939,7 +1951,7 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
 #endif
     for (int64_t i = 0; i < (int64_t)S*I; i++) g[i] = siluf(g[i]) * u[i];
 #ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(out, g, l->dd, S, I, D)) {
+    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(out, g, &l->dd, S, I, D)) {
         /* dd ran on the decode path */
     } else
 #endif
@@ -1991,6 +2003,102 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
     int64_t npair = (int64_t)S*K;
     int64_t *visit = NULL;         /* streaming visit order; NULL on the resident path */
+
+    /* ---- BATCHED ROUTED-EXPERT DECODE (Phase 5) -----------------------------
+     * Experimental (opt-in LG_DEC_EXP_ON=1), DECODE-ONLY (S==1): routes a
+     * layer's routed-expert pairs through the same one-dispatch-per-matrix
+     * kernel as prefill (lg_metal_moe_layer): pairs sorted by expert, ONE
+     * compacted tile list, gate+up+silu+down in ONE command buffer, one
+     * commit+wait per layer instead of 24 tiny S=1 gemvs + 2 waits. The oQ
+     * codes are read straight out of the mmap'd gx slabs (page cache, no slot
+     * cache, no fill). Falls back to the CPU paths below on any failure.
+     *
+     * MEASURED 2026-08-12 (Laguna-XS-2.1-oQ2, 40-token decode A/B): the old
+     * per-pair S=1 loop was a THROUGHPUT REGRESSION vs the CPU oQ-cache path
+     * (1.88 vs 3.25 tok/s). The batched kernel is identical in shape to
+     * prefill, so rows/expert stays ~topk at pure S=1 (the kernel's 31 GFLOP/s
+     * worst regime) -- the win only appears when the ngram spec-verify batch
+     * (LG_SPEC_MAX=24 tokens) rides the same path and rows/expert reach TM=64.
+     * Kept opt-in behind LG_DEC_EXP_ON. */
+#ifdef LAGUNA_METAL
+    if (m->gx && m->experts == EXP_OQ && g_dec_on && !omp_in_parallel() &&
+        S == 1 && npair <= 4096 && getenv("LG_DEC_EXP_ON")) {
+        int bits = m->oq.bits ? m->oq.bits : 2, gs = m->oq.gs ? m->oq.gs : 64;
+        if (bits >= 1 && bits <= 8 && (gs * bits) % 32 == 0 &&
+            D % gs == 0 && I % gs == 0) {
+            int64_t *vis = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
+            int *cnt = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
+            memset(cnt, 0, (size_t)(E + 1) * sizeof(int));
+            for (int64_t t = 0; t < npair; t++) cnt[idx[t] + 1]++;
+            for (int e = 0; e < E; e++) cnt[e+1] += cnt[e];
+            int *estart = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
+            memcpy(estart, cnt, (size_t)(E + 1) * sizeof(int));
+            for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
+
+            GpuExp *G = &m->gx[(size_t)layer * 3];
+            void *hx = lg_metal_scratch(0, (size_t)npair * D * sizeof(float));
+            void *hg = lg_metal_scratch(1, (size_t)npair * I * sizeof(float));
+            void *hu = lg_metal_scratch(2, (size_t)npair * I * sizeof(float));
+            void *hh = lg_metal_scratch(3, (size_t)npair * D * sizeof(float));
+            float *xb = (float*)lg_metal_scratch_ptr(hx);
+            float *gb = (float*)lg_metal_scratch_ptr(hg);
+            float *ub = (float*)lg_metal_scratch_ptr(hu);
+            float *hb = (float*)lg_metal_scratch_ptr(hh);
+            void *ho = lg_metal_scratch(4, (size_t)(E + 1) * sizeof(unsigned));
+            unsigned *offs = (unsigned*)lg_metal_scratch_ptr(ho);
+            int ntiles = 0;
+            if (offs) {
+                for (int e = 0; e <= E; e++) offs[e] = (unsigned)estart[e];
+                for (int e = 0; e < E; e++)
+                    ntiles += (estart[e+1] - estart[e] + LG_EXP_TM - 1) / LG_EXP_TM;
+            }
+            void *ht = lg_metal_scratch(5, (size_t)ntiles * 2 * sizeof(unsigned));
+            unsigned *tiles = (unsigned*)lg_metal_scratch_ptr(ht);
+            if (offs && tiles) {
+                int ti = 0;
+                for (int e = 0; e < E; e++) {
+                    int nr = estart[e+1] - estart[e];
+                    for (int r0 = 0; r0 < nr; r0 += LG_EXP_TM) {
+                        tiles[ti*2] = (unsigned)e; tiles[ti*2+1] = (unsigned)r0; ti++;
+                    }
+                }
+            }
+            if (xb && gb && ub && hb && offs && tiles && ntiles > 0) {
+                for (int64_t r = 0; r < npair; r++)
+                    memcpy(xb + r*D, x + (vis[r]/K)*D, (size_t)D*sizeof(float));
+                size_t wslabGU = (size_t)G[0].N * (((size_t)D*bits+31)/32) * 4;
+                size_t sslabGU = (size_t)G[0].N * (D/gs) * 2;
+                size_t wslabD  = (size_t)G[2].N * (((size_t)I*bits+31)/32) * 4;
+                size_t sslabD  = (size_t)G[2].N * (I/gs) * 2;
+                double te = now_s();
+                int dbg = getenv("LG_DBG_PHASE") != NULL;
+                int ok = lg_metal_moe_layer(
+                        G[0].wmap,G[0].woff,G[0].smap,G[0].soff,G[0].bmap,G[0].boff,
+                        G[1].wmap,G[1].woff,G[1].smap,G[1].soff,G[1].bmap,G[1].boff,
+                        G[2].wmap,G[2].woff,G[2].smap,G[2].soff,G[2].bmap,G[2].boff,
+                        hx,hg,hu,hh,ho,ht, ntiles,(int)npair,D,I,gs,bits,
+                        wslabGU,sslabGU,wslabD,sslabD);
+                if (dbg) fprintf(stderr,
+                    "[phase] L%2d dec-moe %.1fms ntiles=%d npair=%lld ok=%d\n",
+                    layer, (now_s()-te)*1000, ntiles, (long long)npair, ok);
+                if (ok) {
+                    for (int64_t r = 0; r < npair; r++) {
+                        int64_t t = vis[r];
+                        int s = (int)(t / K), kk = (int)(t % K);
+                        float sc = wgt[(int64_t)s*K + kk];
+                        float *os = out + (int64_t)s*D, *hr = hb + r*D;
+                        for (int d = 0; d < D; d++) os[d] += sc * hr[d];
+                    }
+                    m->t_expert += now_s() - te;
+                    m->hits += npair;
+                    visit = NULL;
+                    goto moe_shared;
+                }
+            }
+            memset(out, 0, (size_t)S*D*sizeof(float));
+        }
+    }
+#endif
 
     /* ---- GPU PATH (LAGUNA-FORK) --------------------------------------------
      * Weights are mmap'd, not resident: the kernel dequantizes 2-bit oQ codes
@@ -2343,8 +2451,8 @@ moe_shared:
     float *sg = afloat((int64_t)S*SI), *su = afloat((int64_t)S*SI), *sd = afloat((int64_t)S*D);
 #ifdef LAGUNA_METAL
     if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on &&
-        dec_batch_add(sg, x, l->sh_g, S, D, SI) &&
-        dec_batch_add(su, x, l->sh_u, S, D, SI)) {
+        dec_batch_add(sg, x, &l->sh_g, S, D, SI) &&
+        dec_batch_add(su, x, &l->sh_u, S, D, SI)) {
         dec_batch_end();
     } else {
         dec_batch_end();
@@ -2357,7 +2465,7 @@ moe_shared:
 #endif
     for (int64_t i = 0; i < (int64_t)S*SI; i++) sg[i] = siluf(sg[i]) * su[i];
 #ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(sd, sg, l->sh_d, S, SI, D)) {
+    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(sd, sg, &l->sh_d, S, SI, D)) {
         /* sh_d ran on the decode path */
     } else
 #endif
