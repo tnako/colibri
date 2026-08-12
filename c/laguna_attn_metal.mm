@@ -224,7 +224,10 @@ kernel void online_chunk(device float* Sc  [[buffer(0)]],
         red[0] = g; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     cmax = red[0];
-    if (!(cmax > -1.0e35f)) return;       /* nothing valid in this tile        */
+    if (!(cmax > -1.0e35f)) {         /* nothing valid in this tile          */
+        for (int c = int(lane); c < kt; c += int(W)) sc[c] = 0.0f;
+        return;
+    }
 
     float m = MD[(long)r*2 + 0], d = MD[(long)r*2 + 1];
     float nm = m > cmax ? m : cmax;
@@ -252,6 +255,22 @@ kernel void online_chunk(device float* Sc  [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     MD[(long)r*2 + 0] = m;
     MD[(long)r*2 + 1] = d + red[0];
+}
+
+/* PHASE 7 (LAGUNA-FORK): selective-prefill in-tile mask. After the QK GEMM
+ * writes a score tile, zero every column that the shared selection index does
+ * NOT contain to -INF, so online_chunk folds exp(-inf)=0 for dropped keys and
+ * the PV GEMM contributes nothing for them -- exactly the CPU selection-walk's
+ * "ignore non-selected positions" semantics. `mask` is one byte per tile column
+ * (1 = selected). Run only on tiles that contain at least one selected column. */
+kernel void zero_unselected(device float* Sc    [[buffer(0)]],
+                            device const uchar* mask [[buffer(1)]],
+                            constant int& rows  [[buffer(2)]],
+                            constant int& kt    [[buffer(3)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    int c = int(gid.x), r = int(gid.y);
+    if (r >= rows) return;
+    if (!mask[c]) Sc[(long)r*kt + c] = -INFINITY;
 }
 
 /* Finalize one group's accumulated rows: out[s*qdim + hq*hd + d] =
@@ -308,12 +327,15 @@ typedef struct {
  * and the gather/scatter need custom shaders. */
 static void *g_pipe_sm = NULL, *g_pipe_gq = NULL, *g_pipe_so = NULL, *g_pipe_dq = NULL;
 static void *g_pipe_gg = NULL, *g_pipe_init = NULL, *g_pipe_oc = NULL, *g_pipe_fin = NULL;
+static void *g_pipe_zm = NULL;   /* PHASE 7: selective-prefill in-tile mask */
 static void *g_qt = NULL, *g_sc = NULL, *g_ot = NULL;
 static size_t g_qtcap = 0, g_sccap = 0, g_otcap = 0;
 static void *g_kf = NULL;  /* f32 K+V staging for the band actually scored */
 static size_t g_kfcap = 0;
 static void *g_md = NULL;  /* online-softmax running max/den [H*S][2] */
 static size_t g_mdcap = 0;
+static void *g_selm = NULL;    /* PHASE 7: per-tile selected-column mask (kt bytes) */
+static size_t g_selmcap = 0;
 
 static id<MTLComputePipelineState> mk_pipe(id<MTLLibrary> lib, const char *name) {
     NSError *e = nil;
@@ -381,11 +403,13 @@ static int attn_pipeline(void) {
     id<MTLComputePipelineState> im = mk_pipe(lib, "init_md");
     id<MTLComputePipelineState> oc = mk_pipe(lib, "online_chunk");
     id<MTLComputePipelineState> fs = mk_pipe(lib, "fin_scatter");
-    if (!gg || !im || !oc || !fs) return 0;
+    id<MTLComputePipelineState> zm = mk_pipe(lib, "zero_unselected");
+    if (!gg || !im || !oc || !fs || !zm) return 0;
     g_pipe_gg  = (void*)CFBridgingRetain(gg);
     g_pipe_init = (void*)CFBridgingRetain(im);
     g_pipe_oc   = (void*)CFBridgingRetain(oc);
     g_pipe_fin  = (void*)CFBridgingRetain(fs);
+    g_pipe_zm   = (void*)CFBridgingRetain(zm);
     return 1;
 }
 
@@ -438,9 +462,17 @@ int lg_metal_attn_bind(int layers, int layer, int kv, int ctxcap, int hd,
 }
 
 /* One (layer, chunk) attention: per query head, QK^T then softmax then PV, with
- * both GEMMs on MPS. win>0 restricts to a sliding window. */
-int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
-                  int S, int pos0, int H, int KV, int hd, float scale, int window) {
+ * both GEMMs on MPS. win>0 restricts to a sliding window.
+ *
+ * PHASE 7 (LAGUNA-FORK): `sel`, when non-NULL and sel->engaged, tells the tiled
+ * full-layer path (win==0) which KV columns are selected by the shared index so
+ * it can skip empty tiles and mask non-selected columns inside the rest. The
+ * scoring layer (layer == sel->sel_base) and sliding layers are exempt and keep
+ * the full walk. NULL keeps the current behavior exactly. */
+static int lg_metal_attn_impl(int layer, float *ctx_out, const float *q,
+                              const float *gt, int S, int pos0, int H, int KV,
+                              int hd, float scale, int window,
+                              const LgAttnSel *sel) {
     if (!g_al || !g_pipe_sm || layer < 0 || layer >= g_al_n) return 0;
     AttnLayer *L = &g_al[layer];
     if (!L->K) return 0;
@@ -504,6 +536,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
             if (!ensure(&g_ot, &g_otcap, (size_t)H * S * hd * 4)) { fprintf(stderr, "tiled: g_ot fail\n"); return 0; }
             if (!ensure(&g_md, &g_mdcap, (size_t)H * S * 8)) { fprintf(stderr, "tiled: g_md fail\n"); return 0; }
             if (!ensure(&g_kf, &g_kfcap, (size_t)ktile * hd * 4 * 2)) { fprintf(stderr, "tiled: g_kf fail\n"); return 0; }
+            if (!ensure(&g_selm, &g_selmcap, (size_t)ktile)) { fprintf(stderr, "tiled: g_selm fail\n"); return 0; }
             static void *qs2 = NULL, *od2 = NULL, *gs2 = NULL;
             static size_t qsc2 = 0, odc2 = 0, gsc2 = 0;
             if (!ensure(&qs2, &qsc2, (size_t)S * qdim * 4)) { fprintf(stderr, "tiled: qs2 fail\n"); return 0; }
@@ -544,6 +577,7 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
             id<MTLComputePipelineState> poc  = (__bridge id<MTLComputePipelineState>)g_pipe_oc;
             id<MTLComputePipelineState> pfin = (__bridge id<MTLComputePipelineState>)g_pipe_fin;
             id<MTLComputePipelineState> pdeq = (__bridge id<MTLComputePipelineState>)g_pipe_dq;
+            id<MTLComputePipelineState> pzm  = (__bridge id<MTLComputePipelineState>)g_pipe_zm;
 
             id<MTLCommandBuffer> cb = [cq2 commandBuffer];
             int ninit = H * S;
@@ -562,6 +596,10 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                 int hq0 = kh * group;               /* first query head of group */
                 long rbase = (long)hq0 * S;         /* AC/MD row base            */
 
+                /* PHASE 7: selective-prefill state for this head group. */
+                int selon = sel && sel->engaged && layer > sel->sel_base;
+                const int *idx = selon ? sel->sel_idx[kh] : NULL;
+                int nidx = selon ? sel->sel_n[kh] : 0;
                 {   /* stack this group's query heads: [G*S, hd] */
                     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
                     [e setComputePipelineState:pgg];
@@ -576,9 +614,22 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                     [e endEncoding];
                 }
                 int kbase = kh * L->ctxcap;
+                /* PHASE 7 (LAGUNA-FORK): selective-prefill. For a LATE full
+                 * layer with an engaged shared index, score only the selected
+                 * KV columns: tiles with none are skipped entirely, and inside
+                 * the rest the non-selected columns are masked to -INF before
+                 * online_chunk (exact: exp(-inf)=0, no softmax contribution).
+                 * `idx` is sorted ascending; `ip` is the running tile scan. */
+                int ip = 0;
+                long scored_col = 0;   /* diagnostic: columns actually scored */
                 for (long t = 0; t < nkey; t += ktile) {
                     long kt = nkey - t; if (kt > ktile) kt = ktile;
                     int kabs = (int)(k0 + t);
+                    if (selon && nidx > 0) {
+                        while (ip < nidx && idx[ip] < t) ip++;
+                        if (!(ip < nidx && idx[ip] < t + kt)) continue;
+                    }
+                    scored_col += kt;
                     /* dequantize this tile's K and V into the tile staging */
                     for (int rep = 0; rep < 2; rep++) {
                     id<MTLComputeCommandEncoder> ed = [cb computeCommandEncoder];
@@ -627,6 +678,26 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                         f = fopen(pth, "wb"); if (f) { fwrite([SC contents], 1, (size_t)rows*ktile*4, f); fclose(f); }
                     }
 
+                    /* PHASE 7: mask non-selected columns of this (partially
+                     * selected) tile to -INF so online_chunk and PV drop them. */
+                    if (selon && nidx > 0) {
+                        uint8_t *mask = (uint8_t*)[(__bridge id<MTLBuffer>)g_selm contents];
+                        memset(mask, 0, (size_t)kt);
+                        { int j = ip;
+                          for (; j < nidx && idx[j] < t + kt; j++)
+                              mask[(int)(idx[j] - t)] = 1;
+                          ip = j; }
+                        int zm_rows = (int)rows, zm_kt = (int)kt;
+                        id<MTLComputeCommandEncoder> ez = [cb computeCommandEncoder];
+                        [ez setComputePipelineState:pzm];
+                        [ez setBuffer:SC offset:0 atIndex:0];
+                        [ez setBuffer:(__bridge id<MTLBuffer>)g_selm offset:0 atIndex:1];
+                        [ez setBytes:&zm_rows length:4 atIndex:2];
+                        [ez setBytes:&zm_kt  length:4 atIndex:3];
+                        [ez dispatchThreads:MTLSizeMake((NSUInteger)kt, (NSUInteger)rows, 1)
+                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                        [ez endEncoding];
+                    }
                     int rrows = (int)rows;
                     id<MTLComputeCommandEncoder> eo = [cb computeCommandEncoder];
                     [eo setComputePipelineState:poc];
@@ -681,6 +752,9 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                   threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
                     [ef endEncoding];
                 }
+                if (selon && getenv("LG_SEL_DIAG"))
+                    fprintf(stderr, "[seldiag] layer=%d S=%d nkey=%d scored_col=%ld (%.0f%% of nkey)\n",
+                            layer, S, nkey, scored_col, (nkey ? 100.0*scored_col/nkey : 0.0));
             }
             double w0 = prof_on() ? CFAbsoluteTimeGetCurrent() : 0;
             [cb commit];
@@ -863,6 +937,22 @@ int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
     return 1;
 }
 
+/* Phase 3/7 public entry points: no selection (full walk, unchanged behavior)
+ * and the selective-prefill variant. Any failure falls through to the CPU
+ * path, which honors the same index (see attention() in laguna_common.h). */
+int lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
+                  int S, int pos0, int H, int KV, int hd, float scale, int window) {
+    return lg_metal_attn_impl(layer, ctx_out, q, gt, S, pos0, H, KV, hd, scale,
+                              window, NULL);
+}
+
+int lg_metal_attn_sel(int layer, float *ctx_out, const float *q, const float *gt,
+                      int S, int pos0, int H, int KV, int hd, float scale,
+                      int window, const LgAttnSel *sel) {
+    return lg_metal_attn_impl(layer, ctx_out, q, gt, S, pos0, H, KV, hd, scale,
+                              window, sel);
+}
+
 size_t lg_metal_attn_bytes(int layer) {
     if (!g_al || layer < 0 || layer >= g_al_n || !g_al[layer].K) return 0;
     /* Phase 1: the GPU attention footprint is bounded by the chunk, not the
@@ -876,5 +966,6 @@ size_t lg_metal_attn_bytes(int layer) {
     if (kt < 256) kt = 256;
     if (kt > 65536) kt = 65536;
     return (size_t)(rows * hd * 4 + H * LG_ATTN_CHUNK * hd * 4 + rows * kt * 4 +
-                    kt * hd * 8 + H * LG_ATTN_CHUNK * 8 + 2.0 * LG_ATTN_CHUNK * H * hd * 4);
+                    kt * hd * 8 + H * LG_ATTN_CHUNK * 8 + 2.0 * LG_ATTN_CHUNK * H * hd * 4 +
+                    kt);   /* + PHASE 7 selected-column mask (kt bytes) */
 }

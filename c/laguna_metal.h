@@ -51,6 +51,20 @@ void   lg_metal_attn_append(int layer, int pos0, int S, const float *k,
                             const float *vv, int kvdim);
 int    lg_metal_attn(int layer, float *ctx_out, const float *q, const float *gt,
                      int S, int pos0, int H, int KV, int hd, float scale, int window);
+/* PHASE 7 (LAGUNA-FORK): selective-prefill variant of lg_metal_attn. When
+ * `sel` is non-NULL and sel->engaged, the tiled full-layer path (window==0)
+ * skips tiles with no selected column and masks non-selected columns in the
+ * others, so a LATE full layer (layer > sel->sel_base) scores O(cap) columns
+ * instead of the whole prefix. NULL has exactly the behavior of lg_metal_attn. */
+typedef struct {
+    const int *sel_idx[32];   /* per KV head, sorted absolute positions  */
+    int        sel_n[32];     /* per KV head, selected count (<= cap)    */
+    int sel_base;             /* scoring (first full) layer index        */
+    int engaged;              /* nonzero => use selection on this call   */
+} LgAttnSel;
+int    lg_metal_attn_sel(int layer, float *ctx_out, const float *q,
+                         const float *gt, int S, int pos0, int H, int KV, int hd,
+                         float scale, int window, const LgAttnSel *sel);
 size_t lg_metal_attn_bytes(int layer);
 /* GPU busy vs wall for the attention dispatches (LAGUNA_GPU_PROF=1). */
 void   lg_metal_prof_dump(void);

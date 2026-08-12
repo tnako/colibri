@@ -174,8 +174,16 @@ typedef struct {
      * `sel_cap` is the max selected positions per head group (LG_SEL_CAP,
      * default 8192); `sel_min` is the context threshold above which selection
      * is allowed to engage (LG_SEL_MIN, default 16384) so short fixture runs
-     * stay on the full-attention path. */
-    int sel, sel_cap, sel_min;
+     * stay on the full-attention path.
+     *
+     * PHASE 7 (LAGUNA-FORK): `selp` (LG_SELP, default 0) turns on SELECTIVE
+     * PROPAGATION during prefill: the selection index is computed DURING
+     * prefill (after the first full layer scores each chunk) and late full
+     * layers then score only the selected KV positions, making prefill
+     * O(S*cap) instead of O(S^2). Setting LG_SELP=1 also implies m->sel = 1
+     * (the sel_pass machinery runs), but the two flags stay distinct so a
+     * full-cap byte-exact run (sel_full) is still verifiable. */
+    int sel, sel_cap, sel_min, selp;
     /* PHASE 3 selection pass results, per full-attention layer per KV head
      * (heads capped at 32): sorted absolute positions of the selected KV rows
      * and their count. Only the FIRST full-attention layer's index is filled
@@ -1234,6 +1242,12 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         if (ec) { int v = atoi(ec); if (v > 0) m->sel_cap = v; }
         const char *em = getenv("LG_SEL_MIN");
         if (em) { int v = atoi(em); if (v > 0) m->sel_min = v; }
+        /* PHASE 7 (LAGUNA-FORK): selective-propagation prefill. LG_SELP=1
+         * implies selection is engaged (sel = 1) so sel_pass machinery runs,
+         * but the prefill-time tile skip only happens when selp is set. */
+        const char *ep = getenv("LG_SELP");
+        m->selp = ep ? atoi(ep) != 0 : 0;
+        if (m->selp) m->sel = 1;
         m->sel_base = -1;
         m->sel_full = 0;
     }
@@ -1791,7 +1805,23 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                            m->K[li], m->V[li], m->Ks[li], m->Vs[li],
                            (size_t)kvrows * hd, (size_t)kvrows * sizeof(float), ring_mod)) {
         int win = c->slide[li] ? c->window : 0;
-        if (lg_metal_attn(li, ctx, q, gt, S, pos0, H, KV, hd, scale, win))
+        /* PHASE 7 (LAGUNA-FORK): route LATE full layers of a selective-prefill
+         * run (selp engaged) through the index-aware GPU path so they skip
+         * non-selected tiles. The scoring layer (li == sel_base), sliding
+         * layers and any non-engaged state take the plain full walk. The CPU
+         * fallback also honors the index (sel_use above), so a GPU failure
+         * keeps bounded reads instead of reverting to full attention. */
+        LgAttnSel sas; LgAttnSel *selarg = NULL;
+        if (m->selp && !m->sel_full && m->sel_base >= 0 && !c->slide[li] &&
+            li > m->sel_base) {
+            sas.engaged = 1; sas.sel_base = m->sel_base;
+            for (int hh = 0; hh < 32; hh++) {
+                sas.sel_idx[hh] = m->sel_idx[m->sel_base][hh];
+                sas.sel_n[hh]   = m->sel_n[m->sel_base][hh];
+            }
+            selarg = &sas;
+        }
+        if (lg_metal_attn_sel(li, ctx, q, gt, S, pos0, H, KV, hd, scale, win, selarg))
             goto attn_out;   /* the output gate is applied by scatter_o */
     }
 #endif
@@ -1840,10 +1870,19 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                      * layer, iterate ONLY the selected KV positions (from the
                      * first full layer's shared index) instead of the whole
                      * history. Sorted ascending, all < pos0 for a decode batch,
-                     * so the causal mask below leaves them all in range. */
+                     * so the causal mask below leaves them all in range.
+                     *
+                     * PHASE 7 (LAGUNA-FORK): during PREFILL with selective
+                     * propagation (selp), LATE full layers (li > sel_base) also
+                     * walk the shared index, so a chunk scores O(cap) columns
+                     * instead of O(S). The scoring layer itself (li == sel_base)
+                     * is exempt and keeps full attention. The decode
+                     * (S <= LG_DEC_SMAX) path still uses the index on ALL full
+                     * layers including sel_base, exactly as before. */
                     int sel_use = m->sel && !c->slide[li] && m->sel_base >= 0 &&
-                                  S <= LG_DEC_SMAX && !m->sel_full &&
-                                  m->sel_n[m->sel_base][kh] > 0;
+                                  !m->sel_full &&
+                                  m->sel_n[m->sel_base][kh] > 0 &&
+                                  (S <= LG_DEC_SMAX || (m->selp && li > m->sel_base));
                     const int *tlist = sel_use ? m->sel_idx[m->sel_base][kh] : NULL;
                     int nrows = sel_use ? m->sel_n[m->sel_base][kh] : (hi - t0 + 1);
                     for (int r0 = 0; r0 < nrows; r0 += LG_KC) {
@@ -2480,6 +2519,7 @@ moe_shared:
 /* ---------- one forward pass over S new tokens ----------
  * Returns malloc'd logits for the last position. tf_out, when non-NULL, also
  * receives the per-position argmax (teacher-forcing parity check). */
+static void sel_pass_at(Model *m, int upto);   /* PHASE 7: prefill-time scoring */
 static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
@@ -2498,6 +2538,12 @@ static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     }
     for (int s = 0; s < S; s++) wt_row_f32(m->embed, ids[s], x + (int64_t)s*D, D);
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    /* PHASE 7 (LAGUNA-FORK): the scoring layer is the FIRST full-attention
+     * layer. After its attention() returns, this chunk's K/V are in the cache
+     * for the whole prefix [0, pos0+S), so the shared selection index is valid
+     * for the LATE full layers of the SAME step_raw call. */
+    int sbase = -1;
+    for (int i = 0; i < c->n_layers; i++) if (!c->slide[i]) { sbase = i; break; }
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         /* Arena scratch from the previous layer is dead once its residual has
@@ -2508,6 +2554,15 @@ static float *step_raw(Model *m, const int *ids, int S, int pos0, int *tf_out) {
         double ta = now_s();
         attention(m, l, i, nrm, S, pos0, tmp);
         m->t_attn += now_s() - ta;
+        /* PHASE 7 (LAGUNA-FORK): refresh the shared selection index DURING
+         * prefill so late full layers of the same chunk can skip non-selected
+         * tiles. PREFILL CHUNKS ONLY (S > LG_DEC_SMAX): decode batches call
+         * step_raw with S <= LG_DEC_SMAX and must NOT re-run the scoring pass
+         * per token -- the post-prefill sel_pass() in generate_stream already
+         * produced the freshest index for decode. */
+        if (m->selp && i == sbase && S > LG_DEC_SMAX &&
+            pos0 + S >= m->sel_min)
+            sel_pass_at(m, pos0 + S);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
         if (c->sparse[i]) moe(m, l, i, nrm, S, tmp);
@@ -2663,29 +2718,40 @@ static int int_cmp(const void *a, const void *b) {
 }
 
 /* ---------- PHASE 3 selection pass (SAGE-KV / SnapKV style) ----------------
- * Runs ONCE after prefill (called from generate_stream) on the FIRST
- * full-attention layer only: its pooled attention scores decide the KV set
- * that ALL full layers share (layer-wise index reuse, per the design doc).
+ * Runs on the FIRST full-attention layer only: its pooled attention scores
+ * decide the KV set that ALL full layers share (layer-wise index reuse, per the
+ * design doc).
+ *
+ * PHASE 7 (LAGUNA-FORK): the pass is parameterized by `upto`, the absolute KV
+ * prefix length to score. It is called repeatedly DURING prefill (from
+ * step_raw, once per chunk, with upto = pos0+S) so the shared index exists
+ * before the late full layers of each chunk score; the final post-prefill call
+ * (sel_pass = sel_pass_at(kv_len)) recomputes identically. Each call frees the
+ * previous index first, so repeated calls cannot double-allocate or leak.
  *
  * Score = the pooled L2 norm of the K rows in a trailing observation window
- * (the last `sel_min` positions), averaged per LG_KC-sized block. Blocks fully
- * outside the window score 0. The top `sel_cap` POSITIONS per KV head are kept
- * (whole blocks chosen by block score first), sorted ascending, stored in
- * m->sel_idx[li][h] / m->sel_n[li][h]. */
-static void sel_pass(Model *m) {
+ * (the last `sel_min` positions of the prefix), averaged per LG_KC-sized block.
+ * Blocks fully outside the window score 0. The top `sel_cap` POSITIONS per KV
+ * head are kept (whole blocks chosen by block score first), sorted ascending,
+ * stored in m->sel_idx[li][h] / m->sel_n[li][h]. */
+static void sel_pass_at(Model *m, int upto) {
     Cfg *c = &m->c;
-    if (!m->sel || m->kv_len < m->sel_min) return;
+    if (!m->sel || upto < m->sel_min) return;
     int li = -1;
     for (int i = 0; i < c->n_layers; i++) if (!c->slide[i]) { li = i; break; }
     if (li < 0) return;                      /* no full-attention layer */
     m->sel_base = li;
     int KV = c->n_kv; if (KV > 32) KV = 32;
-    int hd = c->head_dim, S = m->kv_len;
+    int hd = c->head_dim, S = upto;
     int kvphys = m->kvphys[li];
     int w0 = S - m->sel_min; if (w0 < 0) w0 = 0;    /* obs window start */
     #define SEL_BLK 64                        /* == LG_KC block size */
     int nb = (S + SEL_BLK - 1) / SEL_BLK;
-    /* free any prior allocation; guards a second call from reallocating */
+    /* Each call re-derives sel_full for THIS prefix length: an early chunk
+     * where cap >= upto (no sparsification yet) must NOT latch full-selection
+     * for the whole run once the prefix grows past cap. */
+    m->sel_full = 0;
+    /* free any prior allocation; guards repeated calls from reallocating */
     for (int h = 0; h < KV; h++) {
         free(m->sel_idx[li][h]);
         m->sel_idx[li][h] = NULL;
@@ -2704,7 +2770,6 @@ static void sel_pass(Model *m) {
         printf("[sel] cap=%d from %d keys\n", m->sel_cap, S);
         return;
     }
-    m->sel_full = 0;
     for (int h = 0; h < KV; h++) {
         const int8_t *K  = m->K[li]  + (int64_t)h*kvphys*hd;
         const float  *Ks = m->Ks[li] + (int64_t)h*kvphys;
@@ -2747,6 +2812,9 @@ static void sel_pass(Model *m) {
     printf("[sel] cap=%d from %d keys\n", m->sel_cap, S);
     #undef SEL_BLK
 }
+
+/* Phase 3 API: post-prefill selection over the whole KV prefix. */
+static void sel_pass(Model *m) { sel_pass_at(m, m->kv_len); }
 
 /* greedy generation into out[] (prompt copied in first) */
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out, int *n_out) {
@@ -3221,6 +3289,9 @@ static void print_cfg(Model *m) {
                                     : " (expert layout probed at load)");
     if (m->sel)
         printf("     sel: ON cap=%d min=%d (post-prefill selection pass, engages when prompt > min)\n",
+               m->sel_cap, m->sel_min);
+    if (m->selp)
+        printf("     selp: ON cap=%d min=%d (selective-propagation prefill: late full layers score only selected KV)\n",
                m->sel_cap, m->sel_min);
 }
 
