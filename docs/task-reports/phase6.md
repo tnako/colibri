@@ -53,4 +53,11 @@ XS 65k (68 min), S 16k (71 min).
 
 ## STEP 4 — write-up
 
-`docs/256k-final.md` to be written next.
+`docs/256k-final.md` written (measured table + per-phase state + honest
+recommendation). Plan doc `docs/256k-rework-plan.md` Phase 6 marked DONE.
+
+## Final numbers (headline)
+
+- 256k context fits in RAM: peak RSS 8.7-12.1 GB @ CTX_MAX=262144 (target <20 GB ✅)
+- 256k prefill not runnable: projected ~290 h (S) / ~11 h (XS), O(S²) attn
+- Decode 0.6-1.3 tok/s (target 140 tok/s ❌); gate matrix 100% green
