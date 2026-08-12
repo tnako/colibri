@@ -244,6 +244,29 @@ reachable: prefill is O(S²) on the full layers — 256k prefill projects to ~29
 ship the memory win, implement selective-propagation prefill (the one missing
 lever) before claiming TTFT/decode targets.
 
+## Phase 7 — Selective-propagation prefill (O(S·cap) full-layer prefill) — ✅ DONE (merged aca7080)
+
+Status: benchmark committed `acb0aed` (plan doc) → Phase 7 implemented + merged as
+`aca7080`. New env `LG_SELP` (default 0 off ⇒ byte-exact) makes the late full
+layers of prefill score only the selected KV positions (the shared Phase-3
+index), refreshed per chunk via `sel_pass_at(m, upto)`. CPU attention walk and
+the Metal tiled path (`lg_metal_attn_sel`, `zero_unselected` in-tile mask) both
+honor the index; the scoring layer and sliding layers stay exempt. `sel_full` is
+re-derived per prefix (fixes the cap>=prefix latch that nullified gains).
+
+Measured (XS-2.1-oQ2 Metal): 32k prefill attn **370.4 → 297.1 s (−20%)**, wall
+649.9 → 568.7 s; quality 85.2% top-1 token agreement at cap=8192. Remaining
+prefill cost is the scoring layer (still full O(S²)) + the expert-mm term.
+Gates green: 4/4 builds, tiny fixtures, selection + prefill-selection gates,
+resource_plan 44/44, decode + attn-tiled parity.
+
+Notes:
+- The scoring layer (first full layer) still pays O(S²); a shallow selection
+  layer would remove it (design doc §5, deferred).
+- `LG_SELP=1` implies `LG_SEL=1` (machinery runs) but flags stay distinct so a
+  full-cap byte-exact run is still verifiable.
+- `LG_SELP` only affects prefill; decode behavior is unchanged (Phase 3).
+
 ## Known landmines (from docs, do not re-trip)
 
 - Do not resurrect the MPS batched-per-head attention GEMM — measured slower,

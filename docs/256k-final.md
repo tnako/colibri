@@ -87,11 +87,22 @@ S ~15k (71 min).
   reads only; the documented "selective propagation" prefill skip (Phase 4
   second half) was not implemented. This is the one lever that could make
   256k prefill feasible, and it is the honest recommendation below.
+  **PHASE 7 (merged aca7080): now implemented** via `LG_SELP` — late full
+  layers score only the selected KV during prefill (O(S·cap)). Measured at 32k:
+  attn 370.4 → 297.1 s (−20%). The scoring layer's own O(S²) term remains
+  (deferred), so the *asymptotic* 256k wall is reduced but not eliminated.
 - **Missed: 140 tok/s decode.** Decode is CPU-lane bound (0.6-1.3 tok/s).
   Phase 2/5 moved projections to Metal GEMV but the per-token CPU path (oQ
   unpack, router, residual) still dominates; routed-expert Metal decode
   regressed and is opt-in off. The measured gap is architectural, matching
   the pre-rework docs (`laguna-decode-throughput.md`).
+- **Phase 7 (selective-propagation prefill, merged aca7080).** New env `LG_SELP`
+  (default off ⇒ byte-exact). `sel_pass` → `sel_pass_at(m, upto)` refreshes the
+  shared index during prefill; CPU walk + Metal tiled path (`lg_metal_attn_sel`,
+  `zero_unselected`) score only selected columns for late full layers; scoring
+  layer + sliding exempt; `sel_full` re-derived per prefix. 32k attn −20%; 85.2%
+  top-1 token agreement at cap=8192. Detail: `docs/benchmarks/phase7-selective-prefill.md`,
+  `docs/task-reports/phase7.md`.
 
 ## Known limits
 
