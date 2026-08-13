@@ -1311,6 +1311,7 @@ def cmd_serve(a):
                             _LAGUNA_MODEL_ID.get(arch) or   # LAGUNA-FORK
                             "glm-5.2-colibri")
     try:
+        if a.temp is not None: os.environ["COLI_TEMP"] = str(a.temp)
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
               a.cap,ngen_for(a,interactive=True),engine,env_for_engine(a,arch),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)

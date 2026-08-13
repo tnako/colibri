@@ -1513,7 +1513,17 @@ def generation_options(body, limit):
         maximum = limit
     temperature = body.get("temperature")
     top_p = body.get("top_p")
-    temperature = 0.7 if temperature is None else temperature
+    if temperature is None:
+        # The launcher publishes --temp through COLI_TEMP (#509, #968). The
+        # gateway must use that value as its request default or the SERVE frame
+        # replaces it with 0.7 before any engine can honor the setting.
+        try:
+            temperature = float(os.environ.get("COLI_TEMP", "0.7"))
+            if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+                temperature = 0.7
+        except ValueError:
+            temperature = 0.7
+    top_p = 0.9 if top_p is None else top_p
     top_p = 0.9 if top_p is None else top_p
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
         raise APIError(400, f"`{maximum_param}` must be a positive integer.", maximum_param)

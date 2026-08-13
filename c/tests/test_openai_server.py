@@ -161,6 +161,13 @@ class TemplateTest(unittest.TestCase):
             generation_options({"top_p": math.inf}, 8)
         self.assertEqual(generation_options({"temperature": None, "top_p": None}, 8),
                          (8, 0.7, 0.9, None, ()))
+        with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
+            self.assertEqual(generation_options({}, 8)[1], 0.25)
+            self.assertEqual(generation_options({"temperature": 0}, 8)[1], 0.0)
+        for invalid in ("malformed", "5", "-1", "nan", "1e999"):
+            with self.subTest(invalid=invalid):
+                with patch.dict("openai_server.os.environ", {"COLI_TEMP": invalid}):
+                    self.assertEqual(generation_options({}, 8)[1], 0.7)
         # response_format -> grammar plumbing (draft source, never a constraint)
         opts = generation_options({"max_tokens": 4, "response_format": {"type": "json_object"}}, 8)
         self.assertIn("root ::=", opts[3])
