@@ -59,8 +59,9 @@ on Metal; `===` is a zsh error (use `echo "==="`).
 ## Decode throughput (Laguna-XS)
 
 Opening 6.1–6.6 tok/s (2044-token prompt, oQ2, Metal). Roofline ~147 tok/s (298 GFLOP/s UDOT ÷ ~2
-GFLOP/token). Current: **~9.5 tok/s** — headline change is spec decode (ngram draft, `ca7374b`, on by
-default).
+GFLOP/token). The n-gram speculative path once reported ~9.5 tok/s on repetitive workloads, but commit
+`fc20f78` removed it after controlled runs showed regressions and unsafe complexity; current decode is plain
+greedy unless a future drafter earns its place again.
 
 Ruled out: disk streaming (cache already holds 256/layer, hit 99.3–99.5%, zero `pread`) · GPU dispatch at S=1
 (`LG_GPU_EXP_MIN=1`: >300 s for 30 tokens vs 29 s) · OMP spin-wait (`OMP_WAIT_POLICY=active` inert;
@@ -78,9 +79,18 @@ region forks aren't the bottleneck.
 Landed: **`matmul_oq` nested-parallel bug** (unconditional `#pragma omp parallel` from inside the MoE parallel
 region → wasted fork+join): expert-mm 18.3–18.6 → 17.2–18.3 s (~4–5%).
 
+**4k audit (2026-08-13, `fc20f78`, M5 4P+6E, 32 GiB):** the canonical 4,084-token prompt and 128-token
+generation measured **4.70 tok/s**, 51.1 s prefill (79.92 tok/s), 7.2 GB RSS. A harness-only rerun measured
+4.63 tok/s / 50.3 s; no inference speedup is claimed. Per-token deltas were 45-55 ms fill, ~55 ms routed
+experts, 5-8 ms shared expert, and 81-82 ms attention. Ten threads gave 4.84 tok/s; full cache 4.40; a 24 GB
+budget 3.95. Selective attention cap 512 gave 5.94 tok/s but changes semantics. Tiny Metal parity remained
+24/24 teacher-forced and 12/12 generated.
+
 Gap to 147 tok/s is architectural: ~10 regions/layer (~400/token), each tiny (topk=8-row / 1-row-per-kv-head),
-far from UDOT compute density; `__psynch_cvwait` dominance is legitimately idle workers. Spec decode is the
-lever that landed; deeper draft + trained draft head unstarted.
+far from UDOT compute density; `__psynch_cvwait` dominance is legitimately idle workers. At 4k the measured
+~213 ms/token is ~30x the 7.1 ms target. Cache/thread tuning cannot close it; a future attempt needs a
+whole-forward resident Metal pipeline with very few command-buffer waits, plus end-to-end real-model parity
+and throughput gates.
 
 ## Attention & selection design
 

@@ -360,9 +360,9 @@ tasks:
   # ---------------------------------------------------------------- benchmarks
 
   bench:lg:xs:
-    desc: 'Benchmark Laguna-XS prefill + decode: task bench:lg:xs [PTOK] [NGEN] [TAG]'
+    desc: 'Benchmark Laguna-XS prefill + decode: task bench:lg:xs PTOK=4096 BNGEN=128 TAG=round1'
     cmds:
-      - '{{.PYTHON | default "python3"}} -c "pass" && bash {{.C}}/tools/bench_laguna.sh {{.MODELS}}/{{.LG_BENCH_DIR | default "Laguna-XS-2.1-oQ2"}} {{if .PTOK}}{{.PTOK}}{{else}}2048{{end}} {{if .NGEN}}{{.NGEN}}{{else}}128{{end}} {{if .TAG}}{{.TAG}}{{else}}round-{{now | date "150405"}}{{end}}'
+      - '{{.PYTHON | default "python3"}} -c "pass" && bash {{.C}}/tools/bench_laguna.sh {{.MODELS}}/{{.LG_BENCH_DIR | default "Laguna-XS-2.1-oQ2"}} {{if .PTOK}}{{.PTOK}}{{else}}4096{{end}} {{.BNGEN | default 128}} {{if .TAG}}{{.TAG}}{{else}}round-{{now | date "150405"}}{{end}}'
 
   sweep:spec:
     desc: 'A/B spec-decode depth on a model: task sweep:spec [PTOK] [NGEN] [TAG]'
@@ -374,6 +374,11 @@ tasks:
     cmds:
       - for: [2048, 3072, 4096, 6144]
         cmd: 'OUT={{.OUT | default "/tmp/lgbench"}} CTX_MAX=8192 bash {{.C}}/tools/bench_laguna.sh {{.MODELS}}/Laguna-XS-2.1-oQ2 {{.ITEM}} 8 prefill-{{.ITEM}} 2>&1 | grep -E "prefill-only|summary"'
+
+  stress:lg:xs:
+    desc: 'Profile Laguna-XS with macOS sample: task stress:lg:xs PTOK=4096 SNGEN=32 SCTX=8192 TAG=round1'
+    cmds:
+      - 'ENGINE={{.C}}/laguna_xs_metal OUT={{.OUT | default "/tmp/lgstress"}} CTX_MAX={{.SCTX | default 8192}} LAGUNA_MEM_GB={{.MEM_GB}} bash {{.C}}/tools/stress_laguna.sh {{.MODELS}}/{{.LG_BENCH_DIR | default "Laguna-XS-2.1-oQ2"}} {{.PTOK | default 4096}} {{.SNGEN | default 32}} {{if .TAG}}{{.TAG}}{{else}}round-{{now | date "150405"}}{{end}}'
 
   # ---------------------------------------------------------------- validation
 

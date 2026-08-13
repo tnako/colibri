@@ -123,12 +123,18 @@ COLI_VULKAN=1 COLI_VK_DENSE=1 COLI_VK_ATTN=1 PIN=<model>/.coli_usage PIN_GB=0 CO
 - Result XS ~2k tok: prefill 89.2→31.4 s, RSS 18.9→15.5 GB (11.1 at MEM=8), scratch O(chunk). Correctness: XS 24/24 + 12/12, S 208/208 + 8/8, task test 3/3.
 - Open: int8 KV; full-size S never run (arithmetic from config + measured per-phase rates; S ~235 GB bf16 / 27 GiB oQ2).
 
-## Laguna 256k rework phases (measured 2026-08-10, 10 p-cores, 32 GiB)
-- Harness: `c/tools/stress_laguna.sh <model> <prompt-tok> <gen> <tag>`; `LG_SPEC=0` for plain greedy decode. Targets: prefill 256k <2 s (unreachable full-attn), decode 140 tok/s, mem <20 GB.
+## Laguna 256k rework phases (measured 2026-08-10, Apple M5 4P+6E, 32 GiB)
+- Canonical real-model throughput: `task bench:lg:xs PTOK=4096 BNGEN=128 TAG=<unique>`; sampled profile: `task stress:lg:xs PTOK=4096 SNGEN=32 SCTX=8192 TAG=<unique>`. Both default to the real `Laguna-XS-2.1-oQ2`, share an exclusion lock, reject reused tags, and write commit/binary/config/host metadata beside raw logs. Targets: prefill 256k <2 s (unreachable full-attn), decode 140 tok/s, mem <20 GB.
 - **Laguna-XS-2.1-oQ2** (10 full/30 sliding, D=2048, kv=8, hd=128, topk=8): CPU 1,869-tok: prefill 184.6 s / 15.1 GB / 5.88 tok/s; Metal 1,869: 28.7 s / 6.1 GB / **6.10 tok/s**; Metal 30k: prefill 436.4 s (attn 231.4 s) / 9.3 GB. Decode = CPU per-token path (6.1-6.6 tok/s) regardless of build.
 - **Laguna-S-2.1-oQ2e-fast** (12/36, D=3072, topk=10): Metal 800-tok: 60.7 s / 9.5 GB / **0.86 tok/s** (decode ~1.16 s/token, 7× slower than XS; 3× params).
 - Prefill scratch unbudgeted ~10.7 GB at last 256k chunk (score tile 8.6 GB + f32 band 2.1 GB); decode never touches GPU (S<64 gate). KV: Metal build 7.97 GB vs CPU 6.68 GB @ 262,144 (Laguna-S).
 
-### Phase 7 selective prefill (`LG_SELP`, Laguna-XS, Metal, `LG_SPEC=0`)
+### Laguna-XS 4k decode audit (2026-08-13, Apple M5 4P+6E, 32 GiB)
+- Exact workload: 4,084 actual prompt tokens, 128 generated, `CTX_MAX=8192`, `LAGUNA_MEM_GB=20`, automatic four-P-core OpenMP team, greedy decode. Baseline `fc20f78`: **4.70 tok/s**, 51.1 s prefill (**79.92 tok/s**), 7.2 GB RSS. Identical post-harness run: **4.63 tok/s**, 50.3 s prefill (**81.19 tok/s**). The change is measurement hardening, not an inference speedup; the 1.5% decode difference is run variance.
+- Decode deltas were about 45-55 ms/token expert fill, 55 ms routed experts, 5-8 ms shared expert, and 81-82 ms attention. `sample` attributed 38% self samples to `__workq_kernreturn`, 34% to `__psynch_cvwait`, and 15% to `matmul_oq.omp_outlined`. The measured ~213 ms/token is ~30x the 7.1 ms/token required for 140 tok/s.
+- Controlled negative results on the same 4k workload: ten OpenMP threads **4.84 tok/s** (+3%, not enough to replace the P-core policy); full 256-slot cache **4.40 tok/s**; 24 GB auto budget/full cache **3.95 tok/s**. `LG_SEL=1 LG_SEL_MIN=1 LG_SEL_CAP=512` reached **5.94 tok/s**, but sparsifies attention and therefore is not a semantics-preserving default.
+- Conclusion: cache/thread tuning cannot close this gap. The next credible path is a whole-forward, resident fused Metal decode pipeline covering attention, projections, routed/shared experts, and LM head in very few command buffers. Earlier per-matrix/per-layer Metal decode paths regressed and were removed; do not revive them without an end-to-end real-model A/B.
+
+### Phase 7 selective prefill (`LG_SELP`, Laguna-XS, Metal)
 - 16k: baseline attn 141.3 s / wall 273.4 s / 2.24 tok/s → `LG_SELP=1 cap=4096`: 116.5 / 227.8 / 2.35 → `cap=8192`: ~136 / ~254 / **2.53**.
 - 32k: baseline 370.4 / 649.9 / 1.79 → **cap=8192: 297.1 (−20%) / 568.7 / 2.26**. Remaining cost = full O(S²) scoring pass + expert-MM (153-165 s). Quality: first 32 tokens, 85.2% token agreement vs baseline. Single-run variance ±15%.

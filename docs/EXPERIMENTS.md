@@ -539,17 +539,40 @@ HCAttention (2025).
 
 ## 12. Laguna Engine Optimization & 2k Prefill Sweeps — 2026-08-13
 
-Host: Apple M5 (10 physical cores, 32 GB RAM, ~126 GB/s), Metal build `c/laguna_xs_metal` / `c/laguna_s_metal`. Model: `Laguna-XS-2.1-oQ2` (39 MoE layers, $E=256$, top-$K=8$).
+Host: Apple M5 (4P+6E CPU, 32 GB RAM, ~126 GB/s), Metal build `c/laguna_xs_metal` / `c/laguna_s_metal`. Model: `Laguna-XS-2.1-oQ2` (39 MoE layers, $E=256$, top-$K=8$).
 
 ### Summary of Results
 - **2k Prompt Prefill**: Wall time reduced from **37.5 s → 29.2 s** (**22% overall speedup**).
 - **M3 (Sliding Attention GPU Gate Threshold $K=1$)**: `c/laguna_common.h` updated gate threshold to $K=1$ (`pos0 + S >= c->window`), dropping prefill attention phase from **10.6 s → 4.2 s** (**60.4% faster**).
-- **M6 (Grouped Expert Metal Occupancy & Unaligned Vector Loads)**: `c/laguna_expert_metal.mm` tuned tile geometry to `TM=32, TN=16, TK=64, NSG=4` with 32-bit `ushort2` vector loads, dropping decode per-token expert delta from **65.6 ms → 39.0 ms** (**40.5% faster**).
+- **M6 (Grouped Expert Metal Occupancy & Unaligned Vector Loads)**: `c/laguna_expert_metal.mm` retained tile geometry `TM=32, TN=32, TK=64, NSG=4` with 32-bit `ushort2` vector loads. The measured expert delta improvement applied to the prefill/grouped candidate path; decode remains on CPU because the S=1 GPU route regressed.
 - **Parallel Token-Indexed OpenMP Gather/Scatter**: `c/laguna_common.h` parallelized token gather and scatter-add with `pos_map` lookups, eliminating atomic contention and single-threaded 163 MB memory copies per layer.
-- **M4 (Decode Attention UDOT `LG_DEC_Q8`)**: `c/laguna_common.h` added opt-in `LG_DEC_Q8` int8 query quantization, dropping 4k context decode attention phase from **97 ms → 72 ms** (**26% faster**).
-- **Adaptive Specative Decode (`LG_SPEC_ADAPT=1`)**: Added depth-survival counters and rolling acceptance tracking (`eff_depth`), eliminating dead-weight verify passes on non-repetitive text without regressing code-like repeats.
+- **M4 (Decode Attention UDOT `LG_DEC_Q8`) candidate**: int8 query scoring dropped one measured 4k attention phase from **97 ms → 72 ms**, but the numeric path and end-to-end result did not justify another decode mode. Removed in `fc20f78`.
+- **Adaptive speculative decode candidate (`LG_SPEC_ADAPT=1`)**: depth-survival counters and rolling acceptance were implemented and measured, then removed in `fc20f78` with the regressive speculative decode path. It is not a current engine feature.
 
 ### Prefill Ceiling & Hardware Analysis
-- On Apple M5 with 39 MoE layers, 2k prompt prefill has a hard hardware/architectural floor (~2.5–4 s):
-  1. **Inter-Layer Dependency**: Sequential execution is required because Layer $l+1$'s router needs Layer $l$'s output ($X_{l+1} = X_l + \text{MoE}_l$).
-  2. **Precision Requirement**: FP16 staging for expert GEMM introduces $5.5 \times 10^{-2}$ relative error corrupting token output logits. Exact FP32 is required to maintain fixture parity.
+- On Apple M5 with 39 MoE layers, 2k prompt prefill has a hard hardware/architectural floor (~2.5–4 s). Inter-layer execution is sequential because layer $l+1$'s router needs layer $l$'s output ($X_{l+1} = X_l + \text{MoE}_l$). FP16 expert staging introduced $5.5 \times 10^{-2}$ relative error through gate/up/down, so the retained expert kernel uses FP32 staging to maintain fixture parity.
+
+---
+
+## 13. Laguna-XS Real-Model 4k Decode Audit — 2026-08-13
+
+**Question:** can semantics-preserving tuning bring Laguna-XS oQ2 close to 140 tok/s at a 4k context window?
+
+**Host/model:** Apple M5 (4P+6E CPU, 10-core GPU), 32 GiB unified memory; real `Laguna-XS-2.1-oQ2`; Metal engine; commit `fc20f78`. Deterministic prose seed 1234 produced 4,084 actual prompt tokens. Runs used `CTX_MAX=8192`, `LAGUNA_MEM_GB=20`, 128 generated tokens, automatic four-P-core OpenMP tuning, and plain greedy decode. The benchmark launches separate prefill-only and decode processes; phase deltas subtract the former from the latter.
+
+| configuration | prefill | prefill tok/s | decode tok/s | result |
+|---|---:|---:|---:|---|
+| baseline | 51.1 s | 79.92 | **4.70** | reference |
+| harness-only rerun | 50.3 s | 81.19 | **4.63** | neutral; variance, no engine change |
+| `OMP_NUM_THREADS=10` | 49.9 s | 81.84 | **4.84** | +3%; insufficient |
+| `CAP=256` | 49.3 s | 82.84 | **4.40** | regression |
+| `LAGUNA_MEM_GB=24` (auto cap 256) | 46.1 s | 88.59 | **3.95** | regression |
+| `LG_SEL=1 LG_SEL_MIN=1 LG_SEL_CAP=512`, 10 threads | 47.9 s | 85.26 | **5.94** | changes attention semantics |
+
+**Baseline phase deltas:** expert fill 45.3 ms/token, routed expert 56.2 ms, shared expert 6.2 ms, attention 82.0 ms. The post-harness run measured 54.7/54.7/4.7/81.2 ms respectively. A 32-token sampled profile reported 38.0% self samples in `__workq_kernreturn`, 34.3% in `__psynch_cvwait`, 14.6% in `matmul_oq.omp_outlined`, 3.4% in `matmul.omp_outlined`, and 1.2% in `attention.omp_outlined`; profiler wall is not used as the throughput number.
+
+**Decision:** 140 tok/s needs 7.1 ms/token; the baseline needs about 213 ms/token. Even removing all measured fills leaves a roughly 6 tok/s projection. Full cache, extra memory, and extra CPU threads do not alter that order of magnitude. The only larger measured gain used sparse attention and is not a faithful default. No inference optimization landed from this audit; the useful change is a reproducible harness that defaults to 4k/128, reports actual token count/prefill rate, records commit/dirty state/binary SHA/config/hardware, rejects reused result tags, and serializes bench/stress through one lock.
+
+**Next credible experiment:** one resident whole-forward Metal decode graph, not per-matrix dispatch: fuse or batch attention, projections, routed/shared experts, and LM head so command-buffer waits are counted per token rather than per layer/matrix. Gate it on real-model end-to-end throughput and the existing 24/24 teacher-forced plus 12/12 generated Metal fixture. Earlier per-layer Metal decode implementations measured 3.41-3.48 vs 4.98 CPU and 0.49 tok/s for routed experts, then were removed.
+
+Raw local artifacts from this run: `/tmp/lgbench/baseline-4k`, `/tmp/lgbench/after-harness-4k`, and `/tmp/lgstress/after-harness-4k`. They are not committed; the harness metadata makes future shared artifacts attributable.

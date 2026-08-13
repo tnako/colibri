@@ -484,4 +484,3 @@ extern "C" int lg_metal_expert(void *wmap, size_t woff, void *smap, size_t soff,
     return lg_metal_expert_grouped(wmap, woff, smap, soff, bmap, boff,
                                    xbuf, ybuf, offh, tileh, ntiles, Kd, N, gs, bits, 0, 0);
 }
-

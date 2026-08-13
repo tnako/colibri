@@ -20,7 +20,7 @@
 #                                spec) or 0 code-like (n-gram-rich, spec flatters)
 #   SEED=1234                    prompt RNG seed (identical prompt across rounds)
 #   OUT=/tmp/lgbench              output dir
-#   Any LG_SPEC_MAX / LG_SPEC / LG_* value is inherited by the engine.
+#   Any LG_* value is inherited by the engine.
 set -euo pipefail
 
 MODEL="${1:?usage: bench_laguna.sh <model-dir> [prompt-tokens] [gen-tokens] [tag]}"
@@ -42,8 +42,46 @@ OUT="${OUT:-/tmp/lgbench}"
 [ -x "$ENGINE" ] || { echo "!! no engine at $ENGINE (make -C c laguna_xs laguna_xs_metal)" >&2; exit 1; }
 [ -f "$MODEL/config.json" ] || { echo "!! no checkpoint at $MODEL" >&2; exit 1; }
 
+LOCK="${LAGUNA_BENCH_LOCK:-/tmp/laguna-xs-real-model.lock}"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "!! another Laguna-XS benchmark is running (lock: $LOCK)" >&2
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 D="$OUT/$TAG"
+[ ! -e "$D" ] || { echo "!! result directory already exists: $D" >&2; exit 1; }
 mkdir -p "$D"
+
+if command -v shasum >/dev/null 2>&1; then
+  ENGINE_SHA=$(shasum -a 256 "$ENGINE" | cut -d ' ' -f 1)
+elif command -v sha256sum >/dev/null 2>&1; then
+  ENGINE_SHA=$(sha256sum "$ENGINE" | cut -d ' ' -f 1)
+else
+  ENGINE_SHA=unknown
+fi
+
+{
+  echo "timestamp_utc $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "model $MODEL"
+  echo "engine $ENGINE"
+  echo "prompt_tokens_requested $PTOK"
+  echo "generated_tokens_requested $NGEN"
+  echo "cap $CAP"
+  echo "ctx_max $CTX"
+  echo "memory_gb $MEM"
+  echo "omp_num_threads ${OMP_NUM_THREADS:-auto}"
+  echo "git_commit $(git -C "$(dirname "$0")/../.." rev-parse HEAD 2>/dev/null || echo unknown)"
+  if git -C "$(dirname "$0")/../.." diff --quiet HEAD -- 2>/dev/null; then
+    echo "git_dirty 0"
+  else
+    echo "git_dirty 1"
+  fi
+  echo "engine_sha256 $ENGINE_SHA"
+  echo "host $(uname -sm)"
+  if command -v sysctl >/dev/null 2>&1; then
+    echo "cpu $(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+  fi
+} > "$D/metadata.txt"
 
 # --- deterministic prompt: ~PTOK tokens, prose or code-like -----------------
 python3 - "$PTOK" "$PROSE" "$SEED" > "$D/prompt.txt" <<'PY'
@@ -77,7 +115,9 @@ if not prose:
     sys.stdout.write("\n".join(lines) + "\n")
     raise SystemExit
 words = []
-while len(words) < want * 0.8:
+# Calibrated against Laguna-XS's tokenizer: 0.862 words/requested-token makes
+# the deterministic 4096-token workload land within a few tokens of its target.
+while len(words) < want * 0.862:
     words.extend(random.choice(prose_topics).split())
 sys.stdout.write(" ".join(words))
 PY
@@ -96,9 +136,10 @@ run_one() {  # $1=ngen  $2=outfile  $3=label
   GLOBIGNORE=*
   env "${envstr[@]}" SNAP="$MODEL" "$ENGINE" "$CAP" 0 --chat -n "$ngen" -f "$D/prompt.txt" \
     > "$outf.log" 2> "$outf.err" || { echo "  !! run failed (exit $?)"; return 1; }
-  pre=$(grep -oE '[0-9]+ prompt tokens' "$outf.log" | head -1 || true)
-  local pf tt gen tok spec
+  local pf actual pftps tt gen tok spec
+  actual=$(grep -oE '[0-9]+ prompt tokens' "$outf.log" | head -1 | awk '{print $1}' || true)
   pf=$(grep -oE '\[prefill [0-9.]+s' "$outf.log" | head -1 | sed 's/\[prefill //;s/s//' || true)
+  pftps=$(awk -v n="${actual:-0}" -v t="${pf:-0}" 'BEGIN { if (t > 0) printf "%.2f", n/t; else print "" }')
   tt=$(grep -E 'tok/s' "$outf.log" | grep -oE '[0-9]+ tokens in [0-9.]+s = [0-9.]+ tok/s' | head -1 || true)
   gen=$(grep -oE 'in [0-9.]+s = [0-9.]+ tok/s' <<<"$tt" | sed 's/in //;s/ = .*//;s/s//' || true)
   tok=$(grep -oE '= [0-9.]+ tok/s' <<<"$tt" | sed 's/= //;s/ tok\/s//' || true)
@@ -110,7 +151,7 @@ run_one() {  # $1=ngen  $2=outfile  $3=label
   sh=$(grep -oE 'shared [0-9.]+s' <<<"$phases" | head -1 | sed 's/shared //;s/s//' || true)
   attn=$(grep -oE 'attn [0-9.]+s' <<<"$phases" | head -1 | sed 's/attn //;s/s//' || true)
   hit=$(grep -oE 'hit [0-9.]+%' <<<"$phases" | head -1 | sed 's/hit //;s/%//' || true)
-  echo "  $label: prefill=$pf s | $gen gen in $tt | tok/s=$tok | fill=$fill expert=$exp shared=$sh attn=$attn hit=$hit%"
+  echo "  $label: actual=$actual tok | prefill=$pf s ($pftps tok/s) | $gen gen in $tt | tok/s=$tok | fill=$fill expert=$exp shared=$sh attn=$attn hit=$hit%"
   if [ -n "$spec" ]; then
     echo "    $(echo "$spec" | tr '\n' ' ')"
     sacc=$(echo "$spec" | head -1 | sed -E 's/.*accepted \(([0-9.]+)%\).*/\1/')
@@ -119,7 +160,7 @@ run_one() {  # $1=ngen  $2=outfile  $3=label
     sacc=0
   fi
   rss=$(grep -oE 'RSS [0-9.]+ GB' "$outf.log" | tail -1 | awk '{print $2}')
-  echo "$label prefill $pf gen $gen toks $tok fill $fill expert $exp shared $sh attn $attn hit $hit rss $rss specacc $sacc" >> "$result"
+  echo "$label actual $actual prefill $pf pftps $pftps gen $gen toks $tok fill $fill expert $exp shared $sh attn $attn hit $hit rss $rss specacc $sacc" >> "$result"
   return 0
 }
 

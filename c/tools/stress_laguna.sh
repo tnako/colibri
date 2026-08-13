@@ -17,6 +17,8 @@
 # Env:
 #   ENGINE=./c/laguna_xs   which binary (default laguna_xs)
 #   CAP=0                  expert cache slots per layer, 0 = auto
+#   CTX_MAX=8192           context bound (same contract as bench_laguna.sh)
+#   LAGUNA_MEM_GB=20       memory budget (same contract as bench_laguna.sh)
 #   OUT=/tmp/lgstress      where to write results
 set -euo pipefail
 
@@ -26,13 +28,53 @@ NGEN="${3:-32}"
 TAG="${4:-$(date +%H%M%S)}"
 ENGINE="${ENGINE:-./c/laguna_xs}"
 CAP="${CAP:-0}"
+CTX="${CTX_MAX:-8192}"
+MEM="${LAGUNA_MEM_GB:-20}"
 OUT="${OUT:-/tmp/lgstress}"
 
 [ -x "$ENGINE" ] || { echo "no engine at $ENGINE (run: make -C c laguna_xs)"; exit 1; }
 [ -f "$MODEL/config.json" ] || { echo "no checkpoint at $MODEL"; exit 1; }
 
+LOCK="${LAGUNA_BENCH_LOCK:-/tmp/laguna-xs-real-model.lock}"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "another Laguna-XS stress run is active (lock: $LOCK)" >&2
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 D="$OUT/$TAG"
+[ ! -e "$D" ] || { echo "result directory already exists: $D" >&2; exit 1; }
 mkdir -p "$D"
+
+if command -v shasum >/dev/null 2>&1; then
+  ENGINE_SHA=$(shasum -a 256 "$ENGINE" | cut -d ' ' -f 1)
+elif command -v sha256sum >/dev/null 2>&1; then
+  ENGINE_SHA=$(sha256sum "$ENGINE" | cut -d ' ' -f 1)
+else
+  ENGINE_SHA=unknown
+fi
+
+{
+  echo "timestamp_utc $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "model $MODEL"
+  echo "engine $ENGINE"
+  echo "prompt_tokens_requested $PTOK"
+  echo "generated_tokens_requested $NGEN"
+  echo "cap $CAP"
+  echo "ctx_max $CTX"
+  echo "memory_gb $MEM"
+  echo "omp_num_threads ${OMP_NUM_THREADS:-auto}"
+  echo "git_commit $(git -C "$(dirname "$0")/../.." rev-parse HEAD 2>/dev/null || echo unknown)"
+  if git -C "$(dirname "$0")/../.." diff --quiet HEAD -- 2>/dev/null; then
+    echo "git_dirty 0"
+  else
+    echo "git_dirty 1"
+  fi
+  echo "engine_sha256 $ENGINE_SHA"
+  echo "host $(uname -sm)"
+  if command -v sysctl >/dev/null 2>&1; then
+    echo "cpu $(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+  fi
+} > "$D/metadata.txt"
 
 # Build a prompt of roughly PTOK tokens. Real prose, not a repeated phrase: a
 # repetitive filler prompt makes the model degenerate and also gives the expert
@@ -52,9 +94,9 @@ topics = [
  "Speculative decoding drafts several tokens with a small model and verifies them in one forward pass of the large model, trading extra compute for lower latency.",
  "Unified memory on Apple silicon removes the host-to-device copy, but a kernel dispatch still costs hundreds of microseconds of round-trip latency.",
 ]
-# ~1.3 tokens/word is a safe estimate for this tokenizer; overshoot slightly.
+# Calibrated to the deterministic Laguna-XS benchmark workload.
 words = []
-while len(words) < want * 0.8:
+while len(words) < want * 0.862:
     words.extend(random.choice(topics).split())
 print(" ".join(words))
 PY
@@ -68,7 +110,8 @@ echo "==> stress $TAG: $MODEL, ~$PTOK tokens ($WORDS words), $NGEN generated, ca
 # be the process `sample` attaches to, or the profile is 100% __sigsuspend in the
 # time wrapper; run the engine directly and read RSS from the engine's own line
 # plus a footprint poll.
-SNAP="$MODEL" "$ENGINE" "$CAP" 0 --chat -n "$NGEN" -f "$D/prompt.txt" \
+CTX_MAX="$CTX" LAGUNA_MEM_GB="$MEM" SNAP="$MODEL" \
+  "$ENGINE" "$CAP" 0 --chat -n "$NGEN" -f "$D/prompt.txt" \
      > "$D/engine.log" 2> "$D/engine.err" &
 PID=$!
 # poll peak footprint while it runs (cheap, 1 Hz)
