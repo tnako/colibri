@@ -630,8 +630,7 @@ static int lg_metal_attn_impl(int layer, float *ctx_out, const float *q,
                         if (!(ip < nidx && idx[ip] < t + kt)) continue;
                     }
                     scored_col += kt;
-                    /* dequantize this tile's K and V into the tile staging */
-                    for (int rep = 0; rep < 2; rep++) {
+                    /* Dequantize this tile's K and V into the tile staging. */
                     id<MTLComputeCommandEncoder> ed = [cb computeCommandEncoder];
                     [ed setComputePipelineState:pdeq];
                     [ed setBuffer:(__bridge id<MTLBuffer>)L->K  offset:0 atIndex:0];
@@ -650,7 +649,6 @@ static int lg_metal_attn_impl(int layer, float *ctx_out, const float *q,
                     [ed dispatchThreads:MTLSizeMake((NSUInteger)hd, (NSUInteger)kt, 1)
                   threadsPerThreadgroup:MTLSizeMake(hd < 64 ? hd : 64, 1, 1)];
                     [ed endEncoding];
-                    }
                     if (getenv("LG_DUMP_STEP")) {
                         [cb commit];
                         [cb waitUntilCompleted];

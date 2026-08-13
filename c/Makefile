@@ -640,14 +640,6 @@ gemm-test: tests/test_gemm_largebatch.mm backend_metal.mm backend_metal.h
 	$(METALXX) $(OMPC) tests/test_gemm_largebatch.mm backend_metal.mm $(OMPL) -framework Metal -framework Foundation -o gemm_largebatch_test
 	./gemm_largebatch_test
 
-# Phase 2: persistent decode GEMV parity — lg_decode_gemv (all four formats,
-# S=1 and S=8) and lg_decode_silu against a plain-C reference. Mirrors
-# tests/attn_tiled_parity.mm (test_gpu_attn_parity.py's .mm driver).
-decode_parity_test: tests/decode_gemv_parity.mm laguna_metal.o laguna_metal.h
-	$(CXX) -std=gnu++17 -fobjc-arc -O3 $(LG_ARCH) tests/decode_gemv_parity.mm laguna_metal.o -o $@ $(LG_METAL_LD)
-decode-parity: decode_parity_test
-	./decode_parity_test
-
 # fmt=6 (E8/IQ3) encoder for tools/convert_fp8_to_int4.py. OPTIONAL: iq3_pack.py
 # falls back to its numpy path when the library is absent, producing the same
 # bytes ~13x slower. Uses the same ARCH as the engine, so an AVX2 host gets the
@@ -980,9 +972,6 @@ tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json
 
 tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_ngram_draft$(EXE): tests/test_ngram_draft.c laguna_common.h oq.h q8r.h coli_moe_route.h st.h json.h tok.h tok_unicode.h compat.h route_trace.h
-	$(CC) $(CFLAGS) $(LG_ARCH) $< -o $@ $(LDFLAGS)
 
 tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

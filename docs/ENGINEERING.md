@@ -18,10 +18,10 @@ via Metal GEMV + spec decode.
 |---|---|---|---|
 | 0 | Baseline rig + planner KV model | ✅ `7101974` | `resource_plan.py` models Laguna KV (S @256k = 7.97 GB Metal / 6.68 GB CPU); 44/44 plan tests; XS 2k ~68.8 s prefill, XS decode 6.1 tok/s @1869, S 0.86 tok/s @800 |
 | 1 | Kill 13 GB GPU KV ring: tiled online-softmax prefill | ✅ `2581a9f` | S×nkey score matrix never materialized; staging tile-sized (peak RSS 7.9 GB); parity max \|diff\| 2.4e-4; XS Metal @6k prefill 67.9 / attn 28.5 s / RSS 7.5 GB; sliding keeps banded path |
-| 2 | Metal decode: batched GEMV projections + experts | ✅ `dd12af2` merged | projections/shared-expert GEMV behind `LAGUNA_DEC_GPU`; decode still CPU oQ path (GPU gated `S>=64`) |
+| 2 | Metal decode: batched GEMV projections + experts | ❌ removed | 3.41-3.48 tok/s vs 4.98 CPU on M5; per-layer waits dominated despite a 105-124 GB/s SIMD GEMV kernel |
 | 3 | Sparse/selective attention (SAGE-KV) | ✅ `1e57466` merged | caps decode KV reads (XS 65k decode 1.28 vs 0.54 tok/s); **doesn't cap prefill quadratic** |
 | 4 | Prefill linear-term + big-chunk amortization | ✅ `ffa01f4` merged | expert-mm ~linear ~31 ms/tok; chunk knee at 1024; RSS flat vs chunk |
-| 5 | Full-Metal migration | ✅ investigated `bd04e23` merged | routed-expert decode GEMV regressed, opt-in `LG_DEC_EXP_ON=1` (spec-on 12.28 tok/s vs opt-in 0.49); 3 decode-path bug fixes (`dec_batch_end` silent no-op, `dec_reg_for` 4096→16384 align masking path, `dec_bind` use-after-free) |
+| 5 | Full-Metal migration | ✅ investigated `bd04e23` merged | routed-expert decode regressed to 0.49 tok/s and was removed with the slower projection session; future Metal decode must be whole-forward resident |
 | 6 | 256k hardening + release gate | ✅ done | memory target **met** (peak RSS 8.7–12.1 GB @CTX_MAX=262144); gate matrix green CPU+Metal |
 | 7 | Selective-propagation prefill (O(S·cap)) | ✅ `aca7080` merged (plan `acb0aed`) | `LG_SELP` (default 0 ⇒ byte-exact); late full layers score only selected KV, refreshed via `sel_pass_at(m, upto)`; `sel_full` re-derived per prefix. 32k prefill attn **370.4→297.1 s (−20%)**, wall 649.9→568.7 s; 85.2% top-1 agreement @cap=8192; scoring layer still O(S²) (deferred) |
 
@@ -300,7 +300,7 @@ Lever is **expert-mm** (86.1→21.4 s 256→1024, flat after); attn (4.2–5.3 s
 
 ## Phase 5 — routed experts on the persistent decode session
 
-Status: **opt-in, correct, but a regression vs the CPU oQ-cache path** (`LG_DEC_EXP_ON=1`). `moe()` routes decode (S==1) routed pairs through persistent Metal session `g_dec`: expert-sorted gather, per-pair S=1 `dec_gemv` (oQ bf16, `LG_DEC_OQBF16`) gate+up in one commit, CPU silu `siluf(g)*u`, down in a second commit, weighted scatter; CPU fallback on failure. `dec_exp_alloc` registers scratch `[0]gather [1]gate [2]up [3]down` (posix_memalign 16384); `dec_exp_add` page-aligns bases, folds delta into offsets (keeps dec_bind no-copy). `LG_DEC_EXP_OFF` removed; gates on `LG_DEC_EXP_ON`.
+Status: **removed**. Both routed-expert and projection/shared-expert Metal decode paths were slower than the CPU oQ-cache path on M5. Their runtime flags, implementation, tests and tuning script were deleted.
 
 Bugs fixed: (1) cmd buffer never ran — `dec_batch_end()` early-returned when `n_dec_copies==0`; fixed via `dec_exp_ops`; (2) cmd-buffer OOM from no-copy buffers sized to strided offsets (~1.9–3.1 GB) → page-align base + offset-shift; (3, P2) `dec_reg_for` 4096-align vs required `NSPageSize()` 16384; (4, P2) UAF in `dec_bind` wrap buffers — `dec_relinquish`.
 
@@ -317,9 +317,29 @@ Earlier per-pair S=1 path: 3.25 vs 1.88 tok/s (40-tok); 3.29 vs 1.29 (16-tok, by
 
 ### v2 — one-dispatch-per-matrix batched routed decode
 
-Routes decode routed pairs through `lg_metal_moe_layer` like prefill — ONE command buffer, 4 dispatch groups (gate+up+silu+down), ONE compact 128-row tile list/layer, ONE commit+wait. Same `expert_gemm` + GPU silu → byte-identical to CPU default. Still a regression (0.49 / 0.06 tok/s): rows/expert ≈1 at decode scale whether S=1 or S=25 (npair=200 over 256 experts); TM=64 tile wastes 64x FLOPs padding 1-row experts. One layer = 177 ms GPU busy + ~150 ms commit+wait (rmsnorm/residual CPU-owned). CPU slot cache resident-hot → **verdict: keep opt-in.** Routed decode no longer needs `LgDecode` regions/wrap buffers; `dec_batch_*` untouched.
+Routes decode routed pairs through `lg_metal_moe_layer` like prefill — ONE command buffer, 4 dispatch groups (gate+up+silu+down), ONE compact row-tile list/layer, ONE commit+wait. Same `expert_gemm` + GPU silu was byte-identical to CPU default. It still regressed to 0.49/0.06 tok/s: rows/expert ≈1 at decode scale, so tile padding and per-layer synchronization dominate. **Verdict: removed.**
 
-Verification (both): text byte-identical to CPU default (n=16); `decode_gemv_parity` DECODE PARITY OK (worst=7.63e-06); 4 tiny gates + `make test-c` ALL PASS; `dec_exp_*` per-pair helpers removed.
+Historical verification: text byte-identical to CPU default (n=16); the removed decoder's parity worst was 7.63e-06.
+
+### M5 cleanup experiments (2026-08-13)
+
+Laguna-XS-2.1-oQ2 on Apple M5, 10-core GPU, 32 GB unified memory. Losing paths were removed rather than retained behind flags.
+
+| experiment | result | baseline / verdict |
+|---|---:|---|
+| Metal projection/shared decode | 3.41 tok/s | CPU 4.98 tok/s; removed |
+| Metal decode with SIMD oQ2 GEMV | 3.48 tok/s | CPU 4.98 tok/s; removed |
+| routed-expert Metal decode | 0.49 tok/s spec-on; 0.06 tok/s greedy | removed |
+| CPU decode, 128 generated tokens | 6.14 tok/s | retained |
+| int8 query/K attention scoring | 6.06 tok/s | regression; removed `LG_DEC_Q8` |
+| n-gram speculation, depth 1 | 5.68 tok/s, 45.5% accepted | regression; removed |
+| n-gram speculation, depth 4 | 5.57 tok/s, 40.0% accepted | regression; removed |
+| cleaned greedy path | 6.23 tok/s | best comparable 128-token run |
+| 4,084-token exact prefill | 49-51 s | retained baseline |
+| selective prefill, cap 1024 | 49.7 s | no gain at 4k |
+| selective prefill, cap 512 | 50.8 s | regression at 4k |
+
+An isolated oQ2 Metal GEMV comparison explained why kernel tuning did not improve end-to-end decode. Scalar kernels delivered 20-36 GB/s, packed-word kernels 49-92 GB/s, and SIMD reduction 105-124 GB/s with maximum error 4.5e-08. Despite the fast SIMD kernel, CPU/GPU synchronization at layer boundaries dominated the full model. A future Metal decoder must keep residuals, routing, attention and expert execution on-device for the whole forward; another per-layer GEMV session is not useful.
 
 ## Phase 6 — 256k hardening + release gate
 

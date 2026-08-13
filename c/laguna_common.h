@@ -379,27 +379,6 @@ static inline void axpy_f32(float *y, float a, const float *x, int n) {
     }
     for (; i < n; i++) y[i] += a*x[i];
 }
-/* int8 x int8 dot (symmetric, per-row scaled). The attention KV cache is int8
- * with one scale per row; quantizing the query row the same way lets the score
- * walk run as UDOT (FEAT_DotProd, 16 int8 MACs/instruction) instead of staging
- * K to f32 and dotting in f32. Numeric (opt-in LG_DEC_Q8, decode-only), gated
- * on fixture parity. */
-static inline int32_t dot_i8i8(const int8_t *a, const int8_t *b, int n) {
-    int32_t s = 0;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
-    int i = 0;
-    for (; i + 32 <= n; i += 32) {
-        a0 = vdotq_s32(a0, vld1q_s8(a+i),    vld1q_s8(b+i));
-        a1 = vdotq_s32(a1, vld1q_s8(a+i+16), vld1q_s8(b+i+16));
-    }
-    s = vaddvq_s32(vaddq_s32(a0, a1));
-    for (; i < n; i++) s += (int32_t)a[i]*(int32_t)b[i];
-#else
-    for (int i = 0; i < n; i++) s += (int32_t)a[i]*(int32_t)b[i];
-#endif
-    return s;
-}
 #else
 static inline float dot_f32(const float *a, const float *b, int n) {
     float r = 0; for (int i = 0; i < n; i++) r += a[i]*b[i]; return r;
@@ -477,115 +456,16 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 }
 
 /* Rows below which the GPU loses. A Metal dispatch round-trip measures 0.327 ms
- * on M5, so a small GEMM is pure latency; upstream colibri.c gates its own GPU
- * GEMM at 16 rows for the same reason. LG_METAL_MIN overrides for experiments. */
-static int g_metal_min = 32;
+ * on M5, so a small GEMM is pure latency. Keep this gate fixed: the old
+ * LG_METAL_MIN environment knob was never read and only suggested a tuning
+ * surface that could not change execution. */
+#define LG_METAL_MIN_ROWS 32
 
-/* ---- persistent decode GEMV path (LAGUNA-FORK, Phase 2) ---------------------
- * Decode is a per-token stream of small GEMVs over the resident oQ2 weights. The
- * prefill GEMM path is gated S>=32 and the f16 MPS uploads would double decode's
- * weight memory, so decode gets its OWN Metal path: one persistent LgDecode
- * session with page-aligned host output regions (c/laguna_metal.h). The layer's
- * GEMVs are enqueued and committed as ONE command buffer (dec_batch_*), so the
- * CPU pays a single commit+wait per layer instead of one round trip per matrix
- * (measured ~0.33 ms each on M5 -- at 40 layers that is the whole 140 tok/s
- * budget). Every entry point returns 0 / no-ops when Metal is off, so the CPU
- * matmul_oq path below is the floor and a per-matrix fallback stays bit-exact.
- *
- * Activated by LAGUNA_DEC_GPU=1 (default off: the plain CPU decode path must
- * remain the byte-exact default, and the oQ2 kernels are validated separately by
- * c/tests/decode_gemv_parity.mm). Only oQ-packed weights (W.qbits>0) are
- * representable; the tiny fixtures are f32 so they can never take this path and
- * stay token-exact by construction. */
-#ifdef LAGUNA_METAL
-static LgDecode *g_dec = NULL;
-static int g_dec_on = 0;
-#define LG_DEC_SMAX 25          /* spec batch (LG_SPEC_MAX=24) + 1 */
-
-typedef struct { const Wt *w; float *host; int ry; } DecReg;
-static DecReg dec_regs[512]; static int n_dec_regs = 0;
-
-typedef struct { float *y; float *host; size_t bytes; } DecCopy;
-static DecCopy dec_copies[64]; static int n_dec_copies = 0;
-static int dec_batch_open = 0;
-
-static void dec_init(void) {
-    if (g_dec) return;
-    const char *e = getenv("LAGUNA_DEC_GPU");
-    if (!e || atoi(e) == 0) return;         /* off by default: CPU stays byte-exact */
-    if (!lg_metal_init()) return;
-    g_dec = lg_decode_new();
-    g_dec_on = !!g_dec;
-    if (g_dec_on) fprintf(stderr, "[metal] decode GEMV path active (LAGUNA_DEC_GPU=1)\n");
-}
-
-/* One persistent page-aligned region per oQ weight, lazily. The cache is keyed
- * on the OWNER's Wt* (&l->q etc.), not a by-value copy: dec_batch_add used to
- * take Wt by value and key on &local, which every call site mapped to the same
- * stack slot, so q/k/v/gt shared one region and silently overwrote each other
- * (Phase 2's parity .mm bypassed dec_reg_for with an explicit ry, so it never
- * caught this -- end-to-end decode was garbage but "parity green"). */
-static int dec_reg_for(const Wt *w, int Smax, int *ry, float **host) {
-    for (int i = 0; i < n_dec_regs; i++)
-        if (dec_regs[i].w == w) { *ry = dec_regs[i].ry; *host = dec_regs[i].host; return 1; }
-    if (n_dec_regs == 512) return 0;
-    size_t bytes = (size_t)Smax * w->rows * 4;
-    void *p = NULL;
-    /* lg_decode_region demands NSPageSize() alignment (16384 on arm64, 4096 on
-     * x86); anything less is rejected and the matrix silently falls back to
-     * CPU. 16384-aligned covers both. */
-    if (posix_memalign(&p, 16384, bytes)) return 0;
-    int r = lg_decode_region(g_dec, (float*)p, bytes);
-    if (r < 0) { free(p); return 0; }
-    dec_regs[n_dec_regs].w = w; dec_regs[n_dec_regs].host = (float*)p; dec_regs[n_dec_regs].ry = r;
-    *ry = r; *host = (float*)p; n_dec_regs++;
-    return 1;
-}
-
-/* Enqueue y[S,O] = x @ dequant(W)^T into the current layer batch. Returns 1 if
- * enqueued (caller must dec_batch_end to run + copy back), 0 if this matrix
- * must stay on the CPU matmul_oq path (no Metal, flag off, not oQ, shape not
- * representable, or this would be the 65th matrix of the batch). W is a
- * STABLE pointer to the caller's matrix (e.g. &l->q), used as the region key. */
-static int dec_batch_add(float *y, const float *x, const Wt *W, int S, int I, int O) {
-    if (!g_dec_on || !W->qbits) return 0;
-    if (S < 1 || S > LG_DEC_SMAX) return 0;
-    if (I != W->in || O != W->rows) return 0;
-    if (n_dec_copies == 64) return 0;
-    int ry; float *host;
-    if (!dec_reg_for(W, LG_DEC_SMAX, &ry, &host)) return 0;
-    if (!dec_batch_open) { lg_decode_begin(g_dec, S); dec_batch_open = 1; }
-    if (!lg_decode_gemv(g_dec, ry, 0, x, W->q32, 0, W->qs, 0, W->qb, 0,
-                        W->rows, W->in, W->qbits, W->gs, LG_DEC_OQF32)) return 0;
-    dec_copies[n_dec_copies].y = y; dec_copies[n_dec_copies].host = host;
-    dec_copies[n_dec_copies].bytes = (size_t)S * O * 4;
-    n_dec_copies++;
-    return 1;
-}
-
-/* Commit the batch (ONE command buffer) and copy every enqueued result back. */
-static int dec_batch_end(void) {
-    int n = n_dec_copies;
-    int ncop = n_dec_copies;
-    n_dec_copies = 0;
-    dec_batch_open = 0;
-    if (n == 0) return 1;
-    if (!lg_decode_run(g_dec)) return 0;
-    for (int i = 0; i < ncop; i++)
-        memcpy(dec_copies[i].y, dec_copies[i].host, dec_copies[i].bytes);
-    return 1;
-}
-
-/* Convenience: one matrix through the decode path (run immediately). */
-static int dec_mm(float *y, const float *x, const Wt *W, int S, int I, int O) {
-    if (!dec_batch_add(y, x, W, S, I, O)) return 0;
-    return dec_batch_end();
-}
-#endif
+#define LG_DEC_SMAX 25          /* small decode/teacher-forcing batch bound */
 
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
 #ifdef LAGUNA_METAL
-    if (W.gpu && S >= g_metal_min && !omp_in_parallel() &&
+    if (W.gpu && S >= LG_METAL_MIN_ROWS && !omp_in_parallel() &&
         lg_metal_gemm(W.gpu, y, x, S)) return;
 #endif
     if (W.qbits) matmul_oq(y, x, W.q32, W.qs, W.qb, S, I, O, W.qbits, W.gs);
@@ -1222,7 +1102,6 @@ static void wt_to_gpu(Wt *w, int rows, int in, double *spent, double budget) {
 static void load_gpu_weights(Model *m) {
     Cfg *c = &m->c;
     if (!lg_metal_init()) { fprintf(stderr, "[metal] unavailable, CPU only\n"); return; }
-    dec_init();
     /* Spend the reserve set aside before the expert cache was sized, so the
      * projections cannot be crowded out by a cache that already took the room. */
     double budget = m->proj_reserve > 0 ? m->proj_reserve : 4e9;
@@ -1729,32 +1608,10 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     float *k  = afloat((int64_t)S*kvdim);
     float *vv = afloat((int64_t)S*kvdim);
     float *gt = afloat((int64_t)S*H);
-    /* PHASE 2 (LAGUNA-FORK): the four projections share one decode command
-     * buffer when the flag is on and S is a decode batch; if ANY of them is not
-     * representable (fallback = 0), the whole group stays on the CPU so the
-     * matmul_w calls below remain bit-exact. The GPU results are read back by
-     * dec_batch_end, so the CPU rope/rmsnorm below sees the same numbers as the
-     * CPU path (parity-tested in c/tests/decode_gemv_parity.mm). */
-#ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on &&
-        dec_batch_add(q, x, &l->q, S, D, qdim) &&
-        dec_batch_add(k, x, &l->k, S, D, kvdim) &&
-        dec_batch_add(vv, x, &l->v, S, D, kvdim) &&
-        dec_batch_add(gt, x, &l->g, S, D, H)) {
-        dec_batch_end();
-    } else {
-        dec_batch_end();                     /* clear any partial batch */
-        matmul_w(q,  x, l->q, S, D, qdim);
-        matmul_w(k,  x, l->k, S, D, kvdim);
-        matmul_w(vv, x, l->v, S, D, kvdim);
-        matmul_w(gt, x, l->g, S, D, H);
-    }
-#else
     matmul_w(q,  x, l->q, S, D, qdim);
     matmul_w(k,  x, l->k, S, D, kvdim);
     matmul_w(vv, x, l->v, S, D, kvdim);
     matmul_w(gt, x, l->g, S, D, H);
-#endif
     rope_grow(m, lt, pos0 + S);
     for (int s = 0; s < S; s++) {
         int pos = pos0 + s;
@@ -1803,19 +1660,6 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * scratch stops growing with prompt length. */
     #define LG_QB 8
     #define LG_KC 64
-    #ifndef LAGUNA_METAL
-    #define LG_DEC_SMAX 25        /* decode batch bound, Metal-only upstream */
-    #endif
-    /* M4 (LAGUNA-FORK) opt-in: decode-attention UDOT scoring (LG_DEC_Q8=1).
-     * Quantize each query ONCE per (KV head, query block); the int8@int8
-     * score won't match f32 bit-for-bit, so this is opt-in and decode-only and
-     * must clear the fixture-parity gate (tests/test_laguna_tiny.py). */
-    static int lg_dec_q8 = -1;
-    if (lg_dec_q8 < 0) {
-        const char *e = getenv("LG_DEC_Q8");
-        lg_dec_q8 = e && *e && *e != '0';
-    }
-    int q8_ok = lg_dec_q8 && S <= LG_DEC_SMAX;
 
     /* APPEND FIRST (LAGUNA-FORK). The GPU path now reads this int8 cache in
      * place rather than a separate f16 copy, so this chunk's own K/V must be in
@@ -1924,15 +1768,6 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         float *qt    = falloc((int64_t)LG_QB * hd);   /* contiguous query tile */
         float *kstage = falloc((int64_t)LG_KC * hd);  /* int8 KV -> f32, per chunk */
         float *vstage = falloc((int64_t)LG_KC * hd);
-        /* M4 (LAGUNA-FORK): opt-in decode-attention UDOT scoring. When
-         * lg_dec_q8 is set, each query row is quantized to int8 once (per
-         * (KV head, query block)) and scored against the int8 K cache rows
-         * directly via dot_i8i8 (FEAT_DotProd) instead of unpacking K to f32
-         * and dotting in f32 — the same trick q8r.h uses for routed experts.
-         * Numeric (opt-in), decode-only (S <= LG_DEC_SMAX), gated on the
-         * fixture-parity gate below. */
-        int8_t *q8scr = q8_ok ? (int8_t*)malloc((size_t)LG_QB * hd) : NULL;
-        float q8s[LG_QB];
         #pragma omp for collapse(2) schedule(static)
         for (int kh = 0; kh < KV; kh++) {
             for (int sb = 0; sb < S; sb += LG_QB) {
@@ -1965,15 +1800,6 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     for (int b = 0; b < nb; b++)
                         memcpy(qt + (int64_t)b*hd, q + (int64_t)(sb+b)*qdim + hq*hd,
                                (size_t)hd*sizeof(float));
-                    /* M4: quantize the query tile once, per (KV head, query
-                     * block). Per-row symmetric int8 with one scale each,
-                     * exactly like the kv_i8 cache, so the score below is
-                     * s_q*s_k*dot(q8,k8), matching the f32 dot up to the
-                     * order it accumulates in. */
-                    if (q8_ok)
-                        for (int b = 0; b < nb; b++)
-                            kv_i8_pack(q8scr + (int64_t)b*hd, &q8s[b],
-                                       qt + (int64_t)b*hd, hd);
                     /* PHASE 3 (LAGUNA-FORK): selection-walk. When the post-prefill
                      * selection pass is on and this is a decode batch on a full
                      * layer, iterate ONLY the selected KV positions (from the
@@ -2003,10 +1829,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                             int t = sel_use ? tlist[r0 + j] : (t0 + r0 + j);
                             if (t >= pos0) break;
                             int64_t sl = LG_KSLOT(t);
-                            /* M4: in the q8 path K is scored as raw int8 below,
-                             * so only the V side needs staging here. */
-                            if (!q8_ok)
-                                kv_i8_unpack(kstage + (int64_t)j*hd, Kh + sl*hd, Kq[sl], hd);
+                            kv_i8_unpack(kstage + (int64_t)j*hd, Kh + sl*hd, Kq[sl], hd);
                             kv_i8_unpack(vstage + (int64_t)j*hd, Vh + sl*hd, Vq[sl], hd);
                         }
                         for (int j = 0; j < tn; j++) {
@@ -2014,19 +1837,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                             const float *kv = t >= pos0
                                 ? k  + (int64_t)(t-pos0)*kvdim + kh*hd
                                 : kstage + (int64_t)j*hd;
-                            /* cached rows in the q8 path score raw int8
-                             * (s_q*s_k*dot(q8,k8)) instead of the staged f32 */
-                            int64_t sl8 = q8_ok && t < pos0 ? LG_KSLOT(t) : -1;
                             for (int b = 0; b < nb; b++) {
                                 int qpos = pos0 + sb + b;
                                 float v = -INFINITY;
                                 if (t <= qpos && !(c->slide[li] && t < qpos - c->window + 1)) {
-                                    if (sl8 >= 0)
-                                        v = (float)dot_i8i8(q8scr + (int64_t)b*hd,
-                                                            Kh + sl8*hd, hd)
-                                            * q8s[b] * Kq[sl8] * scale;
-                                    else
-                                        v = dot_f32(qt + (int64_t)b*hd, kv, hd) * scale;
+                                    v = dot_f32(qt + (int64_t)b*hd, kv, hd) * scale;
                                 }
                                 sbuf[(int64_t)b*LG_KC + j] = v;
                             }
@@ -2074,17 +1889,11 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
             }
         }
         free(accum); free(sbuf); free(qt); free(kstage); free(vstage);
-        if (q8scr) free(q8scr);
     }
     #undef LG_QB
     #undef LG_KC
 #ifdef LAGUNA_METAL
 attn_out: ;   /* empty statement: a label must precede a statement, not a decl */
-#endif
-#ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(out, ctx, &l->o, S, qdim, D)) {
-        /* o_proj ran on the decode path */
-    } else
 #endif
     matmul_w(out, ctx, l->o, S, qdim, D);
     /* q/k/vv/gt/ctx are arena-owned; reclaimed by arena_reset() per layer */
@@ -2094,26 +1903,9 @@ attn_out: ;   /* empty statement: a label must precede a statement, not a decl *
 static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, I = c->dense_inter;
     float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
-#ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on &&
-        dec_batch_add(g, x, &l->dg, S, D, I) &&
-        dec_batch_add(u, x, &l->du, S, D, I)) {
-        dec_batch_end();
-    } else {
-        dec_batch_end();
-        matmul_w(g, x, l->dg, S, D, I);
-        matmul_w(u, x, l->du, S, D, I);
-    }
-#else
     matmul_w(g, x, l->dg, S, D, I);
     matmul_w(u, x, l->du, S, D, I);
-#endif
     for (int64_t i = 0; i < (int64_t)S*I; i++) g[i] = siluf(g[i]) * u[i];
-#ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(out, g, &l->dd, S, I, D)) {
-        /* dd ran on the decode path */
-    } else
-#endif
     matmul_w(out, g, l->dd, S, I, D);
     free(g); free(u);
 }
@@ -2162,102 +1954,6 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
     int64_t npair = (int64_t)S*K;
     int64_t *visit = NULL;         /* streaming visit order; NULL on the resident path */
-
-    /* ---- BATCHED ROUTED-EXPERT DECODE (Phase 5) -----------------------------
-     * Experimental (opt-in LG_DEC_EXP_ON=1), DECODE-ONLY (S==1): routes a
-     * layer's routed-expert pairs through the same one-dispatch-per-matrix
-     * kernel as prefill (lg_metal_moe_layer): pairs sorted by expert, ONE
-     * compacted tile list, gate+up+silu+down in ONE command buffer, one
-     * commit+wait per layer instead of 24 tiny S=1 gemvs + 2 waits. The oQ
-     * codes are read straight out of the mmap'd gx slabs (page cache, no slot
-     * cache, no fill). Falls back to the CPU paths below on any failure.
-     *
-     * MEASURED 2026-08-12 (Laguna-XS-2.1-oQ2, 40-token decode A/B): the old
-     * per-pair S=1 loop was a THROUGHPUT REGRESSION vs the CPU oQ-cache path
-     * (1.88 vs 3.25 tok/s). The batched kernel is identical in shape to
-     * prefill, so rows/expert stays ~topk at pure S=1 (the kernel's 31 GFLOP/s
-     * worst regime) -- the win only appears when the ngram spec-verify batch
-     * (LG_SPEC_MAX=24 tokens) rides the same path and rows/expert reach TM=64.
-     * Kept opt-in behind LG_DEC_EXP_ON. */
-#ifdef LAGUNA_METAL
-    if (m->gx && m->experts == EXP_OQ && g_dec_on && !omp_in_parallel() &&
-        S == 1 && npair <= 4096 && getenv("LG_DEC_EXP_ON")) {
-        int bits = m->oq.bits ? m->oq.bits : 2, gs = m->oq.gs ? m->oq.gs : 64;
-        if (bits >= 1 && bits <= 8 && (gs * bits) % 32 == 0 &&
-            D % gs == 0 && I % gs == 0) {
-            int64_t *vis = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
-            int *cnt = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
-            memset(cnt, 0, (size_t)(E + 1) * sizeof(int));
-            for (int64_t t = 0; t < npair; t++) cnt[idx[t] + 1]++;
-            for (int e = 0; e < E; e++) cnt[e+1] += cnt[e];
-            int *estart = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
-            memcpy(estart, cnt, (size_t)(E + 1) * sizeof(int));
-            for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
-
-            GpuExp *G = &m->gx[(size_t)layer * 3];
-            void *hx = lg_metal_scratch(0, (size_t)npair * D * sizeof(float));
-            void *hg = lg_metal_scratch(1, (size_t)npair * I * sizeof(float));
-            void *hu = lg_metal_scratch(2, (size_t)npair * I * sizeof(float));
-            void *hh = lg_metal_scratch(3, (size_t)npair * D * sizeof(float));
-            float *xb = (float*)lg_metal_scratch_ptr(hx);
-            float *gb = (float*)lg_metal_scratch_ptr(hg);
-            float *ub = (float*)lg_metal_scratch_ptr(hu);
-            float *hb = (float*)lg_metal_scratch_ptr(hh);
-            void *ho = lg_metal_scratch(4, (size_t)(E + 1) * sizeof(unsigned));
-            unsigned *offs = (unsigned*)lg_metal_scratch_ptr(ho);
-            int ntiles = 0;
-            if (offs) {
-                for (int e = 0; e <= E; e++) offs[e] = (unsigned)estart[e];
-                for (int e = 0; e < E; e++)
-                    ntiles += (estart[e+1] - estart[e] + LG_EXP_TM - 1) / LG_EXP_TM;
-            }
-            void *ht = lg_metal_scratch(5, (size_t)ntiles * 2 * sizeof(unsigned));
-            unsigned *tiles = (unsigned*)lg_metal_scratch_ptr(ht);
-            if (offs && tiles) {
-                int ti = 0;
-                for (int e = 0; e < E; e++) {
-                    int nr = estart[e+1] - estart[e];
-                    for (int r0 = 0; r0 < nr; r0 += LG_EXP_TM) {
-                        tiles[ti*2] = (unsigned)e; tiles[ti*2+1] = (unsigned)r0; ti++;
-                    }
-                }
-            }
-            if (xb && gb && ub && hb && offs && tiles && ntiles > 0) {
-                for (int64_t r = 0; r < npair; r++)
-                    memcpy(xb + r*D, x + (vis[r]/K)*D, (size_t)D*sizeof(float));
-                size_t wslabGU = (size_t)G[0].N * (((size_t)D*bits+31)/32) * 4;
-                size_t sslabGU = (size_t)G[0].N * (D/gs) * 2;
-                size_t wslabD  = (size_t)G[2].N * (((size_t)I*bits+31)/32) * 4;
-                size_t sslabD  = (size_t)G[2].N * (I/gs) * 2;
-                double te = now_s();
-                int dbg = getenv("LG_DBG_PHASE") != NULL;
-                int ok = lg_metal_moe_layer(
-                        G[0].wmap,G[0].woff,G[0].smap,G[0].soff,G[0].bmap,G[0].boff,
-                        G[1].wmap,G[1].woff,G[1].smap,G[1].soff,G[1].bmap,G[1].boff,
-                        G[2].wmap,G[2].woff,G[2].smap,G[2].soff,G[2].bmap,G[2].boff,
-                        hx,hg,hu,hh,ho,ht, ntiles,(int)npair,D,I,gs,bits,
-                        wslabGU,sslabGU,wslabD,sslabD);
-                if (dbg) fprintf(stderr,
-                    "[phase] L%2d dec-moe %.1fms ntiles=%d npair=%lld ok=%d\n",
-                    layer, (now_s()-te)*1000, ntiles, (long long)npair, ok);
-                if (ok) {
-                    for (int64_t r = 0; r < npair; r++) {
-                        int64_t t = vis[r];
-                        int s = (int)(t / K), kk = (int)(t % K);
-                        float sc = wgt[(int64_t)s*K + kk];
-                        float *os = out + (int64_t)s*D, *hr = hb + r*D;
-                        for (int d = 0; d < D; d++) os[d] += sc * hr[d];
-                    }
-                    m->t_expert += now_s() - te;
-                    m->hits += npair;
-                    visit = NULL;
-                    goto moe_shared;
-                }
-            }
-            memset(out, 0, (size_t)S*D*sizeof(float));
-        }
-    }
-#endif
 
     /* ---- GPU PATH (LAGUNA-FORK) --------------------------------------------
      * Weights are mmap'd, not resident: the kernel dequantizes 2-bit oQ codes
@@ -2602,26 +2298,9 @@ moe_shared:
     { double ts = now_s();
     int SI = c->shared_inter;
     float *sg = afloat((int64_t)S*SI), *su = afloat((int64_t)S*SI), *sd = afloat((int64_t)S*D);
-#ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on &&
-        dec_batch_add(sg, x, &l->sh_g, S, D, SI) &&
-        dec_batch_add(su, x, &l->sh_u, S, D, SI)) {
-        dec_batch_end();
-    } else {
-        dec_batch_end();
-        matmul_w(sg, x, l->sh_g, S, D, SI);
-        matmul_w(su, x, l->sh_u, S, D, SI);
-    }
-#else
     matmul_w(sg, x, l->sh_g, S, D, SI);
     matmul_w(su, x, l->sh_u, S, D, SI);
-#endif
     for (int64_t i = 0; i < (int64_t)S*SI; i++) sg[i] = siluf(sg[i]) * su[i];
-#ifdef LAGUNA_METAL
-    if (S <= LG_DEC_SMAX && !omp_in_parallel() && g_dec_on && dec_mm(sd, sg, &l->sh_d, S, SI, D)) {
-        /* sh_d ran on the decode path */
-    } else
-#endif
     matmul_w(sd, sg, l->sh_d, S, SI, D);
     for (int64_t i = 0; i < (int64_t)S*D; i++) out[i] += sd[i];
     /* sg/su/sd are arena-owned */
@@ -2734,9 +2413,10 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
         double w0 = trace ? now_s() : 0;
         double a0 = m->t_attn, e0 = m->t_expert, f0 = m->t_fill, s0 = m->t_shared;
         free(logit);
-        /* tf_out (teacher-forcing argmax per position) is filled per chunk at the
-         * matching offset so chunking is invisible to the fixtures. */
-        logit = step_raw(m, ids + off, n, pos0 + off, tf_out ? tf_out + off : NULL);
+        /* step_raw indexes tf_out by absolute position, so retain the original
+         * base pointer while advancing ids/pos0. Advancing tf_out as well would
+         * apply `off` twice and eventually write beyond the caller's buffer. */
+        logit = step_raw(m, ids + off, n, pos0 + off, tf_out);
         if (trace)
             fprintf(stderr, "[chunk] %d/%d pos %d..%d n=%d prefill %.1fs attn %.1fs expert-mm %.1fs fill %.1fs shared %.1fs\n",
                     off / chunk + 1, (S + chunk - 1) / chunk, pos0 + off, pos0 + off + n - 1, n,
@@ -2996,35 +2676,6 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out, i
     *n_out = len;
 }
 
-/* SPECULATIVE N-GRAM DRAFT (LAGUNA-FORK): draft() finds the longest recent
- * repeat of the last 2-3 tokens in the sequence-so-far and proposes whatever
- * followed it last time. Free to attempt (no model call) and free to reject
- * (the verify step below runs anyway). Ported from deepseek_v4.c's
- * v4_ngram_draft with the same trigram->bigram fallback; see
- * docs/ENGINEERING.md for why this and not a trained draft
- * model. LG_SPEC_MAX caps how many tokens are proposed per round; LG_SPEC=0
- * disables speculation entirely for a clean A/B against the plain loop. */
-static int ngram_draft(const int *seq, int count, int *out, int maximum) {
-    if (!seq || !out || maximum < 1) return 0;
-    for (int gram = 3; gram >= 2; gram--) {
-        if (count < gram + 1) continue;
-        int tail = count - gram;
-        for (int start = count - gram - 1; start >= 0; start--) {
-            int matches = 1;
-            for (int item = 0; item < gram; item++)
-                if (seq[start + item] != seq[tail + item]) { matches = 0; break; }
-            if (!matches) continue;
-            int from = start + gram;
-            int take = count - from;
-            if (take > maximum) take = maximum;
-            if (take < 1) break;
-            for (int item = 0; item < take; item++) out[item] = seq[from + item];
-            return take;
-        }
-    }
-    return 0;
-}
-
 /* ---------- interactive prompt: greedy, streaming, stop on eos ---------- */
 static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     Cfg *c = &m->c;
@@ -3040,45 +2691,6 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     fflush(stdout);
     int len = np;
     char buf[512];
-    /* seq[] tracks the whole sequence (prompt + generated) for the n-gram
-     * lookup; cap it generously since n_new is bounded by the caller. */
-    int *seq = malloc((size_t)(np + n_new + 8) * sizeof(int));
-    memcpy(seq, ids, (size_t)np * sizeof(int));
-    int seqn = np;
-    int spec_max = getenv("LG_SPEC_MAX") ? atoi(getenv("LG_SPEC_MAX")) : 4;
-    if (spec_max < 0) spec_max = 0;
-    if (spec_max > 24) spec_max = 24;
-    int spec_on = getenv("LG_SPEC") ? atoi(getenv("LG_SPEC")) != 0 : (spec_max > 0);
-    uint64_t spec_drafted = 0, spec_accepted = 0, spec_rounds = 0;
-    /* PER-DEPTH ACCEPTANCE + ADAPTIVE DEPTH (LAGUNA-FORK).
-     * spec_ddf[d]/spec_acc[d] count drafts of depth >= d and rounds accepted
-     * >= d, so the marginal survival curve A_d is measurable (the flat
-     * A/D aggregate cannot separate "adopts 4 of 6" from "adopts 1, sometimes
-     * 5"). LG_SPEC_ADAPT=1 (default) clamps the effective depth to 1 whenever
-     * the rolling acceptance over the last LG_SPEC_WIN drafts clears
-     * LG_SPEC_MINACC -- a hopeless n-gram source stops paying S>2 verify
-     * forwards, a live one keeps full depth. Reject-only: the accepted set is
-     * still model-confirmed, so token output is unchanged; only the number of
-     * batched forwards we spend on drafts changes. */
-    int spec_adapt = getenv("LG_SPEC_ADAPT") ? atoi(getenv("LG_SPEC_ADAPT")) : 1;
-    int spec_win = getenv("LG_SPEC_WIN") ? atoi(getenv("LG_SPEC_WIN")) : 64;
-    if (spec_win < 1) spec_win = 1;
-    double spec_minacc = getenv("LG_SPEC_MINACC") ? atof(getenv("LG_SPEC_MINACC")) : 0.5;
-    int *wn = calloc((size_t)spec_win, sizeof(int));
-    int *wa = calloc((size_t)spec_win, sizeof(int));
-    int wi = 0, wfull = 0, eff_max = spec_max;
-    int spec_ddf[25] = {0}, spec_acc[25] = {0};
-    /* BUG FIXED (caught by AddressSanitizer, not review): step_raw() writes
-     * tf_out[pos0 + s], i.e. ABSOLUTE position, not a 0-based batch index --
-     * that's how the fixture's teacher-forcing path already uses it (a
-     * full-length buffer, pos0=0). A fixed tf[25] stack array with pos0 =
-     * len-1 (len in the hundreds by mid-generation) wrote miles past the end
-     * of that array -- confirmed stack-use-after-scope /
-     * out-of-bounds-write via ASan, not a benign lint nit. Fix: allocate one
-     * buffer sized to cover every position this call ever uses (np+n_new+8,
-     * same bound as seq[]) and always read/write it at the ABSOLUTE index
-     * step_raw expects, never a small per-round scratch array. */
-    int *tf_buf = malloc((size_t)(np + n_new + 8) * sizeof(int));
     int s = 0;
     while (s < n_new) {
         int best = 0; float bv = logit[0];
@@ -3088,89 +2700,11 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
         if (is_eos(c, best)) { printf("\n[eos after %d tokens]", s); break; }
         int nb = tok_decode(T, &best, 1, buf, sizeof(buf)-1);
         buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
-        seq[seqn++] = best;
         len++; s++;
         if (s == n_new) break;
-
-        /* SPECULATIVE VERIFY ROUND (LAGUNA-FORK): draft up to spec_max tokens
-         * from the n-gram match, then verify ALL of them in ONE batched
-         * step() call instead of one call per token. tf_buf[pos0+i] is what
-         * the real model predicts right after consuming batch[i] -- i.e. the
-         * model's own claim about position pos0+i+1 -- so it is compared
-         * against draft[i] (our guess for that same position). Accept the
-         * longest matching prefix; KV rows written for the rejected tail are
-         * silently overwritten by the next call at the same absolute
-         * positions (kv_len is metadata only, not a masking bound -- see
-         * docs/ENGINEERING.md), so no explicit rollback is
-         * needed. */
-        int room = n_new - s;
-        int draft[24] = {0};
-        int ndraft = 0;
-        if (spec_on && room > 0) {
-            int want = (eff_max < room) ? eff_max : room;
-            ndraft = ngram_draft(seq, seqn, draft, want);
-        }
-        if (ndraft > 0) {
-            int batch[25]; batch[0] = best;
-            for (int i = 0; i < ndraft; i++) batch[i+1] = draft[i];
-            int S = ndraft + 1;
-            int pos0 = len - 1;
-            logit = step(m, batch, S, pos0, tf_buf);
-            spec_rounds++; spec_drafted += (uint64_t)ndraft;
-            int accepted = 0;
-            while (accepted < ndraft && tf_buf[pos0 + accepted] == draft[accepted]) accepted++;
-            spec_accepted += (uint64_t)accepted;
-            for (int d = 1; d <= ndraft; d++) spec_ddf[d]++;
-            for (int d = 1; d <= accepted; d++) spec_acc[d]++;
-            /* rolling acceptance over the last spec_win rounds; adapt depth */
-            wn[wi] = ndraft; wa[wi] = accepted;
-            wi = (wi + 1) % spec_win; if (wi == 0) wfull = 1;
-            if (spec_adapt && ndraft >= 2) {
-                long long td = 0, ta = 0;
-                int n = wfull ? spec_win : wi;
-                for (int i = 0; i < n; i++) { td += wn[i]; ta += wa[i]; }
-                double frac = td ? (double)ta / (double)td : 1.0;
-                eff_max = (frac >= spec_minacc) ? spec_max : 1;
-            }
-            /* Emit the accepted draft tokens (they are now confirmed correct
-             * -- tf_buf's prediction for their predecessor matched what was
-             * fed). The (accepted+1)-th slot is always a fresh, unverified
-             * prediction (tf_buf[pos0+accepted], the real model's own choice
-             * at that point) and becomes next round's `best` via the normal
-             * loop top, WITHOUT being decoded here -- it still needs the
-             * same EOS/decode handling the loop top already does. */
-            for (int i = 0; i < accepted && s < n_new; i++) {
-                int tok = draft[i];
-                if (is_eos(c, tok)) { printf("\n[eos after %d tokens]", s); free(logit); logit=NULL; s = n_new; break; }
-                int nb2 = tok_decode(T, &tok, 1, buf, sizeof(buf)-1);
-                buf[nb2] = 0; fputs(buf, stdout); fflush(stdout);
-                seq[seqn++] = tok;
-                len++; s++;
-            }
-            if (s >= n_new || (logit == NULL)) break;
-            /* logit currently holds the prediction AFTER the full batch
-             * (position pos0+S), which is only valid if every drafted token
-             * was accepted. On a partial/no accept, the correct next
-             * prediction is tf_buf[pos0+accepted] itself -- rebuild a
-             * one-hot-ish "logit" isn't right (tf_buf holds argmax ids, not
-             * logits), so re-run a clean single-token step for the confirmed
-             * position instead of reusing possibly-wrong batched logits.
-             * This costs one extra step call on a rejection, which is still
-             * a net win whenever accepted > 0, and a wash (not a regression)
-             * when accepted == 0. */
-            if (accepted < ndraft) {
-                free(logit);
-                int last_tok = accepted == 0 ? best : draft[accepted - 1];
-                logit = step(m, &last_tok, 1, len - 1, NULL);
-            }
-            continue;
-        }
-        /* no draft available this round: plain single-token step, identical
-         * to the pre-speculation code path. */
         int one = best;
         logit = step(m, &one, 1, len - 1, NULL);
     }
-    free(tf_buf);
     double dt = now_s() - t1;
     int gen = len - np;
 #ifdef LAGUNA_METAL
@@ -3182,21 +2716,6 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     double tot = m->hits + m->miss;
     printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | expert cache hit %.1f%%\n",
            m->t_fill, m->t_expert, m->t_shared, m->t_attn, tot ? 100.0*m->hits/tot : 0.0);
-    if (spec_on) {
-        printf("[spec] %llu rounds | %llu drafted | %llu accepted (%.1f%%)\n",
-               (unsigned long long)spec_rounds, (unsigned long long)spec_drafted,
-               (unsigned long long)spec_accepted,
-               spec_drafted ? 100.0*spec_accepted/spec_drafted : 0.0);
-        int last = 24;
-        while (last > 1 && spec_ddf[last] == 0) last--;
-        printf("[spec] depth-survival");
-        for (int d = 1; d <= last; d++)
-            printf(" A%d=%.0f%%", d,
-                   spec_ddf[d] ? 100.0*spec_acc[d]/spec_ddf[d] : 0.0);
-        printf(" (eff_depth=%d)\n", eff_max);
-    }
-    free(wn); free(wa);
-    free(seq);
     free(ids);
 }
 
@@ -3334,33 +2853,6 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     float rep = getenv("REP_PEN") ? (float)atof(getenv("REP_PEN")) : 1.1f;
     int hist[128], nhist = 0;
     for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
-    /* SPECULATIVE N-GRAM DRAFT (LAGUNA-FORK): same mechanism as generate_stream()
-     * in this file -- ngram_draft() proposes tokens from recent trigram/bigram
-     * repeats, then a SINGLE batched step() verifies all drafts at once. At S=1
-     * the bottleneck is per-token forward overhead (48 layers, shared expert
-     * reload, attention O(context)), so even a 20% n-gram hit rate at depth 4
-     * yields ~1.8x effective throughput: each accepted draft costs zero extra
-     * forward passes beyond the batched verify that already ran.
-     *
-     * LG_SPEC=0 disables; LG_SPEC_MAX caps depth (default 4, max 24). */
-    int spec_max = getenv("LG_SPEC_MAX") ? atoi(getenv("LG_SPEC_MAX")) : 4;
-    if (spec_max < 0) spec_max = 0;
-    if (spec_max > 24) spec_max = 24;
-    int spec_on = getenv("LG_SPEC") ? atoi(getenv("LG_SPEC")) != 0 : (spec_max > 0);
-    uint64_t spec_drafted = 0, spec_accepted = 0, spec_rounds = 0;
-    /* per-depth acceptance + adaptive depth, same contract as generate_stream */
-    int spec_adapt = getenv("LG_SPEC_ADAPT") ? atoi(getenv("LG_SPEC_ADAPT")) : 1;
-    int spec_win = getenv("LG_SPEC_WIN") ? atoi(getenv("LG_SPEC_WIN")) : 64;
-    if (spec_win < 1) spec_win = 1;
-    double spec_minacc = getenv("LG_SPEC_MINACC") ? atof(getenv("LG_SPEC_MINACC")) : 0.5;
-    int *wn = calloc((size_t)spec_win, sizeof(int));
-    int *wa = calloc((size_t)spec_win, sizeof(int));
-    int wi = 0, wfull = 0, eff_max = spec_max;
-    int spec_ddf[25] = {0}, spec_acc[25] = {0};
-    int *seq = malloc((size_t)(np + q->max_tok + 8) * sizeof(int));
-    memcpy(seq, ids, (size_t)np * sizeof(int));
-    int seqn = np;
-     int *tf_buf = malloc((size_t)(np + q->max_tok + 8) * sizeof(int));
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         apply_rep_penalty(logit, c->vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->vocab, q->temp, q->top_p);
@@ -3372,80 +2864,16 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         printf("DATA %s %d\n", q->id, nb);
         fwrite(buf, 1, (size_t)nb, stdout);
         fputc('\n', stdout); fflush(stdout);
-        seq[seqn++] = tk;
         gen++; len++;
         while (coli_stdin_readable()) {
             int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); free(seq); free(tf_buf); free(wn); free(wa); return; }
+            if (r < 0) { free(ids); return; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
 
-        /* SPEC VERIFY ROUND (LAGUNA-FORK): draft up to spec_max tokens from
-         * the n-gram match, then verify ALL in ONE batched step() instead of
-         * one call per token. tf_buf[pos0+i] is the model's argmax at
-         * position pos0+i (i.e. its prediction for the NEXT position, pos0+i+1,
-         * which is where draft[i] sits) -- so it is compared directly against
-         * draft[i]. KV rows for the rejected tail are silently overwritten by
-         * the next call at the same absolute positions (kv_len is metadata only). */
-        int room = q->max_tok - s - 1;
-        int draft[24] = {0};
-        int ndraft = 0;
-        if (spec_on && room > 0) {
-            int want = (eff_max < room) ? eff_max : room;
-            ndraft = ngram_draft(seq, seqn, draft, want);
-        }
-        if (ndraft > 0) {
-            int batch[25]; batch[0] = tk;
-            for (int i = 0; i < ndraft; i++) batch[i + 1] = draft[i];
-            int S = ndraft + 1;
-            int pos0 = len - 1;
-            logit = step(m, batch, S, pos0, tf_buf);
-            spec_rounds++; spec_drafted += (uint64_t)ndraft;
-            int accepted = 0;
-             while (accepted < ndraft && tf_buf[pos0 + accepted] == draft[accepted]) accepted++;
-            spec_accepted += (uint64_t)accepted;
-            for (int d = 1; d <= ndraft; d++) spec_ddf[d]++;
-            for (int d = 1; d <= accepted; d++) spec_acc[d]++;
-            wn[wi] = ndraft; wa[wi] = accepted;
-            wi = (wi + 1) % spec_win; if (wi == 0) wfull = 1;
-            if (spec_adapt && ndraft >= 2) {
-                long long td = 0, ta = 0;
-                int n = wfull ? spec_win : wi;
-                for (int i = 0; i < n; i++) { td += wn[i]; ta += wa[i]; }
-                double frac = td ? (double)ta / (double)td : 1.0;
-                eff_max = (frac >= spec_minacc) ? spec_max : 1;
-            }
-            for (int i = 0; i < accepted && s + 1 + i < q->max_tok; i++) {
-                int tok = draft[i];
-                if (is_eos(c, tok)) { limited = 0; free(logit); logit = NULL; s += accepted; break; }
-                if (nhist < 128) hist[nhist++] = tok;
-                else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tok; }
-                seq[seqn++] = tok;
-                len++; s++; gen++;
-                int nb2 = tok_decode(T, &tok, 1, buf, sizeof(buf)-1);
-                printf("DATA %s %d\n", q->id, nb2);
-                fwrite(buf, 1, (size_t)nb2, stdout);
-                fputc('\n', stdout); fflush(stdout);
-            }
-            if (s + 1 >= q->max_tok || (logit == NULL)) break;
-            while (coli_stdin_readable()) {
-                int r = serve_read_cmd(q->id);
-                if (r < 0) { free(seq); free(tf_buf); free(wn); free(wa); return; }
-                if (r > 0) { cancelled = 1; limited = 0; }
-            }
-            if (cancelled) break;
-            if (accepted < ndraft) {
-                free(logit);
-                int last_tok = accepted == 0 ? tk : draft[accepted - 1];
-                logit = step(m, &last_tok, 1, len - 1, NULL);
-            }
-            continue;
-        }
         logit = step(m, &tk, 1, len - 1, NULL);
     }
-    free(seq); free(tf_buf);
-    free(wn); free(wa);
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
@@ -3453,20 +2881,6 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
            dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
            m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
-    if (spec_on && spec_rounds)
-        fprintf(stderr, "[spec] %llu rounds | %llu drafted | %llu accepted (%.1f%%)\n",
-                (unsigned long long)spec_rounds, (unsigned long long)spec_drafted,
-                (unsigned long long)spec_accepted,
-                spec_drafted ? 100.0*spec_accepted/spec_drafted : 0.0);
-    if (spec_on && spec_rounds) {
-        int last = 24;
-        while (last > 1 && spec_ddf[last] == 0) last--;
-        fprintf(stderr, "[spec] depth-survival");
-        for (int d = 1; d <= last; d++)
-            fprintf(stderr, " A%d=%.0f%%", d,
-                    spec_ddf[d] ? 100.0*spec_acc[d]/spec_ddf[d] : 0.0);
-        fprintf(stderr, " (eff_depth=%d)\n", eff_max);
-    }
     fflush(stdout);
     free(ids);
 }
