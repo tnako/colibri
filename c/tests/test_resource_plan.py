@@ -520,6 +520,36 @@ class LagunaKvBytesTest(unittest.TestCase):
         self.assertEqual(resource_plan.laguna_kv_bytes(cfg, 512, metal=True),
                          4 * 512 * 8 * 132 * 2)
 
+    def test_laguna_selp_caps_full_layer_kv(self):
+        # Phase-7 selective propagation on a CPU-attention path caps the LATE
+        # full layers to the observation window. Same 4-layer model: layer 0 is
+        # the scoring layer (first full, exempt), layer 3 is the capped one.
+        cfg = {"num_hidden_layers": 4, "num_key_value_heads": 8,
+               "num_attention_heads": 48, "head_dim": 128,
+               "sliding_window": 512,
+               "layer_types": ["full_attention", "sliding_attention",
+                               "sliding_attention", "full_attention"]}
+        # Defaults, 256k, no generation headroom:
+        #   layer 0 full AT context; layer 3 capped to max(8192, 16384+64)+1 = 16449
+        rows = {"full": 262144, "capped": 16449, "slide": 512}
+        expected = (rows["full"] + rows["slide"] * 2 + rows["capped"]) * 8 * 132 * 2
+        self.assertEqual(resource_plan.laguna_kv_bytes(cfg, 262144, metal=False,
+                                                       selp=True),
+                         expected)
+        # gen headroom grows the ring; a small window caps harder.
+        self.assertEqual(
+            resource_plan.laguna_kv_bytes(cfg, 300, metal=False, selp=True,
+                                          sel_cap=100, sel_min=1, gen=64),
+            (300 * 3 + (100 if 100 > 1 + 64 else 1 + 64) + 64 + 1) * 8 * 132 * 2)
+        # Metal targets are never capped (the GPU path needs full KV).
+        self.assertEqual(resource_plan.laguna_kv_bytes(cfg, 262144, metal=True,
+                                                       selp=True),
+                         2 * 262144 * 8 * 132 * 2 + 2 * 17408 * 8 * 132 * 2)
+        # Short context where the capped ring exceeds context stays full.
+        self.assertEqual(resource_plan.laguna_kv_bytes(cfg, 100, metal=False,
+                                                       selp=True),
+                         4 * 100 * 8 * 132 * 2)
+
     def test_plan_reports_nonzero_kv_for_laguna(self):
         model = write_laguna_model(
             self._tmp(), ["full_attention", "sliding_attention",

@@ -79,6 +79,11 @@ static inline int omp_in_parallel(void) { return 0; }
 #define LG_MAXL 128
 #define LG_FULL 0                 /* layer_types[i] == "full_attention"    */
 #define LG_SLIDE 1                /* layer_types[i] == "sliding_attention" */
+/* Score-block width of the selection pass (laguna_common.h's SEL_BLK). The
+ * shared selection index can reference one partially-overlapping block BEYOND
+ * the observation window, so any ring serving indexed reads must hold
+ * `sel_min` positions plus one block's worth (LG_SEL_RING_BLK) of slack. */
+#define LG_SEL_RING_BLK 64
 
 /* Routed-expert tensor layout, probed at load — all four exist in the wild and
  * none is guessed. */
@@ -206,7 +211,11 @@ typedef struct {
     /* rope tables, [pos][rot_dim], grown on demand, one pair per layer type */
     float *cos_t[2], *sin_t[2]; int rope_pos[2];
     /* KV cache: sliding layers keep only `window` slots (ring), full layers
-     * keep max_t. Laid out [kv_head][kvcap][head_dim].
+     * keep max_t EXCEPT the late full layers of a Phase-7 selective-propagation
+     * run on a CPU-attention path, which keep only the selection observation
+     * window (`sel_min + LG_SEL_RING_BLK + gen`, see kv_alloc/laguna_full_ring)
+     * so full-layer KV is O(sel_min) not O(max_t). Laid out
+     * [kv_head][kvcap][head_dim].
      *
      * int8 codes with one f32 scale per row (see kv_i8.h): 4x smaller than f32,
      * which is what makes 256k context fit in a 20 GB budget. */
@@ -1691,6 +1700,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     int qdim = H*hd, kvdim = KV*hd, group = H/KV;
     int kvcap = m->kvcap[li];    /* ring modulus (CPU wraparound), unchanged */
     int kvphys = m->kvphys[li];  /* physical per-head row stride, see kv_alloc */
+    /* A capped full-attention layer (selp observation-window ring, see kv_alloc)
+     * wraps the same way a sliding ring does: kvcap < max_t is the tell. */
+    int kvring = kvcap < m->max_t;
     /* arena: single-threaded, dead at this layer's arena_reset() */
     float *q  = afloat((int64_t)S*qdim);
     float *k  = afloat((int64_t)S*kvdim);
@@ -1787,7 +1799,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         if (c->slide[li] && S > kvcap) s0 = S - kvcap;
         int is_ring = (kvphys != kvcap);   /* sliding + Metal build, see kv_alloc */
         for (int s = s0; s < S; s++) {
-            int pos = pos0 + s, slot = c->slide[li] ? pos % kvcap : pos;
+            int pos = pos0 + s, slot = (c->slide[li] || kvring) ? pos % kvcap : pos;
             for (int h = 0; h < KV; h++) {
                 int64_t base = (int64_t)h*kvphys;
                 int64_t r = base + slot;
@@ -1897,7 +1909,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                                                 : kstage + (int64_t)((t) - tc)*hd)
                 #define LG_VROW(t) ((t) >= pos0 ? vv + (int64_t)((t)-pos0)*kvdim + kh*hd \
                                                 : vstage + (int64_t)((t) - tc)*hd)
-                #define LG_KSLOT(t) ((int64_t)(c->slide[li] ? (t) % kvcap : (t)))
+                #define LG_KSLOT(t) ((int64_t)((c->slide[li] || kvring) ? (t) % kvcap : (t)))
                 for (int hq = kh*group; hq < (kh+1)*group; hq++) {
                     int hi = pos0 + sb + nb - 1;
                     int t0 = 0;
@@ -2679,7 +2691,26 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     return logit;
 }
 
-static void kv_alloc(Model *m, int max_t) {
+/* Full-attention KV ring under PHASE 7 selective propagation (LG_SELP=1) on a
+ * CPU-attention path. The shared selection index only ever references positions
+ * inside the observation window (the last `sel_min` positions) plus one
+ * partially-overlapping score block, so a full layer whose KV only holds the
+ * most recent `win = sel_min + LG_SEL_RING_BLK + gen` rows can serve every
+ * indexed read: the extra `gen` rows keep the prefill-time index valid through
+ * up to `gen` decode appends (each decode step appsends its own row before it
+ * reads). Anything older than `win` has already been dropped from the selection
+ * index by construction -- see sel_pass_at's window clamp. sel_base (the FIRST
+ * full layer) is EXEMPT: it scores the whole prefix post-prefill, so it keeps
+ * full KV. Returns the clamped ring size; callers fall back to max_t when this
+ * exceeds max_t (short contexts / full-cap byte-exact runs keep full KV). */
+static int laguna_full_ring(const Model *m, int max_t, int gen) {
+    int win = m->sel_min + LG_SEL_RING_BLK;
+    if (m->sel_cap > win) win = m->sel_cap;      /* full-cap runs need >= S rows */
+    long long need = (long long)win + gen + 1;
+    return (need < max_t) ? (int)need : max_t;
+}
+
+static void kv_alloc(Model *m, int max_t, int gen) {
     Cfg *c = &m->c;
     if (m->K && max_t <= m->max_t) return;
     if (m->K) {
@@ -2696,6 +2727,12 @@ static void kv_alloc(Model *m, int max_t) {
     m->Vs = calloc(c->n_layers, sizeof(float*));
     m->kvcap  = calloc(c->n_layers, sizeof(int));
     m->kvphys = calloc(c->n_layers, sizeof(int));
+    /* The scoring layer of a Phase-7 run (first full-attention layer) is exempt
+     * from the full-layer ring cap: sel_pass_at scores the ENTIRE prefix there,
+     * so it needs all max_t rows. Mirrors step_raw()'s `sbase` computation. */
+    int sbase = -1;
+    for (int i = 0; i < c->n_layers && sbase < 0; i++) if (!c->slide[i]) sbase = i;
+    int capped = 0;
     for (int i = 0; i < c->n_layers; i++) {
         /* sliding layers only ever read the last `window` positions, so a ring
          * of exactly `window` rows is enough for the CPU -- the post-scoring
@@ -2720,11 +2757,26 @@ static void kv_alloc(Model *m, int max_t) {
          * instead of just `window` -- still O(1) in context, just a bigger
          * constant -- then double-map THAT ring so any window+chunk-1-wide
          * band starting anywhere in it is contiguous. */
-        int ring = c->window;
+        int cap;
+        if (c->slide[i] && c->window > 0) {
+            int ring = c->window;
 #ifdef LAGUNA_METAL
-        if (c->slide[i] && c->window > 0) ring = c->window + lg_chunk();
+            ring += lg_chunk();
 #endif
-        int cap = (c->slide[i] && c->window > 0 && ring < max_t) ? ring : max_t;
+            cap = (ring < max_t) ? ring : max_t;
+        } else if (m->selp && !m->gpu_attn && i != sbase) {
+            /* FULL-ATTENTION cap (LAGUNA-FORK): with selective propagation
+             * engaged on a CPU-attention path, late full layers only ever read
+             * the selected positions, all of which live inside the observation
+             * window. Hold just that window instead of the whole context, so
+             * the full-layer KV footprint is O(sel_min) rather than O(max_t) --
+             * at 256k on Laguna-S that is ~0.4 GB instead of ~6.1 GB for the
+             * layers that share the index. sel_base keeps everything (above). */
+            cap = laguna_full_ring(m, max_t, gen);
+            if (cap < max_t) capped++;
+        } else {
+            cap = max_t;
+        }
         m->kvcap[i] = cap;   /* ring modulus: CPU wraparound (`pos % kvcap`) */
 #ifdef LAGUNA_METAL
         int is_ring = (c->slide[i] && cap < max_t);
@@ -2752,6 +2804,14 @@ static void kv_alloc(Model *m, int max_t) {
         if (!m->K[i] || !m->V[i] || !m->Ks[i] || !m->Vs[i]) {
             fprintf(stderr, "OOM kv cache\n"); exit(1);
         }
+    }
+    if (capped > 0) {
+        int rr = laguna_full_ring(m, max_t, gen);
+        double rowb = (double)c->n_kv * (c->head_dim + 4) * 2;
+        fprintf(stderr, "[kv] %d full layers capped to %d rows/head (selp observation window; "
+                        "full-layer KV %.2f GB vs %.2f GB at full context)\n",
+                capped, rr, (double)capped * rr * rowb / 1e9,
+                (double)capped * max_t * rowb / 1e9);
     }
 }
 
@@ -2793,7 +2853,7 @@ static void sel_pass_at(Model *m, int upto) {
     int hd = c->head_dim, S = upto;
     int kvphys = m->kvphys[li];
     int w0 = S - m->sel_min; if (w0 < 0) w0 = 0;    /* obs window start */
-    #define SEL_BLK 64                        /* == LG_KC block size */
+    #define SEL_BLK LG_SEL_RING_BLK
     int nb = (S + SEL_BLK - 1) / SEL_BLK;
     /* Each call re-derives sel_full for THIS prefix length: an early chunk
      * where cap >= upto (no sparsification yet) must NOT latch full-selection
@@ -2918,7 +2978,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
     if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); free(ids); return; }
-    kv_alloc(m, np + n_new + 8);
+    kv_alloc(m, np + n_new + 8, n_new);
     double t0 = now_s(), t1 = 0;
     float *logit = step(m, ids, np, 0, NULL);
     sel_pass(m);
@@ -3170,7 +3230,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         printf("ERROR %s CONTEXT_EXCEEDED %d %d\n", q->id, np, ctx_max);
         fflush(stdout); free(ids); return;
     }
-    kv_alloc(m, np + q->max_tok + 8);
+    kv_alloc(m, np + q->max_tok + 8, q->max_tok);
     m->kv_len = 0;
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
@@ -3460,7 +3520,7 @@ int main(int argc, char **argv) {
            m.cache[0].cap, bits ? "int (runtime quant)" : "f32");
     print_cfg(&m);
     printf("resident weights loaded in %.1fs | RSS %.2f GB\n", m.dense_load_s, rss_gb());
-    kv_alloc(&m, nfull + 8);
+    kv_alloc(&m, nfull + 8, ngen);
 
     int tf_ok = 1;
     if (tfref && ntf == nfull) {
@@ -3470,7 +3530,7 @@ int main(int argc, char **argv) {
         printf("teacher-forced argmax: %d/%d match\n", ok, nfull);
         tf_ok = (ok == nfull);
         free(tf);
-        kv_alloc(&m, nfull + 8); m.kv_len = 0;
+        kv_alloc(&m, nfull + 8, ngen); m.kv_len = 0;
     }
 
     int *out = malloc((size_t)nfull * sizeof(int));

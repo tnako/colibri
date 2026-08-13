@@ -574,7 +574,8 @@ POLICIES = {
 LG_CHUNK = 8192
 
 
-def laguna_kv_bytes(cfg, context, metal=False):
+def laguna_kv_bytes(cfg, context, metal=False, selp=False, sel_cap=8192,
+                    sel_min=16384, gen=0):
     """LAGUNA-FORK: per-layer int8 KV cache bytes, mirroring the single-source
     budget loop in laguna_common.h:1186-1207 byte-for-byte.
 
@@ -588,12 +589,23 @@ def laguna_kv_bytes(cfg, context, metal=False):
         context short enough to fit in the ring still allocates the full
         ctx_hint rows (kv_alloc semantics).
     Pass metal=True when the Metal engine is the deployment target.
+    Pass selp=True (with the identically-named engine tunables) to model a Phase-7
+    selective-propagation run on a CPU-attention path: late FULL layers keep only
+    the selection observation window `max(sel_cap, sel_min+64) + gen + 1` rows
+    (laguna_full_ring in laguna_common.h), clamped to context; the layer-0/first
+    full scoring layer keeps everything. Mirrors kv_alloc's `!m->gpu_attn` gate:
+    Metal targets are never capped.
     """
     layers = int(cfg.get("num_hidden_layers") or 0)
     n_kv = int(cfg.get("num_key_value_heads") or cfg.get("num_attention_heads") or 0)
     hd = int(cfg.get("head_dim") or 0)
     window = int(cfg.get("sliding_window") or 0)
     types = cfg.get("layer_types") or []
+    first_full = -1
+    for i in range(layers):
+        if not (i < len(types) and types[i] and "sliding" in types[i]):
+            first_full = i
+            break
     total = 0.0
     for i in range(layers):
         is_slide = i < len(types) and types[i] and "sliding" in types[i]
@@ -602,6 +614,10 @@ def laguna_kv_bytes(cfg, context, metal=False):
             ring = window + (LG_CHUNK if metal else 0)
             if ring < context:
                 rows = 2.0 * ring if metal else float(ring)
+        elif selp and not metal and i != first_full:
+            ring = max(sel_cap, sel_min + 64) + gen + 1
+            if ring < context:
+                rows = float(ring)
         total += rows * n_kv * (hd + 4.0) * 2
     return total
 
