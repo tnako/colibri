@@ -29,10 +29,19 @@ each dispatch covers ~1 row.
 
 ## Ruled out: OMP spin-wait / thread count tuning
 
+> Status correction (v1.6.0 merge, 2026-08-13): the wording below said the team
+> was "sized to physical cores already by omp_tune.h", but laguna_common.h then
+> did NOT include or call omp_tune.h — every other engine did. That gap is now
+> closed: `coli_omp_tune_threads(LAGUNA_NAME)` runs at main() entry. The
+> spin-wait half of the family tuning stays off for laguna (measured inert/regres-
+> sion on Apple Silicon, #707); only the physical-core sizing applies.
+
 - `OMP_WAIT_POLICY=active`: no measurable change (5.5-5.8 vs 6.1-6.6 tok/s,
-  within run-to-run noise). This machine's OMP team is sized to physical
-  cores already by omp_tune.h; spin-wait's documented win (docs cite a -2.2x
-  case) was on a different, more disk-bound regime.
+  within run-to-run noise). Once the missing physical-core sizing landed, the
+  tiny fixture parity harness measured 3.4x faster decode (453 -> 1528 tok/s)
+  than the SMT-wide default team an uninstrumented launch would otherwise use;
+  spin-wait's documented win (docs cite a -2.2x case) was on a different, more
+  disk-bound regime.
 - `OMP_NUM_THREADS=1`: measurably WORSE (1.87 tok/s). Confirms the existing
   parallel regions are net-positive, not a source of pure overhead to strip.
 

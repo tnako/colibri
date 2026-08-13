@@ -48,6 +48,8 @@
 #include "st.h"
 #include "tok.h"
 #include "route_trace.h"
+#include <omp.h>               /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
+#include "omp_tune.h"          /* LAGUNA-FORK: physical-core OMP sizing (#718), like every other engine */
 #include "coli_moe_route.h"
 #include "oq.h"                   /* LAGUNA-FORK: oMLX oQ packed-weight kernels */
 #include "q8r.h"                  /* LAGUNA-FORK: UDOT-native resident format   */
@@ -3296,6 +3298,13 @@ static void print_cfg(Model *m) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _OPENMP
+    /* LAGUNA-FORK: same physical-core team sizing every other engine applies
+     * (colibri/kimi_k3/olmoe/deepseek_v4). With the expert fill loop and the
+     * decode parallel regions sharing the OpenMP team, an SMT-wide default
+     * team measurably halves decode on some CPUs (#718); OMP_NUM_THREADS wins. */
+    coli_omp_tune_threads(LAGUNA_NAME);
+#endif
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     const char *prompt = NULL, *refpath = LAGUNA_REF_DEFAULT;
