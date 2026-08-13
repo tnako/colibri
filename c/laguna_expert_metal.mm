@@ -31,6 +31,12 @@
 extern id<MTLDevice>       lg_metal_device(void);
 extern id<MTLCommandQueue> lg_metal_queue(void);
 
+#define K_TM 32
+#define K_TN 32
+#define K_TK 64
+#define K_NSG 4
+#define K_NT (K_NSG * 32)
+
 static const char *EXP_SRC = R"(
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -51,11 +57,12 @@ using namespace metal;
  * expert), and the occupancy loss outweighed the compute saving -- consistent
  * with the doc's own note that 32->64 helped but going further was untested
  * and, now measured, does not. Reverted to 64. */
-#define TM 64
+#define TM 32
 #define TN 32
-#define TK 32
-#define NSG 8          /* simdgroups per threadgroup; each owns one 8-row band */
-#define RB (TM / (NSG * 8))  /* 8-row bands per simdgroup (1 at TM=64) */
+#define TK 64
+#define NSG 4          /* simdgroups per threadgroup; each owns one 8-row band */
+#define RB (TM / (NSG * 8))  /* 8-row bands per simdgroup */
+#define NC (TN / 8)          /* 8-wide column tiles inside TN */
 
 struct ExpArgs {
     uint Kd, N, gs, bits;
@@ -137,13 +144,10 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
     threadgroup float Bs[TK * TN];
 
     /* acc[b][j]: b indexes this simdgroup's RB row-bands (each 8 rows), j
-     * indexes the 4 8-wide column tiles inside TN. Was acc[4] (RB==1) when
-     * TM==64; widening TM to amortize the B dequant (see the comment above
-     * expert_gemm) over more rows per weight-tile decode needs each
-     * simdgroup to cover RB bands instead of exactly one. */
-    simdgroup_float8x8 acc[RB][4];
+     * indexes the NC 8-wide column tiles inside TN. */
+    simdgroup_float8x8 acc[RB][NC];
     for (uint b = 0; b < RB; b++)
-        for (uint j = 0; j < 4; j++) acc[b][j] = make_filled_simdgroup_matrix<float,8,8>(0.0f);
+        for (uint j = 0; j < NC; j++) acc[b][j] = make_filled_simdgroup_matrix<float,8,8>(0.0f);
 
     uint tid = sidx * 32 + lane;                 /* 0..NSG*32-1 */
     uint NT  = NSG * 32;
@@ -170,14 +174,14 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
                 uint widx = gk / per, sh = (gk % per) * a.bits;
                 /* byte-wise reads: the base is unaligned, so never form a typed pointer */
                 device const uchar* wp = Wb + ((ulong)gn * a.wwords + widx) * 4;
-                uint word = (uint)wp[0] | ((uint)wp[1] << 8)
-                          | ((uint)wp[2] << 16) | ((uint)wp[3] << 24);
+                ushort2 p = *(device const ushort2*)wp;
+                uint word = (uint)p.x | ((uint)p.y << 16);
                 uint code = (word >> sh) & ((1u << a.bits) - 1u);
                 uint g = gk / a.gs;
                 device const uchar* sp = Sb + ((ulong)gn * a.ngroups + g) * 2;
                 device const uchar* bp = Bb + ((ulong)gn * a.ngroups + g) * 2;
-                ushort sh_ = (ushort)sp[0] | ((ushort)sp[1] << 8);
-                ushort bh_ = (ushort)bp[0] | ((ushort)bp[1] << 8);
+                ushort sh_ = *(device const ushort*)sp;
+                ushort bh_ = *(device const ushort*)bp;
                 float s = as_type<float>((uint)sh_ << 16);     /* bf16 -> f32 */
                 float b = as_type<float>((uint)bh_ << 16);
                 v = deq(code, s, b);
@@ -187,15 +191,15 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         /* Each simdgroup owns RB 8-row bands (rows [sidx*RB*8 + b*8, ...+8)
-         * for b in [0,RB)) and walks the 4 column tiles for each. */
+         * for b in [0,RB)) and walks the NC column tiles for each. */
         for (uint kk = 0; kk < TK; kk += 8) {
-            simdgroup_float8x8 mb[4];
-            for (uint j = 0; j < 4; j++)
+            simdgroup_float8x8 mb[NC];
+            for (uint j = 0; j < NC; j++)
                 simdgroup_load(mb[j], Bs + (ulong)kk*TN + j*8, TN);
             for (uint b = 0; b < RB; b++) {
                 simdgroup_float8x8 ma;
                 simdgroup_load(ma, As + (ulong)(sidx*RB*8 + b*8)*TK + kk, TK);
-                for (uint j = 0; j < 4; j++)
+                for (uint j = 0; j < NC; j++)
                     simdgroup_multiply_accumulate(acc[b][j], ma, mb[j], acc[b][j]);
             }
         }
@@ -210,7 +214,7 @@ kernel void expert_gemm(device const float*    X    [[buffer(0)]],
      * memory and reused across the RB bands each simdgroup owns. */
     threadgroup float Cs[NSG * 8 * TN];
     for (uint b = 0; b < RB; b++) {
-        for (uint j = 0; j < 4; j++)
+        for (uint j = 0; j < NC; j++)
             simdgroup_store(acc[b][j], Cs + (ulong)(sidx*8)*TN + j*8, TN);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = tid; e < NSG*8*TN; e += NT) {
@@ -349,8 +353,8 @@ extern "C" int lg_metal_expert_grouped(void *wmap, size_t woff, void *smap, size
         [en setBuffer:(__bridge id<MTLBuffer>)offbuf offset:0    atIndex:6];
         [en setBuffer:(__bridge id<MTLBuffer>)tilesbuf offset:0  atIndex:7];
         [en setBytes:&a length:sizeof(a) atIndex:4];
-        [en dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, (NSUInteger)((N+31)/32), 1)
-           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [en dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, (NSUInteger)((N+K_TN-1)/K_TN), 1)
+           threadsPerThreadgroup:MTLSizeMake(K_NT, 1, 1)];
         [en endEncoding];
         double w0 = exp_prof_on() ? CFAbsoluteTimeGetCurrent() : 0;
         [cb commit];
@@ -396,7 +400,7 @@ extern "C" int lg_metal_moe_layer(
         id<MTLCommandBuffer> cb = [lg_metal_queue() commandBuffer];
         id<MTLComputePipelineState> ps = (__bridge id<MTLComputePipelineState>)g_exp_pipe;
         id<MTLComputePipelineState> sp = (__bridge id<MTLComputePipelineState>)g_silu_pipe;
-        NSUInteger cols = (NSUInteger)((I+31)/32);
+        NSUInteger cols = (NSUInteger)((I+K_TN-1)/K_TN);
 
         id<MTLComputeCommandEncoder> e1 = [cb computeCommandEncoder];
         [e1 setComputePipelineState:ps];
@@ -409,7 +413,7 @@ extern "C" int lg_metal_moe_layer(
         [e1 setBuffer:(__bridge id<MTLBuffer>)tilesbuf offset:0 atIndex:7];
         [e1 setBytes:&ag length:sizeof(ag) atIndex:4];
         [e1 dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, cols, 1)
-           threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+           threadsPerThreadgroup:MTLSizeMake(K_NT,1,1)];
         [e1 endEncoding];
 
         id<MTLComputeCommandEncoder> e2 = [cb computeCommandEncoder];
@@ -423,7 +427,7 @@ extern "C" int lg_metal_moe_layer(
         [e2 setBuffer:(__bridge id<MTLBuffer>)tilesbuf offset:0 atIndex:7];
         [e2 setBytes:&au length:sizeof(au) atIndex:4];
         [e2 dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, cols, 1)
-           threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+           threadsPerThreadgroup:MTLSizeMake(K_NT,1,1)];
         [e2 endEncoding];
 
         id<MTLComputeCommandEncoder> e3 = [cb computeCommandEncoder];
@@ -432,10 +436,10 @@ extern "C" int lg_metal_moe_layer(
         [e3 setBuffer:(__bridge id<MTLBuffer>)ubuf offset:0 atIndex:1];
         unsigned n = (unsigned)npair * (unsigned)I;
         [e3 setBytes:&n length:4 atIndex:2];
-        [e3 dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e3 dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(K_NT,1,1)];
         [e3 endEncoding];
 
-        NSUInteger colsD = (NSUInteger)((D+31)/32);
+        NSUInteger colsD = (NSUInteger)((D+K_TN-1)/K_TN);
         id<MTLComputeCommandEncoder> e4 = [cb computeCommandEncoder];
         [e4 setComputePipelineState:ps];
         [e4 setBuffer:(__bridge id<MTLBuffer>)gbuf offset:0 atIndex:0];
@@ -447,7 +451,7 @@ extern "C" int lg_metal_moe_layer(
         [e4 setBuffer:(__bridge id<MTLBuffer>)tilesbuf offset:0 atIndex:7];
         [e4 setBytes:&ad length:sizeof(ad) atIndex:4];
         [e4 dispatchThreadgroups:MTLSizeMake((NSUInteger)ntiles, colsD, 1)
-           threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+           threadsPerThreadgroup:MTLSizeMake(K_NT,1,1)];
         [e4 endEncoding];
 
         double w0 = exp_prof_on() ? CFAbsoluteTimeGetCurrent() : 0;

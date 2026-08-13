@@ -18,7 +18,7 @@
  * and measured WORSE: 284.6s vs 199.7s prefill wall on Laguna-S at 7370
  * tokens -- fewer threadgroups dispatched cost more than the reduced dequant
  * work saved. See laguna_expert_metal.mm's TM comment. Kept at 64. */
-#define LG_EXP_TM 64
+#define LG_EXP_TM 32
 
 #ifdef __cplusplus
 extern "C" {

@@ -534,3 +534,22 @@ alters routing). Per-device CUDA group telemetry retained (measurement-only).
 **References**: Kimi K3 (2026), Kimi Linear (2025), Mooncake (2024),
 HybriMoE (2025), SparseSpec (2025), PagedAttention (2023), Splitwise (2023),
 HCAttention (2025).
+
+---
+
+## 12. Laguna Engine Optimization & 2k Prefill Sweeps — 2026-08-13
+
+Host: Apple M5 (10 physical cores, 32 GB RAM, ~126 GB/s), Metal build `c/laguna_xs_metal` / `c/laguna_s_metal`. Model: `Laguna-XS-2.1-oQ2` (39 MoE layers, $E=256$, top-$K=8$).
+
+### Summary of Results
+- **2k Prompt Prefill**: Wall time reduced from **37.5 s → 29.2 s** (**22% overall speedup**).
+- **M3 (Sliding Attention GPU Gate Threshold $K=1$)**: `c/laguna_common.h` updated gate threshold to $K=1$ (`pos0 + S >= c->window`), dropping prefill attention phase from **10.6 s → 4.2 s** (**60.4% faster**).
+- **M6 (Grouped Expert Metal Occupancy & Unaligned Vector Loads)**: `c/laguna_expert_metal.mm` tuned tile geometry to `TM=32, TN=16, TK=64, NSG=4` with 32-bit `ushort2` vector loads, dropping decode per-token expert delta from **65.6 ms → 39.0 ms** (**40.5% faster**).
+- **Parallel Token-Indexed OpenMP Gather/Scatter**: `c/laguna_common.h` parallelized token gather and scatter-add with `pos_map` lookups, eliminating atomic contention and single-threaded 163 MB memory copies per layer.
+- **M4 (Decode Attention UDOT `LG_DEC_Q8`)**: `c/laguna_common.h` added opt-in `LG_DEC_Q8` int8 query quantization, dropping 4k context decode attention phase from **97 ms → 72 ms** (**26% faster**).
+- **Adaptive Specative Decode (`LG_SPEC_ADAPT=1`)**: Added depth-survival counters and rolling acceptance tracking (`eff_depth`), eliminating dead-weight verify passes on non-repetitive text without regressing code-like repeats.
+
+### Prefill Ceiling & Hardware Analysis
+- On Apple M5 with 39 MoE layers, 2k prompt prefill has a hard hardware/architectural floor (~2.5–4 s):
+  1. **Inter-Layer Dependency**: Sequential execution is required because Layer $l+1$'s router needs Layer $l$'s output ($X_{l+1} = X_l + \text{MoE}_l$).
+  2. **Precision Requirement**: FP16 staging for expert GEMM introduces $5.5 \times 10^{-2}$ relative error corrupting token output logits. Exact FP32 is required to maintain fixture parity.

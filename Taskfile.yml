@@ -357,6 +357,24 @@ tasks:
           - deepsweet/Ornith-1.0-35B-MLX-oQ8
         cmd: '{{.PYTHON | default "python3"}} {{.C}}/tools/probe_oq.py {{.ITEM}} || true'
 
+  # ---------------------------------------------------------------- benchmarks
+
+  bench:lg:xs:
+    desc: 'Benchmark Laguna-XS prefill + decode: task bench:lg:xs [PTOK] [NGEN] [TAG]'
+    cmds:
+      - '{{.PYTHON | default "python3"}} -c "pass" && bash {{.C}}/tools/bench_laguna.sh {{.MODELS}}/{{.LG_BENCH_DIR | default "Laguna-XS-2.1-oQ2"}} {{if .PTOK}}{{.PTOK}}{{else}}2048{{end}} {{if .NGEN}}{{.NGEN}}{{else}}128{{end}} {{if .TAG}}{{.TAG}}{{else}}round-{{now | date "150405"}}{{end}}'
+
+  sweep:spec:
+    desc: 'A/B spec-decode depth on a model: task sweep:spec [PTOK] [NGEN] [TAG]'
+    cmds:
+      - 'bash {{.C}}/tools/sweep_spec.sh {{.MODELS}}/{{.LG_BENCH_DIR | default "Laguna-XS-2.1-oQ2"}} {{if .PTOK}}{{.PTOK}}{{else}}2048{{end}} {{if .NGEN}}{{.NGEN}}{{else}}128{{end}} {{if .TAG}}{{.TAG}}{{else}}sweep-{{now | date "150405"}}{{end}}'
+
+  bench:lg:xs:prefill:
+    desc: 'Prefill-only sweep across prompt sizes (2k/3k/4k/6k) to expose the sliding-attn gate'
+    cmds:
+      - for: [2048, 3072, 4096, 6144]
+        cmd: 'OUT={{.OUT | default "/tmp/lgbench"}} CTX_MAX=8192 bash {{.C}}/tools/bench_laguna.sh {{.MODELS}}/Laguna-XS-2.1-oQ2 {{.ITEM}} 8 prefill-{{.ITEM}} 2>&1 | grep -E "prefill-only|summary"'
+
   # ---------------------------------------------------------------- validation
 
   fixture:

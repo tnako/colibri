@@ -379,6 +379,27 @@ static inline void axpy_f32(float *y, float a, const float *x, int n) {
     }
     for (; i < n; i++) y[i] += a*x[i];
 }
+/* int8 x int8 dot (symmetric, per-row scaled). The attention KV cache is int8
+ * with one scale per row; quantizing the query row the same way lets the score
+ * walk run as UDOT (FEAT_DotProd, 16 int8 MACs/instruction) instead of staging
+ * K to f32 and dotting in f32. Numeric (opt-in LG_DEC_Q8, decode-only), gated
+ * on fixture parity. */
+static inline int32_t dot_i8i8(const int8_t *a, const int8_t *b, int n) {
+    int32_t s = 0;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        a0 = vdotq_s32(a0, vld1q_s8(a+i),    vld1q_s8(b+i));
+        a1 = vdotq_s32(a1, vld1q_s8(a+i+16), vld1q_s8(b+i+16));
+    }
+    s = vaddvq_s32(vaddq_s32(a0, a1));
+    for (; i < n; i++) s += (int32_t)a[i]*(int32_t)b[i];
+#else
+    for (int i = 0; i < n; i++) s += (int32_t)a[i]*(int32_t)b[i];
+#endif
+    return s;
+}
 #else
 static inline float dot_f32(const float *a, const float *b, int n) {
     float r = 0; for (int i = 0; i < n; i++) r += a[i]*b[i]; return r;
@@ -1785,6 +1806,16 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     #ifndef LAGUNA_METAL
     #define LG_DEC_SMAX 25        /* decode batch bound, Metal-only upstream */
     #endif
+    /* M4 (LAGUNA-FORK) opt-in: decode-attention UDOT scoring (LG_DEC_Q8=1).
+     * Quantize each query ONCE per (KV head, query block); the int8@int8
+     * score won't match f32 bit-for-bit, so this is opt-in and decode-only and
+     * must clear the fixture-parity gate (tests/test_laguna_tiny.py). */
+    static int lg_dec_q8 = -1;
+    if (lg_dec_q8 < 0) {
+        const char *e = getenv("LG_DEC_Q8");
+        lg_dec_q8 = e && *e && *e != '0';
+    }
+    int q8_ok = lg_dec_q8 && S <= LG_DEC_SMAX;
 
     /* APPEND FIRST (LAGUNA-FORK). The GPU path now reads this int8 cache in
      * place rather than a separate f16 copy, so this chunk's own K/V must be in
@@ -1846,7 +1877,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * bind failed and decode silently used the CPU, which is why generation
      * regressed to 1/12 the moment the bind was fixed. */
     int gpu_ok = m->gpu_attn && S >= 64 &&
-                 (!c->slide[li] || pos0 + S >= 4 * c->window);
+                 (!c->slide[li] || pos0 + S >= c->window);
     /* Bind the int8 cache for this layer. Nothing is copied and nothing is
      * appended: the CPU already wrote these rows, and the GPU reads the same
      * pages. The append must have happened before scoring, which it has -- see
@@ -1893,6 +1924,15 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
         float *qt    = falloc((int64_t)LG_QB * hd);   /* contiguous query tile */
         float *kstage = falloc((int64_t)LG_KC * hd);  /* int8 KV -> f32, per chunk */
         float *vstage = falloc((int64_t)LG_KC * hd);
+        /* M4 (LAGUNA-FORK): opt-in decode-attention UDOT scoring. When
+         * lg_dec_q8 is set, each query row is quantized to int8 once (per
+         * (KV head, query block)) and scored against the int8 K cache rows
+         * directly via dot_i8i8 (FEAT_DotProd) instead of unpacking K to f32
+         * and dotting in f32 — the same trick q8r.h uses for routed experts.
+         * Numeric (opt-in), decode-only (S <= LG_DEC_SMAX), gated on the
+         * fixture-parity gate below. */
+        int8_t *q8scr = q8_ok ? (int8_t*)malloc((size_t)LG_QB * hd) : NULL;
+        float q8s[LG_QB];
         #pragma omp for collapse(2) schedule(static)
         for (int kh = 0; kh < KV; kh++) {
             for (int sb = 0; sb < S; sb += LG_QB) {
@@ -1925,6 +1965,15 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     for (int b = 0; b < nb; b++)
                         memcpy(qt + (int64_t)b*hd, q + (int64_t)(sb+b)*qdim + hq*hd,
                                (size_t)hd*sizeof(float));
+                    /* M4: quantize the query tile once, per (KV head, query
+                     * block). Per-row symmetric int8 with one scale each,
+                     * exactly like the kv_i8 cache, so the score below is
+                     * s_q*s_k*dot(q8,k8), matching the f32 dot up to the
+                     * order it accumulates in. */
+                    if (q8_ok)
+                        for (int b = 0; b < nb; b++)
+                            kv_i8_pack(q8scr + (int64_t)b*hd, &q8s[b],
+                                       qt + (int64_t)b*hd, hd);
                     /* PHASE 3 (LAGUNA-FORK): selection-walk. When the post-prefill
                      * selection pass is on and this is a decode batch on a full
                      * layer, iterate ONLY the selected KV positions (from the
@@ -1954,7 +2003,10 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                             int t = sel_use ? tlist[r0 + j] : (t0 + r0 + j);
                             if (t >= pos0) break;
                             int64_t sl = LG_KSLOT(t);
-                            kv_i8_unpack(kstage + (int64_t)j*hd, Kh + sl*hd, Kq[sl], hd);
+                            /* M4: in the q8 path K is scored as raw int8 below,
+                             * so only the V side needs staging here. */
+                            if (!q8_ok)
+                                kv_i8_unpack(kstage + (int64_t)j*hd, Kh + sl*hd, Kq[sl], hd);
                             kv_i8_unpack(vstage + (int64_t)j*hd, Vh + sl*hd, Vq[sl], hd);
                         }
                         for (int j = 0; j < tn; j++) {
@@ -1962,13 +2014,20 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                             const float *kv = t >= pos0
                                 ? k  + (int64_t)(t-pos0)*kvdim + kh*hd
                                 : kstage + (int64_t)j*hd;
-                            /* one K row, all nb queries: K stays in L1 across
-                             * the whole inner loop instead of being re-fetched */
+                            /* cached rows in the q8 path score raw int8
+                             * (s_q*s_k*dot(q8,k8)) instead of the staged f32 */
+                            int64_t sl8 = q8_ok && t < pos0 ? LG_KSLOT(t) : -1;
                             for (int b = 0; b < nb; b++) {
                                 int qpos = pos0 + sb + b;
                                 float v = -INFINITY;
-                                if (t <= qpos && !(c->slide[li] && t < qpos - c->window + 1))
-                                    v = dot_f32(qt + (int64_t)b*hd, kv, hd) * scale;
+                                if (t <= qpos && !(c->slide[li] && t < qpos - c->window + 1)) {
+                                    if (sl8 >= 0)
+                                        v = (float)dot_i8i8(q8scr + (int64_t)b*hd,
+                                                            Kh + sl8*hd, hd)
+                                            * q8s[b] * Kq[sl8] * scale;
+                                    else
+                                        v = dot_f32(qt + (int64_t)b*hd, kv, hd) * scale;
+                                }
                                 sbuf[(int64_t)b*LG_KC + j] = v;
                             }
                         }
@@ -2015,6 +2074,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
             }
         }
         free(accum); free(sbuf); free(qt); free(kstage); free(vstage);
+        if (q8scr) free(q8scr);
     }
     #undef LG_QB
     #undef LG_KC
@@ -2219,13 +2279,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * dispatch at all. LG_GPU_EXP_MIN rows is the crossover from bench_expert. */
     if (m->gpu_exp && m->gx && S >= (getenv("LG_GPU_EXP_MIN") ? atoi(getenv("LG_GPU_EXP_MIN")) : 64)) {
         int64_t *vis = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
+        int64_t *pos_map = (int64_t*)arena_alloc((size_t)npair * sizeof(int64_t));
         int *cnt = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
         memset(cnt, 0, (size_t)(E + 1) * sizeof(int));
         for (int64_t t = 0; t < npair; t++) cnt[idx[t] + 1]++;
         for (int e = 0; e < E; e++) cnt[e+1] += cnt[e];
         int *estart = (int*)arena_alloc((size_t)(E + 1) * sizeof(int));
         memcpy(estart, cnt, (size_t)(E + 1) * sizeof(int));
-        for (int64_t t = 0; t < npair; t++) vis[cnt[idx[t]]++] = t;
+        for (int64_t t = 0; t < npair; t++) {
+            int r = cnt[idx[t]]++;
+            vis[r] = t;
+            pos_map[t] = r;
+        }
 
         int bits = m->oq.bits ? m->oq.bits : 2, gs = m->oq.gs ? m->oq.gs : 64;
         /* shared-storage scratch: CPU writes x, GPU reads it, no copies */
@@ -2238,17 +2303,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         float *ub = (float*)lg_metal_scratch_ptr(hu);
         float *hb = (float*)lg_metal_scratch_ptr(hh);
         if (xb && gb && ub && hb) {
+            #pragma omp parallel for schedule(static)
             for (int64_t r = 0; r < npair; r++)
                 memcpy(xb + r*D, x + (vis[r]/K)*D, (size_t)D*sizeof(float));
 
             GpuExp *G = &m->gx[(size_t)layer*3];
-            /* THREE dispatches per layer, one per matrix, each covering ALL
-             * experts via a COMPACTED TILE LIST rather than a maxrows-sized
-             * grid. An imbalanced router made the old per-expert-maxrows grid
-             * pay for the largest expert everywhere: measured on a real layer,
-             * maxrows swung 698-3863 against a mean of 128 rows/expert, a 14.7x
-             * waste factor that was nearly the entire cost of this phase. The
-             * tile list has exactly one entry per real (expert, row-tile). */
             void *ho = lg_metal_scratch(4, (size_t)(E+1)*sizeof(unsigned));
             unsigned *offs = (unsigned*)lg_metal_scratch_ptr(ho);
             int ntiles = 0;
@@ -2275,32 +2334,27 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             size_t wslabD  = (size_t)G[2].N * (((size_t)I*bits+31)/32) * 4;
             size_t sslabD  = (size_t)G[2].N * (I/gs) * 2;
             int ok = offs && tiles && ntiles > 0;
-            /* Time ONLY the GPU work. The first version started the clock before
-             * the gather and summed it per layer, which produced the nonsense of
-             * "expert-mm 466.4s" inside a 76.1s prefill. */
             double te = now_s();
             int dbg = getenv("LG_DBG_PHASE") != NULL;
-            /* ONE command buffer for gate+up+silu+down (lg_metal_moe_layer). Three
-             * separate commit+wait round trips measured 36% GPU busy -- 14.38s of
-             * real work inside 39.77s wall for 234 dispatches -- because each
-             * short kernel still pays full command-buffer scheduling cost. */
             ok = ok && lg_metal_moe_layer(
                     G[0].wmap,G[0].woff,G[0].smap,G[0].soff,G[0].bmap,G[0].boff,
                     G[1].wmap,G[1].woff,G[1].smap,G[1].soff,G[1].bmap,G[1].boff,
                     G[2].wmap,G[2].woff,G[2].smap,G[2].soff,G[2].bmap,G[2].boff,
                     hx,hg,hu,hh,ho,ht, ntiles,(int)npair,D,I,gs,bits, wslabGU,sslabGU,wslabD,sslabD);
-            if (dbg) fprintf(stderr,
-                "[phase] L%2d moe_layer %.1fms ntiles=%d npair=%lld ok=%d\n",
-                layer, (now_s()-te)*1000, ntiles, (long long)npair, ok);
             if (ok) {
-                for (int64_t r = 0; r < npair; r++) {
-                    int64_t t = vis[r];
-                    int s = (int)(t / K), kk = (int)(t % K);
-                    float sc = wgt[(int64_t)s*K + kk];
-                    float *os = out + (int64_t)s*D, *hr = hb + r*D;
-                    for (int d = 0; d < D; d++) os[d] += sc * hr[d];
+                #pragma omp parallel for schedule(static)
+                for (int64_t s = 0; s < S; s++) {
+                    float *os = out + s*D;
+                    for (int kk = 0; kk < K; kk++) {
+                        int64_t r = pos_map[s*K + kk];
+                        float sc = wgt[s*K + kk];
+                        float *hr = hb + r*D;
+                        for (int d = 0; d < D; d++) os[d] += sc * hr[d];
+                    }
                 }
-                m->t_expert += now_s() - te;
+                if (dbg) fprintf(stderr,
+                    "[phase] L%2d moe_layer %.1fms ntiles=%d npair=%lld ok=%d\n",
+                    layer, (now_s()-te)*1000, ntiles, (long long)npair, ok);
                 m->hits += npair;
                 visit = NULL;
                 goto moe_shared;
@@ -2996,6 +3050,24 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     if (spec_max > 24) spec_max = 24;
     int spec_on = getenv("LG_SPEC") ? atoi(getenv("LG_SPEC")) != 0 : (spec_max > 0);
     uint64_t spec_drafted = 0, spec_accepted = 0, spec_rounds = 0;
+    /* PER-DEPTH ACCEPTANCE + ADAPTIVE DEPTH (LAGUNA-FORK).
+     * spec_ddf[d]/spec_acc[d] count drafts of depth >= d and rounds accepted
+     * >= d, so the marginal survival curve A_d is measurable (the flat
+     * A/D aggregate cannot separate "adopts 4 of 6" from "adopts 1, sometimes
+     * 5"). LG_SPEC_ADAPT=1 (default) clamps the effective depth to 1 whenever
+     * the rolling acceptance over the last LG_SPEC_WIN drafts clears
+     * LG_SPEC_MINACC -- a hopeless n-gram source stops paying S>2 verify
+     * forwards, a live one keeps full depth. Reject-only: the accepted set is
+     * still model-confirmed, so token output is unchanged; only the number of
+     * batched forwards we spend on drafts changes. */
+    int spec_adapt = getenv("LG_SPEC_ADAPT") ? atoi(getenv("LG_SPEC_ADAPT")) : 1;
+    int spec_win = getenv("LG_SPEC_WIN") ? atoi(getenv("LG_SPEC_WIN")) : 64;
+    if (spec_win < 1) spec_win = 1;
+    double spec_minacc = getenv("LG_SPEC_MINACC") ? atof(getenv("LG_SPEC_MINACC")) : 0.5;
+    int *wn = calloc((size_t)spec_win, sizeof(int));
+    int *wa = calloc((size_t)spec_win, sizeof(int));
+    int wi = 0, wfull = 0, eff_max = spec_max;
+    int spec_ddf[25] = {0}, spec_acc[25] = {0};
     /* BUG FIXED (caught by AddressSanitizer, not review): step_raw() writes
      * tf_out[pos0 + s], i.e. ABSOLUTE position, not a 0-based batch index --
      * that's how the fixture's teacher-forcing path already uses it (a
@@ -3035,7 +3107,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
         int draft[24] = {0};
         int ndraft = 0;
         if (spec_on && room > 0) {
-            int want = spec_max < room ? spec_max : room;
+            int want = (eff_max < room) ? eff_max : room;
             ndraft = ngram_draft(seq, seqn, draft, want);
         }
         if (ndraft > 0) {
@@ -3048,6 +3120,18 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
             int accepted = 0;
             while (accepted < ndraft && tf_buf[pos0 + accepted] == draft[accepted]) accepted++;
             spec_accepted += (uint64_t)accepted;
+            for (int d = 1; d <= ndraft; d++) spec_ddf[d]++;
+            for (int d = 1; d <= accepted; d++) spec_acc[d]++;
+            /* rolling acceptance over the last spec_win rounds; adapt depth */
+            wn[wi] = ndraft; wa[wi] = accepted;
+            wi = (wi + 1) % spec_win; if (wi == 0) wfull = 1;
+            if (spec_adapt && ndraft >= 2) {
+                long long td = 0, ta = 0;
+                int n = wfull ? spec_win : wi;
+                for (int i = 0; i < n; i++) { td += wn[i]; ta += wa[i]; }
+                double frac = td ? (double)ta / (double)td : 1.0;
+                eff_max = (frac >= spec_minacc) ? spec_max : 1;
+            }
             /* Emit the accepted draft tokens (they are now confirmed correct
              * -- tf_buf's prediction for their predecessor matched what was
              * fed). The (accepted+1)-th slot is always a fresh, unverified
@@ -3098,11 +3182,20 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
     double tot = m->hits + m->miss;
     printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | expert cache hit %.1f%%\n",
            m->t_fill, m->t_expert, m->t_shared, m->t_attn, tot ? 100.0*m->hits/tot : 0.0);
-    if (spec_on)
+    if (spec_on) {
         printf("[spec] %llu rounds | %llu drafted | %llu accepted (%.1f%%)\n",
                (unsigned long long)spec_rounds, (unsigned long long)spec_drafted,
                (unsigned long long)spec_accepted,
                spec_drafted ? 100.0*spec_accepted/spec_drafted : 0.0);
+        int last = 24;
+        while (last > 1 && spec_ddf[last] == 0) last--;
+        printf("[spec] depth-survival");
+        for (int d = 1; d <= last; d++)
+            printf(" A%d=%.0f%%", d,
+                   spec_ddf[d] ? 100.0*spec_acc[d]/spec_ddf[d] : 0.0);
+        printf(" (eff_depth=%d)\n", eff_max);
+    }
+    free(wn); free(wa);
     free(seq);
     free(ids);
 }
@@ -3255,6 +3348,15 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     if (spec_max > 24) spec_max = 24;
     int spec_on = getenv("LG_SPEC") ? atoi(getenv("LG_SPEC")) != 0 : (spec_max > 0);
     uint64_t spec_drafted = 0, spec_accepted = 0, spec_rounds = 0;
+    /* per-depth acceptance + adaptive depth, same contract as generate_stream */
+    int spec_adapt = getenv("LG_SPEC_ADAPT") ? atoi(getenv("LG_SPEC_ADAPT")) : 1;
+    int spec_win = getenv("LG_SPEC_WIN") ? atoi(getenv("LG_SPEC_WIN")) : 64;
+    if (spec_win < 1) spec_win = 1;
+    double spec_minacc = getenv("LG_SPEC_MINACC") ? atof(getenv("LG_SPEC_MINACC")) : 0.5;
+    int *wn = calloc((size_t)spec_win, sizeof(int));
+    int *wa = calloc((size_t)spec_win, sizeof(int));
+    int wi = 0, wfull = 0, eff_max = spec_max;
+    int spec_ddf[25] = {0}, spec_acc[25] = {0};
     int *seq = malloc((size_t)(np + q->max_tok + 8) * sizeof(int));
     memcpy(seq, ids, (size_t)np * sizeof(int));
     int seqn = np;
@@ -3274,7 +3376,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         gen++; len++;
         while (coli_stdin_readable()) {
             int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); free(seq); free(tf_buf); return; }
+            if (r < 0) { free(ids); free(seq); free(tf_buf); free(wn); free(wa); return; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
@@ -3290,7 +3392,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         int draft[24] = {0};
         int ndraft = 0;
         if (spec_on && room > 0) {
-            int want = spec_max < room ? spec_max : room;
+            int want = (eff_max < room) ? eff_max : room;
             ndraft = ngram_draft(seq, seqn, draft, want);
         }
         if (ndraft > 0) {
@@ -3303,6 +3405,17 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
             int accepted = 0;
              while (accepted < ndraft && tf_buf[pos0 + accepted] == draft[accepted]) accepted++;
             spec_accepted += (uint64_t)accepted;
+            for (int d = 1; d <= ndraft; d++) spec_ddf[d]++;
+            for (int d = 1; d <= accepted; d++) spec_acc[d]++;
+            wn[wi] = ndraft; wa[wi] = accepted;
+            wi = (wi + 1) % spec_win; if (wi == 0) wfull = 1;
+            if (spec_adapt && ndraft >= 2) {
+                long long td = 0, ta = 0;
+                int n = wfull ? spec_win : wi;
+                for (int i = 0; i < n; i++) { td += wn[i]; ta += wa[i]; }
+                double frac = td ? (double)ta / (double)td : 1.0;
+                eff_max = (frac >= spec_minacc) ? spec_max : 1;
+            }
             for (int i = 0; i < accepted && s + 1 + i < q->max_tok; i++) {
                 int tok = draft[i];
                 if (is_eos(c, tok)) { limited = 0; free(logit); logit = NULL; s += accepted; break; }
@@ -3318,7 +3431,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
             if (s + 1 >= q->max_tok || (logit == NULL)) break;
             while (coli_stdin_readable()) {
                 int r = serve_read_cmd(q->id);
-                if (r < 0) { free(seq); free(tf_buf); return; }
+                if (r < 0) { free(seq); free(tf_buf); free(wn); free(wa); return; }
                 if (r > 0) { cancelled = 1; limited = 0; }
             }
             if (cancelled) break;
@@ -3332,6 +3445,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         logit = step(m, &tk, 1, len - 1, NULL);
     }
     free(seq); free(tf_buf);
+    free(wn); free(wa);
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
@@ -3344,6 +3458,15 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
                 (unsigned long long)spec_rounds, (unsigned long long)spec_drafted,
                 (unsigned long long)spec_accepted,
                 spec_drafted ? 100.0*spec_accepted/spec_drafted : 0.0);
+    if (spec_on && spec_rounds) {
+        int last = 24;
+        while (last > 1 && spec_ddf[last] == 0) last--;
+        fprintf(stderr, "[spec] depth-survival");
+        for (int d = 1; d <= last; d++)
+            fprintf(stderr, " A%d=%.0f%%", d,
+                    spec_ddf[d] ? 100.0*spec_acc[d]/spec_ddf[d] : 0.0);
+        fprintf(stderr, " (eff_depth=%d)\n", eff_max);
+    }
     fflush(stdout);
     free(ids);
 }
