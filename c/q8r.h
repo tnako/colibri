@@ -34,7 +34,7 @@
  * Activations are quantized to uint8 per group of gs with a real min/max, so
  * the error is bounded by the activation range within a 64-wide group rather
  * than across the whole row. Verified token-exact against the f32 path on the
- * transformers-oracle fixtures; see docs/oq-optimization-rounds.md.
+ * transformers-oracle fixtures; see docs/ENGINEERING.md.
  */
 #ifndef COLI_Q8R_H
 #define COLI_Q8R_H
@@ -125,7 +125,7 @@ static void q8act_fill(Q8Act *a, const float *x){
  * 7.9 GB instead, and the unpack to bytes is 3 NEON ops per 16 values -- far
  * cheaper than the f32 dequant it replaces, and it feeds UDOT directly.
  *
- * A 32-bit word holds 16 2-bit codes, LSB-first (see docs/oq-format.md). */
+ * A 32-bit word holds 16 2-bit codes, LSB-first (see docs/REFERENCE.md). */
 #if defined(__ARM_FEATURE_DOTPROD)
 static inline uint32_t q8r_udot_2bit(const uint32_t *w, const uint8_t *u, int n){
     const uint8x16_t m3 = vdupq_n_u8(3);

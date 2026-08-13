@@ -8,7 +8,7 @@
  *
  * WHAT IT DOES NOT DO: decode. A Metal dispatch round-trip measures 0.327 ms on
  * this machine and a decode step needs hundreds of matmuls, so single-token
- * decode stays on the CPU (see docs/redesign-roofline.md). The gate is
+ * decode stays on the CPU (see docs/ENGINEERING.md). The gate is
  * LG_METAL_MIN rows, mirroring upstream colibri.c's own S>=16 GEMM gate.
  *
  * PRECISION: weights are uploaded once as f16, activations converted per call.

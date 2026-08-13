@@ -195,7 +195,7 @@ typedef struct {
  * as fmt=7 while this PR sat open already holding the maintainer-assigned
  * ordinal 7 from #524, forcing the 7 -> 8 renumber recorded here. Ordinals
  * are only settled by MERGE into dev, not by assignment on an open PR --
- * docs/FORMATS.md (PR 2 of this pair) is the registry meant to make the
+ * docs/REFERENCE.md (PR 2 of this pair) is the registry meant to make the
  * next claim visible before it lands.
  *
  * A PRIVATE-BLOCK ordinal is an internal enum value only -- qt_resolve_fmt
@@ -1373,7 +1373,7 @@ static int detect_group_size(int O, int I, int64_t ns){
  * container or a Feature Request advertises; the int on the right is this
  * build's internal enum value (colibri.c's QT.fmt / qt_resolve_fmt's return
  * value), never itself persisted to a container -- a container's __metadata__
- * stamp (below) carries the NAME, never the number, matching docs/FORMATS.md's
+ * stamp (below) carries the NAME, never the number, matching docs/REFERENCE.md's
  * own registry. Covers every format qt_resolve_fmt can return, not just the
  * one this branch's tool stamps: a single-entry table could only ever
  * exercise the "unrecognized name" refusal path, never a genuine
@@ -3048,7 +3048,7 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     }
 }
 static int g_absorb=-1;
-static int g_metal_prefill=0; /* default 0: S>4 prefill attention stays on the CPU (bit-exact). COLI_METAL_PREFILL=1 opts it onto the GPU (~4x, near-tie divergence — see docs/metal.md, #622) */
+static int g_metal_prefill=0; /* default 0: S>4 prefill attention stays on the CPU (bit-exact). COLI_METAL_PREFILL=1 opts it onto the GPU (~4x, near-tie divergence — see docs/RUNBOOK.md, #622) */
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
 static int g_cuda_router=0; /* COLI_CUDA_ROUTER=1 (#431 PR-A): router on the layer home device at decode */

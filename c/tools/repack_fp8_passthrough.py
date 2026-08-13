@@ -76,7 +76,7 @@ for this build, so this tool refuses to produce a container the engine
 cannot safely read.
 
 METADATA STAMP (reference implementation of the FORMATS-registry FR -- see
-docs/FORMATS.md): every output shard's safetensors `__metadata__` carries a
+docs/REFERENCE.md): every output shard's safetensors `__metadata__` carries a
 `colibri.fmt` key whose VALUE is itself a JSON-encoded object mapping each
 stamped tensor's exact name to its format NAME string (FORMAT_NAME below,
 "fp8-e4m3-b128" -- never the internal fmt=8 ordinal, which the container must

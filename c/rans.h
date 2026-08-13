@@ -15,7 +15,7 @@
  * symbols in the ORIGINAL forward order.
  *
  * RECORD FORMAT (`int4-rans256-g0`, one record = one tensor's nibble
- * stream; all integers little-endian; docs/int4-rans256-g0.md is the full
+ * stream; all integers little-endian; docs/REFERENCE.md is the full
  * writeup):
  *
  *   offset 0:  n_symbols     u64   -- nibble count

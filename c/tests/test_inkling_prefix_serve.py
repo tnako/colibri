@@ -63,7 +63,7 @@ def ensure_tokenizer(fixture):
 
 
 class Engine:
-    """A serve-mode inkling, speaking the protocol in docs/serve_protocol.md."""
+    """A serve-mode inkling, speaking the protocol in docs/REFERENCE.md."""
 
     def __init__(self, log_prefix=True):
         env = dict(os.environ, SNAP=str(FIXTURE), SERVE="1", NGEN=str(MAXTOK))

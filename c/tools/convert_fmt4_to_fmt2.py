@@ -3,7 +3,7 @@
 
 Motivation: the Metal backend rejects fmt=4 at its attention/dispatch entry points
 (#585/#587); fmt=2 (per-row int4) is the format with full backend support. Converted
-container benchmarked in docs/METAL-M1ULTRA-FMT2-REPORT.md.
+container benchmarked in docs/RUNBOOK.md.
 
 Container layout (both formats): every quantized tensor is a FLAT 1-D U8 array `name` (packed
 nibbles, offset binary: value = nibble - 8, LOW nibble = even element) plus a FLAT 1-D F32

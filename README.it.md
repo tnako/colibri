@@ -124,7 +124,7 @@ hardware, commit, container del modello, comando esatto, prompt, stato cache,
 throughput, TTFT, expert hit, byte letti e controllo qualità; cambia una sola
 variabile, ripeti e allega i log grezzi. Parti da
 [CONTRIBUTING.md](CONTRIBUTING.md), confronta il
-[protocollo di benchmark](docs/benchmarks.md), quindi
+[protocollo di benchmark](docs/RUNBOOK.md), quindi
 [apri una issue di esperimento](https://github.com/JustVugg/colibri/issues/new).
 Un fallimento controllato vale più di un numero veloce senza spiegazione.
 
@@ -191,7 +191,7 @@ prefetch degli expert del layer successivo — il routing è misurabilmente
 **prevedibile al 71.6% un layer in anticipo**. Sulle GPU, la pipeline residente
 (`COLI_CUDA_PIPE=2`) mantiene il flusso residuo on-device tra i layer, così il
 loop CPU degli expert procede senza interruzioni; su Apple Silicon un backend
-[Metal](docs/metal.md) sperimentale esegue la matmul batch degli expert sulla
+[Metal](docs/RUNBOOK.md) sperimentale esegue la matmul batch degli expert sulla
 GPU a memoria unificata.
 
 ### Modello fedele, stato compresso
@@ -214,7 +214,7 @@ teste int4 crollano al 0–4% di accettazione,
 calcolare **la stessa funzione** — `SPEC_PIN=1` fissa entrambi sulla stessa
 famiglia di kernel ([#163](https://github.com/JustVugg/colibri/issues/163)
 contiene l'intera indagine forense). I draft forzati da grammatica
-([`GRAMMAR=file.gbnf`](docs/grammar-draft.md)) aggiungono accettazione quasi
+([`GRAMMAR=file.gbnf`](docs/REFERENCE.md)) aggiungono accettazione quasi
 gratuita sull'output JSON vincolato. Se la speculazione conviene dipende dalla
 temperatura della cache — misura, e usa `DRAFT=0` quando non paga.
 
@@ -225,10 +225,10 @@ temperatura della cache — misura, e usa `DRAFT=0` quando non paga.
 </p>
 
 Stesso motore, stesso container int4 — cambia solo dove risiedono gli expert.
-Punti salienti dalle [tabelle benchmark complete](docs/benchmarks.md):
+Punti salienti dalle [tabelle benchmark complete](docs/RUNBOOK.md):
 
 - **6× RTX 5090, residenza completa:** 5.8–6.8 tok/s in decode, TTFT ~13 s
-  ([log dell'esperimento](docs/experiments/glm52-6x5090-2026-07-12.md));
+  ([log dell'esperimento](docs/EXPERIMENTS.md));
 - **desktop solo-CPU da 128 GB:** ~1.8 tok/s a cache calda
   ([#200](https://github.com/JustVugg/colibri/issues/200));
 - **singola RTX 5070 Ti, classe laptop:** 1.07 tok/s tramite la pipeline
@@ -238,14 +238,14 @@ Punti salienti dalle [tabelle benchmark complete](docs/benchmarks.md):
 
 La qualità è misurata, non presunta: il costo di quantizzazione del container
 int4 e le ablazioni su granularità delle scale e rotazione sono in
-[docs/benchmarks.md](docs/benchmarks.md#quality-benchmark) e
+[docs/RUNBOOK.md](docs/RUNBOOK.md#quality-benchmark) e
 [#108](https://github.com/JustVugg/colibri/issues/108)/[#81](https://github.com/JustVugg/colibri/issues/81).
 
 ## Per iniziare
 
 Ti servono due cose: **il programma** (poche centinaia di KB) e **il modello**
 (372 GB). Guida passo passo per tutte le piattaforme nella
-[Quick Start](docs/quickstart.md).
+[Quick Start](docs/RUNBOOK.md).
 
 ### 1. Procurati colibri
 
@@ -317,14 +317,14 @@ e per il gateway API opzionale.
 
 | argomento | documento |
 |---|---|
-| Benchmark, dati dalla comunità, misurazioni di qualità | [docs/benchmarks.md](docs/benchmarks.md) |
-| Parametri di tuning, policy, cache che impara, prefetch | [docs/tuning.md](docs/tuning.md) |
-| Build nativa su Windows 11 (con CUDA DLL) | [docs/windows.md](docs/windows.md) |
-| Backend CUDA, livello expert in VRAM, residenza completa | [docs/cuda.md](docs/cuda.md) |
-| Backend Metal per Apple Silicon | [docs/metal.md](docs/metal.md) |
-| API compatibile OpenAI, KV slot, dashboard web | [docs/api.md](docs/api.md) |
-| Draft forzati da grammatica (output strutturato) | [docs/grammar-draft.md](docs/grammar-draft.md) |
-| Inventario delle variabili d'ambiente | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+| Benchmark, dati dalla comunità, misurazioni di qualità | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Parametri di tuning, policy, cache che impara, prefetch | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Build nativa su Windows 11 (con CUDA DLL) | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Backend CUDA, livello expert in VRAM, residenza completa | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Backend Metal per Apple Silicon | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| API compatibile OpenAI, KV slot, dashboard web | [docs/REFERENCE.md](docs/REFERENCE.md) |
+| Draft forzati da grammatica (output strutturato) | [docs/REFERENCE.md](docs/REFERENCE.md) |
+| Inventario delle variabili d'ambiente | [docs/REFERENCE.md](docs/REFERENCE.md) |
 
 ## Prossimi passi
 

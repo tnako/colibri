@@ -2,7 +2,7 @@
  *
  * The whole forward pass lives in laguna_common.h, shared with laguna_s.c —
  * XS and S are one architecture at two scales and every code path is identical
- * (see docs/laguna.md). This file exists so each size gets its own binary with
+ * (see docs/ENGINEERING.md). This file exists so each size gets its own binary with
  * its own banner, matching how coli's engine_for() picks a binary per arch.
  * Nothing here is XS-specific except the name: geometry comes from the
  * checkpoint's config.json, never from a compile-time constant.

@@ -11,7 +11,7 @@
  * bits and gs come from config.json per tensor, so one reader covers oQ2e..oQ8e
  * and every third-party respin. Widths in the wild: 2,3,4,5,6,8; gs 64 or 128.
  * Verified byte-exact vs mlx.core.dequantize, incl. 3/6-bit (tools/validate_oq_dequant.py).
- * Spec + measurements: docs/oq-format.md.
+ * Spec + measurements: docs/REFERENCE.md.
  *
  * 32%bits!=0 for 3/5/6, so codes straddle words; gs*bits%32==0 for every pair
  * that occurs, so a group always starts word-aligned and the unpacker never
@@ -127,7 +127,7 @@ static inline int oq_is_byte_aligned(int bits) { return bits == 8; }
  * same for every token, so unpacking once and reusing it across all S rows is
  * the difference between O(S*ng) and O(ng) unpacks. With the batched MoE path
  * feeding S=59 rows per expert, hoisting this took oq_unpack from 29% of total
- * runtime to noise (docs/oq-format.md, round 4). */
+ * runtime to noise (docs/REFERENCE.md, round 4). */
 static void matmul_oq(float *y, const float *x, const uint32_t *q,
                       const float *scale, const float *bias,
                       int S, int I, int O, int bits, int gs){
@@ -148,7 +148,7 @@ static void matmul_oq(float *y, const float *x, const uint32_t *q,
      * after. Real but modest (~4-5%) -- most of decode's per-token cost is
      * legitimate attention/expert-GEMM work at Laguna-XS's small per-token
      * batch size (topk=8 of 256 experts), not fork/join overhead; see
-     * docs/laguna-decode-throughput.md for the fuller investigation and the
+     * docs/ENGINEERING.md for the fuller investigation and the
      * ideas that did NOT pan out (resident-bank-at-decode, spin-wait, thread
      * count). */
     #pragma omp parallel if(!omp_in_parallel())

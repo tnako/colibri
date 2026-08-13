@@ -30,7 +30,7 @@ WHAT IT DOES
      The colibri.fmt stamp is MANDATORY for this format: entropy-coded sizes
      are data-dependent, so no byte-arithmetic inference exists — the stamp
      is the only signal a U8 tensor is entropy-coded at all (see
-     docs/int4-rans256-g0.md, "the stamp is load-bearing").
+     docs/REFERENCE.md, "the stamp is load-bearing").
 
 DETERMINISM: two runs over the same input produce byte-identical output —
 sorted tensor order, sorted JSON keys, no timestamps, a codec whose output

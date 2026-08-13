@@ -171,7 +171,7 @@ footer li a:hover{color:var(--on-dark)}
       <a href="#engine">Engine</a>
       <a href="#models">Models</a>
       <a href="#hardware">Hardware</a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md">Benchmarks</a>
       <a class="btn" href="https://github.com/JustVugg/colibri">Star on GitHub</a>
     </div>
   </div>
@@ -230,13 +230,13 @@ footer li a:hover{color:var(--on-dark)}
         <a class="btn" href="https://github.com/JustVugg/colibri">Run it →</a></div>
       <div class="card"><h3>Inkling</h3><p class="desc">A 975B reasoning MoE, running today. An int4 dense container brings the resident set to 15.3 GB, so it fits a 25 GB box.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Thinking Machines</span></div><div class="row"><span class="k">Size · Status</span><span class="v">975B MoE · Live</span></div></div>
-        <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/inkling.md">Run it →</a></div>
+        <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/ENGINEERING.md">Run it →</a></div>
       <div class="card"><h3>DeepSeek</h3><p class="desc">A widely-studied frontier MoE family — the tiered engine's next large-scale target.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">DeepSeek AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">671B–1T MoE · Planned</span></div></div>
         <a class="btn soon">On the roadmap</a></div>
       <div class="card"><h3>Kimi K3</h3><p class="desc">The largest model here, running today — its QAT-trained MXFP4 experts are streamed straight from the original checkpoint, with no conversion.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Moonshot AI</span></div><div class="row"><span class="k">Size · Status</span><span class="v">2.8T MoE · Live</span></div></div>
-        <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/kimi_k3.md">Run it →</a></div>
+        <a class="btn" href="https://github.com/JustVugg/colibri/blob/main/docs/REFERENCE.md">Run it →</a></div>
       <div class="card"><h3>Qwen3 MoE</h3><p class="desc">The most widely-deployed open family — broad hardware coverage meets broad adoption.</p>
         <div class="meta"><div class="row"><span class="k">Maker</span><span class="v">Alibaba Qwen</span></div><div class="row"><span class="k">Size · Status</span><span class="v">MoE · Planned</span></div></div>
         <a class="btn soon">On the roadmap</a></div>
@@ -259,16 +259,16 @@ footer li a:hover{color:var(--on-dark)}
     <div class="eyebrow">Same engine, any hardware</div>
     <p class="lead">Measured decode speed on real community machines. The hardware only changes where the experts live, not what the model answers.</p>
     <div class="dlist">
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">6× RTX 5090 · full residency + NUMA</div><div class="sub">all in VRAM + RAM · disk 0</div></div><div class="spd">9.0–9.2 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">AWS Graviton4 r8g.16xlarge · 64-core aarch64 · CPU-only</div><div class="sub">98% pinned in 512 GB RAM · disk 0</div></div><div class="spd hi">8.0 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">2× Xeon Gold 6430 · 1 TB DDR5 · CPU-only</div><div class="sub">every expert pinned in RAM</div></div><div class="spd">5.42 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">NVIDIA DGX Spark GB10 · 121 GB unified</div><div class="sub">unified memory + CACHE_ROUTE</div></div><div class="spd">3.33 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">MacBook Pro M5 Max · 128 GB · Metal</div><div class="sub">Metal tier + warm pin</div></div><div class="spd">2.0 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">Ryzen 9 9950X3D · RTX 5090 · Gen5 NVMe</div><div class="sub">28 GB VRAM tier + 11.5 GB/s disk</div></div><div class="spd">1.23 tok/s</div></a>
-      <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md"><div><div class="name">25 GB dev box · cold — the proven floor</div><div class="sub">streamed from NVMe</div></div><div class="spd">0.05–0.1 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md"><div><div class="name">6× RTX 5090 · full residency + NUMA</div><div class="sub">all in VRAM + RAM · disk 0</div></div><div class="spd">9.0–9.2 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md"><div><div class="name">AWS Graviton4 r8g.16xlarge · 64-core aarch64 · CPU-only</div><div class="sub">98% pinned in 512 GB RAM · disk 0</div></div><div class="spd hi">8.0 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md"><div><div class="name">2× Xeon Gold 6430 · 1 TB DDR5 · CPU-only</div><div class="sub">every expert pinned in RAM</div></div><div class="spd">5.42 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md"><div><div class="name">NVIDIA DGX Spark GB10 · 121 GB unified</div><div class="sub">unified memory + CACHE_ROUTE</div></div><div class="spd">3.33 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md"><div><div class="name">MacBook Pro M5 Max · 128 GB · Metal</div><div class="sub">Metal tier + warm pin</div></div><div class="spd">2.0 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md"><div><div class="name">Ryzen 9 9950X3D · RTX 5090 · Gen5 NVMe</div><div class="sub">28 GB VRAM tier + 11.5 GB/s disk</div></div><div class="spd">1.23 tok/s</div></a>
+      <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md"><div><div class="name">25 GB dev box · cold — the proven floor</div><div class="sub">streamed from NVMe</div></div><div class="spd">0.05–0.1 tok/s</div></a>
     </div>
     <p class="dlistnote">…and 15+ more community machines, from an M4 Pro Mac Mini to a 430 GB EPYC server.
-      Full tables, methodology and quality ablations: <a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
+      Full tables, methodology and quality ablations: <a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md">docs/RUNBOOK.md</a></p>
   </div>
 </section>
 
@@ -280,7 +280,7 @@ footer li a:hover{color:var(--on-dark)}
         <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Run a benchmark on your hardware</span><span class="c">Any machine is a datapoint</span></a>
         <a href="https://github.com/JustVugg/colibri/issues"><span class="t">Pick an open issue</span><span class="c">Kernels · schedulers · atlas</span></a>
         <a href="https://github.com/JustVugg/colibri"><span class="t">Read the engine</span><span class="c">One C file · zero dependencies</span></a>
-        <a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md"><span class="t">Use the OpenAI-compatible API</span><span class="c">Drop-in gateway</span></a>
+        <a href="https://github.com/JustVugg/colibri/blob/main/docs/REFERENCE.md"><span class="t">Use the OpenAI-compatible API</span><span class="c">Drop-in gateway</span></a>
       </div>
     </div>
   </div>
@@ -293,8 +293,8 @@ footer li a:hover{color:var(--on-dark)}
       <div><h4>Engine</h4><ul>
         <li><a href="https://github.com/JustVugg/colibri">GitHub</a></li>
         <li><a href="https://github.com/JustVugg/colibri#quick-start">Quick start</a></li>
-        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/api.md">API</a></li>
-        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Benchmarks</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/REFERENCE.md">API</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md">Benchmarks</a></li>
       </ul></div>
       <div><h4>Models</h4><ul>
         <li><a href="#models">GLM-5.2</a></li><li><a href="#models">OLMoE</a></li>
@@ -302,7 +302,7 @@ footer li a:hover{color:var(--on-dark)}
       </ul></div>
       <div><h4>Project</h4><ul>
         <li><a href="https://github.com/JustVugg/colibri/issues">Issues</a></li>
-        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/benchmarks.md">Community results</a></li>
+        <li><a href="https://github.com/JustVugg/colibri/blob/main/docs/RUNBOOK.md">Community results</a></li>
         <li><a href="https://github.com/JustVugg/colibri">Apache 2.0 license</a></li>
       </ul></div>
     </div>

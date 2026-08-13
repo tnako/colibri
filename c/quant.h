@@ -575,7 +575,7 @@ static int g_xexp=0;  /* XEXP=1 (opt-in): S==1 decode, all-resident int4 block -
                        * 256 tok greedy, ABAB 3 prompts x 2 reps): 4.20 -> 4.68 tok/s
                        * (+11.6% mean, worst prompt +11.3%), expert-matmul effective
                        * 89.5 -> 131.9 GB/s. A similar restructuring was NEUTRAL/negative on
-                       * a 24-core box (docs/experiments/glm52-6x5090-2026-07-12.md) - hence
+                       * a 24-core box (docs/EXPERIMENTS.md) - hence
                        * opt-in; measure on your host. */
 
 static inline float qrow_i8(const float *x, int8_t *q, int I){

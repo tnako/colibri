@@ -472,7 +472,7 @@ endif
 # for resident expert tensors. Independent of CUDA/HIP: works on GPUs ROCm doesn't
 # support (Polaris/RX 580); the VRAM-resident int4 expert-group PRIMITIVE measured ~35%
 # faster than the ROCm/HIP one on an RX 9070 (per-call incl. readback — end-to-end tok/s
-# depends on what else bounds the box; see docs/vulkan.md, benchmarking notes included).
+# depends on what else bounds the box; see docs/RUNBOOK.md, benchmarking notes included).
 # Needs libvulkan + glslc (shaderc). Default build unchanged (all colibri.c hooks under
 # #ifdef COLI_VULKAN). The .comp shaders compile to .spv, loaded at runtime from
 # COLI_VK_SHADERS (default: alongside the binary / ./shaders).
@@ -742,7 +742,7 @@ laguna_s$(EXE): laguna_s.c laguna_common.h oq.h q8r.h coli_moe_route.h st.h json
 
 # LAGUNA-FORK: Metal/MPS prefill build. Separate targets because they need the
 # ObjC++ TU and two frameworks; the plain targets stay dependency-free.
-# Measured: MPS f16 GEMM 15.5 TFLOP/s vs 59 GFLOP/s on the CPU (docs/redesign-roofline.md).
+# Measured: MPS f16 GEMM 15.5 TFLOP/s vs 59 GFLOP/s on the CPU (docs/ENGINEERING.md).
 LG_METAL_LD = -framework Metal -framework MetalPerformanceShaders -framework Foundation -lc++ -lobjc
 
 laguna_metal.o: laguna_metal.mm laguna_metal.h

@@ -101,7 +101,7 @@ VRAM／RAM／磁盘层级条，以及角落的实时迷你大脑。</em></p>
 想参与就任选一行，负结果也请公开。请记录硬件、commit、模型容器、完整命令、prompt、
 缓存状态、吞吐、TTFT、expert hit、读取字节数与质量检查；每次只改一个变量，重复运行并附上
 原始日志。先阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和
-[benchmark 协议](docs/benchmarks.md)，然后
+[benchmark 协议](docs/RUNBOOK.md)，然后
 [创建实验 issue](https://github.com/JustVugg/colibri/issues/new)。
 在这里，一个受控的失败比一个无法解释的高数字更有价值。
 
@@ -159,7 +159,7 @@ VRAM／RAM／磁盘层级条，以及角落的实时迷你大脑。</em></p>
 实测显示，路由结果提前一层时有 **71.6% 的可预测性**。
 在 GPU 上，常驻管线（`COLI_CUDA_PIPE=2`）让残差流跨层保留在设备端，
 使 CPU 专家循环不中断；在 Apple Silicon 上，实验性的
-[Metal 后端](docs/metal.md)会用统一内存 GPU 执行批量专家运算。
+[Metal 后端](docs/RUNBOOK.md)会用统一内存 GPU 执行批量专家运算。
 
 ### 忠实模型，压缩状态
 
@@ -178,7 +178,7 @@ MTP head 必须是 **int8**（int4 head 的接受率会崩塌到 0–4%，见
 [#8](https://github.com/JustVugg/colibri/issues/8)），且草稿与验证必须计算
 **相同函数**——`SPEC_PIN=1` 会把两者固定在同一 kernel family
 （完整取证过程见 [#163](https://github.com/JustVugg/colibri/issues/163)）。
-语法强制草稿（[`GRAMMAR=file.gbnf`](docs/grammar-draft.md)）可在受限 JSON 输出中，
+语法强制草稿（[`GRAMMAR=file.gbnf`](docs/REFERENCE.md)）可在受限 JSON 输出中，
 以近乎免费的代价提高接受率。推测解码是否带来净收益取决于缓存热度——请实测，
 若不划算就使用 `DRAFT=0`。
 
@@ -189,10 +189,10 @@ MTP head 必须是 **int8**（int4 head 的接受率会崩塌到 0–4%，见
 </p>
 
 同一套引擎、同一个 int4 容器——硬件只会改变专家的存放位置。
-[完整 benchmark 表格](docs/benchmarks.md)中的重点如下：
+[完整 benchmark 表格](docs/RUNBOOK.md)中的重点如下：
 
 - **6× RTX 5090，全部常驻：**解码 5.8–6.8 tok/s，TTFT 约 13 秒
-  （[实验记录](docs/experiments/glm52-6x5090-2026-07-12.md)）；
+  （[实验记录](docs/EXPERIMENTS.md)）；
 - **128 GB、仅使用 CPU 的台式机：**热缓存后约 1.8 tok/s
   （[#200](https://github.com/JustVugg/colibri/issues/200)）；
 - **单张 RTX 5070 Ti 的笔记本级主机：**通过 GPU 常驻管线达到 1.07 tok/s
@@ -201,14 +201,14 @@ MTP head 必须是 **int8**（int4 head 的接受率会崩塌到 0–4%，见
   也仍是诚实的基准。
 
 质量来自测量，而非假设：int4 容器的量化损失，以及 scale granularity／rotation
-消融实验，收录于 [docs/benchmarks.md](docs/benchmarks.md#quality-benchmark)、
+消融实验，收录于 [docs/RUNBOOK.md](docs/RUNBOOK.md#quality-benchmark)、
 [#108](https://github.com/JustVugg/colibri/issues/108) 与
 [#81](https://github.com/JustVugg/colibri/issues/81)。
 
 ## 开始使用
 
 你需要两样东西：**程序本体**（几百 KB）和**模型**（372 GB）。各平台的分步
-指引见 [Quick Start 指南](docs/quickstart.md)。
+指引见 [Quick Start 指南](docs/RUNBOOK.md)。
 
 ### 1. 获取 colibri
 
@@ -274,14 +274,14 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 只读就绪检查
 
 | 主题 | 文档 |
 |---|---|
-| Benchmark、社区实测数据、质量测量 | [docs/benchmarks.md](docs/benchmarks.md) |
-| 调优选项、策略、学习型缓存、预取 | [docs/tuning.md](docs/tuning.md) |
-| Windows 11 原生构建（含 CUDA DLL） | [docs/windows.md](docs/windows.md) |
-| CUDA 后端、VRAM 专家层级、全部常驻 | [docs/cuda.md](docs/cuda.md) |
-| Apple Silicon Metal 后端 | [docs/metal.md](docs/metal.md) |
-| OpenAI 兼容 API、KV slots、网页仪表盘 | [docs/api.md](docs/api.md) |
-| 语法强制草稿（结构化输出） | [docs/grammar-draft.md](docs/grammar-draft.md) |
-| 环境变量完整清单 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+| Benchmark、社区实测数据、质量测量 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| 调优选项、策略、学习型缓存、预取 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Windows 11 原生构建（含 CUDA DLL） | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| CUDA 后端、VRAM 专家层级、全部常驻 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Apple Silicon Metal 后端 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| OpenAI 兼容 API、KV slots、网页仪表盘 | [docs/REFERENCE.md](docs/REFERENCE.md) |
+| 语法强制草稿（结构化输出） | [docs/REFERENCE.md](docs/REFERENCE.md) |
+| 环境变量完整清单 | [docs/REFERENCE.md](docs/REFERENCE.md) |
 
 ## DeepSeek V4
 
@@ -299,8 +299,8 @@ python ./coli run --model /path/to/DeepSeek-V4-Flash --ram 32 \
 ```
 
 状态、checkpoint 验证、统一 CLI／server 用法和动态生成的 tiny 独立
-oracle 说明，请参阅[中文版 DeepSeek V4 文档](docs/deepseek-v4.zh-CN.md)；
-英文原文见 [docs/deepseek-v4.md](docs/deepseek-v4.md)。
+oracle 说明，请参阅[中文版 DeepSeek V4 文档](docs/REFERENCE.md)；
+英文原文见 [docs/REFERENCE.md](docs/REFERENCE.md)。
 
 ## 下一步
 

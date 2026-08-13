@@ -1,4 +1,4 @@
-"""docs/FORMATS.md <-> colibri.c FMT_NAMES parity (fix round 1, adopted
+"""docs/REFERENCE.md <-> colibri.c FMT_NAMES parity (fix round 1, adopted
 review test-candidate).
 
 The registry's name column IS the canonical stamp string: a container's

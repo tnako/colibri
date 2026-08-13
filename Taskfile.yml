@@ -44,10 +44,10 @@ vars:
   CAP: '{{.CAP | default "0"}}'
   # Total memory the engine may use, in GB. The one tuning knob: everything else
   # (GPU attention K/V, resident expert bank, expert cache size) is derived from
-  # it in priority order. See docs/one-knob-and-chunking.md.
+  # it in priority order. See docs/RUNBOOK.md.
   MEM_GB: '{{.MEM_GB | default "20"}}'
   # Max context. Sizes the GPU attention K/V, so it is a memory decision too.
-  # 262144 = 256k, the checkpoint's trained maximum (docs/laguna-s-scaling.md).
+  # 262144 = 256k, the checkpoint's trained maximum (docs/ENGINEERING.md).
   # At that size GPU K/V for the full-attention layers alone is ~13 GB (ring
   # bound), so MEM_GB may need raising past its 20 GB default too -- the
   # engine logs `[mem] gpu attention needs X GB, not affordable -> CPU` and

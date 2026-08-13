@@ -40,12 +40,12 @@ using namespace metal;
  * A = x[rows, Kd] f32 (activations), B = expert weight [N, Kd] oQ-packed.
  * Output y[rows, N] f32.
  *
- * oQ layout (verified in docs/oq-format.md): codes are LSB-first packed into
+ * oQ layout (verified in docs/REFERENCE.md): codes are LSB-first packed into
  * uint32 along K; scales/biases are bf16, one pair per group of `gs` along K.
  *
  * TM=128 was tried (to amortize the B dequant over more rows per weight-tile
  * decode -- see the "dequant is redundant across row-tiles" note in
- * docs/gpu-expert-grouped-gemm.md) and MEASURED WORSE: 284.6s vs 199.7s
+ * docs/ENGINEERING.md) and MEASURED WORSE: 284.6s vs 199.7s
  * prefill wall on Laguna-S at 7370 tokens. Halving dequant work per row also
  * halved the number of threadgroups dispatched (half as many row-tiles per
  * expert), and the occupancy loss outweighed the compute saving -- consistent
@@ -303,7 +303,7 @@ extern "C" void *lg_metal_scratch_ptr(void *h) {
  * one dispatch per expert -- 768 per layer, 36,864 per chunk -- and profiling
  * showed the process 87% blocked in __psynch_cvwait with the GPU idle. The
  * grouped kernel below replaced it and it was deleted rather than kept as a
- * second path. See docs/gpu-expert-grouped-gemm.md. */
+ * second path. See docs/ENGINEERING.md. */
 
 /* GPU busy vs wall time for expert dispatches (LAGUNA_GPU_PROF=1). */
 static double g_exp_gpu_s = 0, g_exp_wall_s = 0;

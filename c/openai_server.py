@@ -1268,7 +1268,7 @@ def anthropic_tools(body):
 
 # Generic whitespace-tolerant JSON grammar for response_format {"type": "json_object"}.
 # Draft-source semantics: positions with one legal byte draft; jws points just keep
-# the walker alive through the model's own spacing (see docs/grammar-draft.md).
+# the walker alive through the model's own spacing (see docs/REFERENCE.md).
 GENERIC_JSON_GBNF = (
     'root ::= jws jval jws\n'
     'jval ::= jobj | jarr | jstr | jnum | "true" | "false" | "null"\n'

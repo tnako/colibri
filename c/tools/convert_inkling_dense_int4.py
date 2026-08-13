@@ -22,7 +22,7 @@ Formato di output (stessa convenzione .qs che inkling.c usa gia' per gli esperti
     <nome>.qs   F32  [O, ceil(I/64)]  una scala ogni 64 elementi lungo l'INPUT
     __metadata__ {"<nome>": "fmt=4;gs=64"}  /  "fmt=1" per int8  /  "fmt=raw"
 
-Politica di precisione (misurata: vedi docs/inkling.md):
+Politica di precisione (misurata: vedi docs/ENGINEERING.md):
     attention / shared_experts / mlp denso   -> int4-gs64    ~11% errore L2
     embed_tokens / lm_head                   -> int8 per-row ~0.9% (entrano in OGNI token)
     norm / bias / A_log / conv1d / router    -> passthrough  (minuscoli e delicati)

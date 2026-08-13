@@ -1081,7 +1081,7 @@ static void test_stamp_agreeing_duplicate(void){
 /* ---- Stamp-map scan bound (maintainer review, #529): st_fmt_stamp_ingest
  * (st.h) caps the number of stamped-tensor entries it will ingest across a
  * container's shards at ST_FMT_STAMP_MAX and refuses (exit(1)) past it --
- * see st.h's own comment and docs/FORMATS.md's "Stamp-map scan bound" for
+ * see st.h's own comment and docs/REFERENCE.md's "Stamp-map scan bound" for
  * why (stamps are a resident-tensor convention, never a bulk migration path
  * for the tens of thousands of routed-expert tensors a large MoE model
  * carries). Writes a minimal ONE-tensor shard (the shard's actual tensor

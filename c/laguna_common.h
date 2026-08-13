@@ -4,7 +4,7 @@
  * is identical, only config numbers differ (D 2048/3072, L 40/48, topk 8/10,
  * moe_inter 512/1024, sliding-layer head count 64/72, YaRN factor 32/128). So
  * the engine is written once and c/laguna_xs.c / c/laguna_s.c include it; see
- * docs/laguna.md.
+ * docs/ENGINEERING.md.
  *
  * What is genuinely new versus every existing Colibri engine:
  *  - PER-HEAD ATTENTION OUTPUT GATE. g_proj is Linear(D, n_heads) and the
@@ -251,7 +251,7 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
  * attention path need it; the chunking itself is in step() far below.
  *
  * 4096 -> 8192 (LAGUNA-FORK): the GPU expert kernel's throughput depends on
- * rows-per-expert-per-dispatch (measured in docs/gpu-expert-grouped-gemm.md:
+ * rows-per-expert-per-dispatch (measured in docs/ENGINEERING.md:
  * 181.8 GFLOP/s at 32 rows, 1386.6 at 512), and rows/expert = chunk*topk/E.
  * On Laguna-S (topk=10, E=256) that was only 160 rows/expert at chunk=4096,
  * far short of where the kernel is efficient. Doubling the chunk collapses a
@@ -357,7 +357,7 @@ static float softplusf(float x) { return x > 20.f ? x : log1pf(expf(x)); }
 /* f32 dot and AXPY. Attention calls these once per (query,key) pair with
  * hd=128, so at long context they run millions of times per layer; leaving them
  * as scalar loops made attention the largest phase once the MoE path was fixed
- * (docs/oq-format.md, round 5). */
+ * (docs/REFERENCE.md, round 5). */
 #ifdef __ARM_NEON
 static inline float dot_f32(const float *a, const float *b, int n) {
     float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0);
@@ -1111,7 +1111,7 @@ static float *load_t(Model *m, const char *name) {
 
 /* Resolve a logical tensor stem to whatever this checkpoint actually calls it.
  * MLX prefixes everything with "language_model." and renames a few modules
- * (docs/oq-format.md has the table). Returns a pointer into `buf`. */
+ * (docs/REFERENCE.md has the table). Returns a pointer into `buf`. */
 static const char *lg_name(Model *m, char *buf, size_t n, const char *stem, const char *suffix) {
     snprintf(buf, n, "%s%s", stem, suffix);
     if (st_find(&m->S, buf)) return buf;
@@ -1761,7 +1761,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * hazard and same resolution as upstream PR #830 for inkling.c. */
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = afloat((int64_t)S*qdim);
-    /* ROUND 6+7 (docs/oq-optimization-rounds.md): tile the score loop over a
+    /* ROUND 6+7 (docs/ENGINEERING.md): tile the score loop over a
      * block of QUERIES per KV head, with a CHUNKED online softmax.
      *
      * Round 6 - reuse. The old shape was one query-head x one query at a time,
@@ -2390,7 +2390,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     }
 
 
-    /* ROUND 8 (docs/oq-optimization-rounds.md): walk the pairs in EXPERT order.
+    /* ROUND 8 (docs/ENGINEERING.md): walk the pairs in EXPERT order.
      *
      * The pair list is naturally in token order, so a chunk of `cap` pairs holds
      * up to `cap` DIFFERENT experts; the next chunk needs a different set, evicts
@@ -2437,7 +2437,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
         double te = now_s();
-        /* ROUND 1+3 (docs/oq-format.md): batch the pairs BY EXPERT, then run one
+        /* ROUND 1+3 (docs/REFERENCE.md): batch the pairs BY EXPERT, then run one
          * matmul per expert over all its tokens.
          *
          * Round 1 replaced per-matmul OpenMP regions (52% of time was
@@ -2947,7 +2947,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out, i
  * followed it last time. Free to attempt (no model call) and free to reject
  * (the verify step below runs anyway). Ported from deepseek_v4.c's
  * v4_ngram_draft with the same trigram->bigram fallback; see
- * docs/laguna-decode-throughput.md for why this and not a trained draft
+ * docs/ENGINEERING.md for why this and not a trained draft
  * model. LG_SPEC_MAX caps how many tokens are proposed per round; LG_SPEC=0
  * disables speculation entirely for a clean A/B against the plain loop. */
 static int ngram_draft(const int *seq, int count, int *out, int maximum) {
@@ -3029,7 +3029,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new) {
          * longest matching prefix; KV rows written for the rejected tail are
          * silently overwritten by the next call at the same absolute
          * positions (kv_len is metadata only, not a masking bound -- see
-         * docs/laguna-decode-throughput.md), so no explicit rollback is
+         * docs/ENGINEERING.md), so no explicit rollback is
          * needed. */
         int room = n_new - s;
         int draft[24] = {0};
@@ -3463,7 +3463,7 @@ int main(int argc, char **argv) {
             "BITS must be 0 (f32 experts) or 8 (runtime int8).\n"
             "  Sub-byte values are rejected on purpose: the runtime quantizer stores one\n"
             "  code per byte, so BITS=%d would use the SAME memory as BITS=8 and be less\n"
-            "  accurate. For real sub-byte weights use an oQ checkpoint (docs/oq-format.md),\n"
+            "  accurate. For real sub-byte weights use an oQ checkpoint (docs/REFERENCE.md),\n"
             "  which is bit-packed and picks a width per tensor.\n", bits);
         return 1;
     }

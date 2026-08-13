@@ -2,7 +2,7 @@
 
 Downloads ONE small quantized tensor (weight+scales+biases) from a real oQ
 checkpoint via ranged GETs, unpacks it with a from-scratch numpy implementation
-of the layout documented in docs/oq-format.md, and compares to MLX's own
+of the layout documented in docs/REFERENCE.md, and compares to MLX's own
 dequantize. If these agree bit-for-bit the C implementation can be written
 against the numpy version with confidence.
 """

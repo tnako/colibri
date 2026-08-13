@@ -45,7 +45,7 @@ of the same basename is already present. It never silently accepts a copy from
 `System32`, from `PATH`, or from an unrelated ROCm install.
 
 Read [what this was tested on](#windows-hip-limitations) before relying on it;
-`docs/windows.md` has the full setup walkthrough.
+`docs/RUNBOOK.md` has the full setup walkthrough.
 
 The two halves are built separately.
 

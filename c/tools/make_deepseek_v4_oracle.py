@@ -3,7 +3,7 @@
 
 This is intentional heavy validation — not part of light `make check`.
 
-Comparison contract (documented in the JSON and docs/deepseek-v4.md):
+Comparison contract (documented in the JSON and docs/REFERENCE.md):
   - top-1 token exact match for teacher-forcing and greedy windows
   - logits max-abs / top-k ranking are reserved for a future transformers
     oracle (`source=transformers`); coli-self fixtures only claim token match

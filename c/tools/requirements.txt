@@ -14,7 +14,7 @@
 # transformers>=5.11 is a hard requirement there, not a preference: the generator
 # exits rather than run below it, because older releases apply split-half Llama
 # RoPE and silently emit an oracle the engine cannot match (issue #281). See
-# docs/windows.md "Generating the synthetic GLM oracle model" for an isolated
+# docs/RUNBOOK.md "Generating the synthetic GLM oracle model" for an isolated
 # CPU-only setup.
 torch>=2.4
 safetensors>=0.4

@@ -129,7 +129,7 @@ hardware, commit, model/container, exact command, prompt, cache state, throughpu
 TTFT, expert hit rate, bytes read, and quality check; change one variable, repeat
 the run, and attach raw logs. Start with
 [CONTRIBUTING.md](CONTRIBUTING.md), compare against
-[the benchmark protocol](docs/benchmarks.md), then
+[the benchmark protocol](docs/RUNBOOK.md), then
 [open an experiment issue](https://github.com/JustVugg/colibri/issues/new).
 A well-controlled failure is more valuable here than an unexplained fast number.
 
@@ -238,12 +238,12 @@ while resident ones compute; batched positions read each unique expert once
 layer's experts — routing is measurably **71.6% predictable one layer ahead**.
 On GPUs, the resident pipeline (`COLI_CUDA_PIPE=2`) keeps the residual stream
 on-device across layers so the CPU expert loop runs uninterrupted; on Apple
-Silicon an experimental [Metal backend](docs/metal.md) does the batched expert
-math on the unified-memory GPU; and a [Vulkan backend](docs/vulkan.md) brings
+Silicon an experimental [Metal backend](docs/RUNBOOK.md) does the batched expert
+math on the unified-memory GPU; and a [Vulkan backend](docs/RUNBOOK.md) brings
 the expert tier, dense projections, and the MLA attention core to any GPU with
 a Vulkan 1.2 driver — including AMD cards via Mesa/RADV (the only backend for
 cards the vendor stacks no longer support, like the RX 580, and competitive
-with ROCm on RDNA4 — see [the benchmarking notes](docs/vulkan.md)).
+with ROCm on RDNA4 — see [the benchmarking notes](docs/RUNBOOK.md)).
 
 > **On real NVMe, measure `DIRECT=1`.** O_DIRECT bypasses the page cache and is
 > often a large win on drives with DRAM cache and bandwidth headroom (+34%
@@ -272,7 +272,7 @@ acceptance, [#8](https://github.com/JustVugg/colibri/issues/8)), and draft and
 verify must compute **the same function** — `SPEC_PIN=1` pins both to one
 kernel family ([#163](https://github.com/JustVugg/colibri/issues/163) is the
 full forensic story). Grammar-forced drafts
-([`GRAMMAR=file.gbnf`](docs/grammar-draft.md)) add ~free acceptance on
+([`GRAMMAR=file.gbnf`](docs/REFERENCE.md)) add ~free acceptance on
 constrained JSON output. Whether speculation is a net win depends on your
 cache temperature — measure, and use `DRAFT=0` when it doesn't pay.
 
@@ -283,10 +283,10 @@ cache temperature — measure, and use `DRAFT=0` when it doesn't pay.
 </p>
 
 Same engine, same int4 container — the hardware only changes where the experts
-live. Highlights from the [full benchmark tables](docs/benchmarks.md):
+live. Highlights from the [full benchmark tables](docs/RUNBOOK.md):
 
 - **6× RTX 5090, full residency:** 5.8–6.8 tok/s decode, TTFT ~13 s
-  ([experiment log](docs/experiments/glm52-6x5090-2026-07-12.md));
+  ([experiment log](docs/EXPERIMENTS.md));
 - **128 GB CPU-only desktop:** ~1.8 tok/s warm ([#200](https://github.com/JustVugg/colibri/issues/200));
 - **single RTX 5070 Ti laptop-class box:** 1.07 tok/s via the GPU-resident
   pipeline ([#273](https://github.com/JustVugg/colibri/issues/273));
@@ -295,14 +295,14 @@ live. Highlights from the [full benchmark tables](docs/benchmarks.md):
 
 Quality is measured, not assumed: the int4 container's quantization cost and the
 scale-granularity/rotation ablations live in
-[docs/benchmarks.md](docs/benchmarks.md#quality-benchmark) and
+[docs/RUNBOOK.md](docs/RUNBOOK.md#quality-benchmark) and
 [#108](https://github.com/JustVugg/colibri/issues/108)/[#81](https://github.com/JustVugg/colibri/issues/81).
 
 ## Get started
 
 You need two things: **the program** (a few hundred KB) and **the model**
 (372 GB). Step-by-step for every platform in the
-[Quick Start guide](docs/quickstart.md).
+[Quick Start guide](docs/RUNBOOK.md).
 
 ### 1. Get colibri
 
@@ -385,18 +385,18 @@ the model's `config.json`):
 | Family | Total / active | Weights | Build | Docs |
 |---|---|---|---|---|
 | **GLM-5.2** | 744B / 40B | [`mastouri/…-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp) (372 GB) | `make -C c glm` | this page |
-| **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
-| **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
-| **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
+| **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/ENGINEERING.md) |
+| **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/REFERENCE.md) |
+| **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/REFERENCE.md) |
 <!-- LAGUNA-FORK -->
-| **Laguna-XS** (Poolside) | 22B / 2B | [`poolside/Laguna-XS-2.1`](https://huggingface.co/poolside/Laguna-XS-2.1) — original bf16 checkpoint | `make -C c laguna_xs` | [laguna.md](docs/laguna.md) |
-| **Laguna-S** (Poolside) | 118B / 8B | [`poolside/Laguna-S-2.1`](https://huggingface.co/poolside/Laguna-S-2.1) — original bf16 checkpoint | `make -C c laguna_s` | [laguna.md](docs/laguna.md) |
+| **Laguna-XS** (Poolside) | 22B / 2B | [`poolside/Laguna-XS-2.1`](https://huggingface.co/poolside/Laguna-XS-2.1) — original bf16 checkpoint | `make -C c laguna_xs` | [laguna.md](docs/ENGINEERING.md) |
+| **Laguna-S** (Poolside) | 118B / 8B | [`poolside/Laguna-S-2.1`](https://huggingface.co/poolside/Laguna-S-2.1) — original bf16 checkpoint | `make -C c laguna_s` | [laguna.md](docs/ENGINEERING.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.
 Inkling ships int4 experts but **bf16 dense weights** (49.4 GB resident); on a host
-that cannot hold those, [inkling.md](docs/inkling.md) has a one-pass tool that brings
+that cannot hold those, [inkling.md](docs/ENGINEERING.md) has a one-pass tool that brings
 the dense set to 15.3 GB and lets the 975B run on a 25 GB box — with the honest
 trade-off written down.
 
@@ -445,25 +445,25 @@ Two things that differ per model, both documented in the per-model page:
 
 - **Inkling on a RAM-tight host** needs the int4 dense container and a small
   expert cache: `./coli chat --model /nvme/inkling_i4 --cap 2`
-  (see [inkling.md](docs/inkling.md) — the default `--cap 8` wants ~14 GB of
+  (see [inkling.md](docs/ENGINEERING.md) — the default `--cap 8` wants ~14 GB of
   cache on top of the resident set).
 - **Kimi K3** streams its MXFP4 experts from the original checkpoint, so there
   is nothing to convert — but the snapshot is ~1.6 TB
-  (see [kimi_k3.md](docs/kimi_k3.md)).
+  (see [kimi_k3.md](docs/REFERENCE.md)).
 
 ### 4. Go deeper
 
 | topic | doc |
 |---|---|
-| Benchmarks, community datapoints, quality measurements | [docs/benchmarks.md](docs/benchmarks.md) |
-| Tuning knobs, policies, the learning cache, prefetch | [docs/tuning.md](docs/tuning.md) |
-| Windows 11 native build (+ CUDA DLL) | [docs/windows.md](docs/windows.md) |
-| CUDA backend, VRAM expert tier, full residency | [docs/cuda.md](docs/cuda.md) |
-| Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
-| Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
-| OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
-| Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
-| Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+| Benchmarks, community datapoints, quality measurements | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Tuning knobs, policies, the learning cache, prefetch | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Windows 11 native build (+ CUDA DLL) | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| CUDA backend, VRAM expert tier, full residency | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| Apple Silicon Metal backend | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
+| OpenAI-compatible API, KV slots, web dashboard | [docs/REFERENCE.md](docs/REFERENCE.md) |
+| Grammar-forced drafts (structured output) | [docs/REFERENCE.md](docs/REFERENCE.md) |
+| Environment variable inventory | [docs/REFERENCE.md](docs/REFERENCE.md) |
 
 ## DeepSeek V4
 
@@ -494,7 +494,7 @@ the drafts saved — one 14-token answer took 495 seconds. So `V4_DRAFT` and
 `V4_MTP` default to `0` and the code stays, with the numbers beside it, for
 whoever retries this on faster storage.
 
-See [docs/deepseek-v4.md](docs/deepseek-v4.md) for checkpoint validation, the
+See [docs/REFERENCE.md](docs/REFERENCE.md) for checkpoint validation, the
 generated tiny independent oracle, and the full knob list.
 
 ## What's next

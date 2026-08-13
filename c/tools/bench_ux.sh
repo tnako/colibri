@@ -9,7 +9,7 @@
 # The engine env (COLI_CUDA, PIN, ...) is inherited from the caller so the same
 # script exercises CPU-only, CUDA and pipeline configurations.
 #
-# Discipline (docs/experiments/glm52-6x5090-2026-07-12.md):
+# Discipline (docs/EXPERIMENTS.md):
 #   - TEMP=0 DRAFT=0 always: greedy, no speculation, one variable at a time.
 #   - Same binary for every configuration under comparison.
 #   - .coli_usage drifts placement between runs: compare medians of >=3 reps,

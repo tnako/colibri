@@ -8,7 +8,7 @@ work; when absent, the pure-Python fallback here produces byte-identical
 output far more slowly (the e2e test pins the two implementations equal, the
 same relationship iq3_pack.py has with tools/libiq3).
 
-FORMAT SUMMARY (docs/int4-rans256-g0.md is the full specification):
+FORMAT SUMMARY (docs/REFERENCE.md is the full specification):
   - a weight tensor's bytes are ONE chunk record: n_symbols u64,
     packed_bytes u64, stream_offsets[N+1] u32, zero-pad to 16, payload
     (N=256 independent rANS streams, round-robin symbol assignment j -> j%N),

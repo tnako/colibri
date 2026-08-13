@@ -12,7 +12,7 @@
  * Deliberately NOT here: rope math (Laguna's apply step is half-split, every
  * other engine's is interleaved, so there is nothing shared to extract yet)
  * and the per-layer-type head-count macros (three one-liners, cheaper
- * duplicated than indirected). See docs/laguna.md's shared-migration table.
+ * duplicated than indirected). See docs/ENGINEERING.md's shared-migration table.
  */
 #ifndef COLI_MOE_ROUTE_H
 #define COLI_MOE_ROUTE_H

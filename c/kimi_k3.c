@@ -1993,7 +1993,7 @@ int main(int argc, char **argv){
     rt_init("kimi_k3",m.c.n_layers,m.c.n_experts);   /* counters, identity, ROUTE_TRACE */
     /* A layer with no counter row is a layer that cannot be credited: dense layers do not
      * route, and K3 has no MTP row. Without this a history record naming one of them is
-     * silently absorbed and written back out. See docs/routing-telemetry.md. */
+     * silently absorbed and written back out. See docs/REFERENCE.md. */
     for(int i=0;i<m.c.n_layers;i++) if(!m.L[i].sparse) rt_drop_row(i);
     rt_drop_row(m.c.n_layers);
     /* LEARNED CACHE. Expert use accumulates in <snap>/.coli_usage across sessions

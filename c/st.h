@@ -86,7 +86,7 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
     /* LAGUNA-FORK: U32 is the packed-code container for oMLX oQ affine quants
-     * (see docs/oq-format.md). Indexed and read through the RAW byte path like
+     * (see docs/REFERENCE.md). Indexed and read through the RAW byte path like
      * the fp8 types below; the float readers refuse it by name. */
     if (!strcmp(s, "U32") || !strcmp(s, "I32")) return 7;
     /* --- tipi dei checkpoint nativi fp8 (DeepSeek-V4, GLM-5.2-FP8 non ripacchettati) ---
@@ -285,7 +285,7 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
     }
 }
 
-/* Stamps are a resident-tensor convention (see docs/FORMATS.md's "Stamp-map
+/* Stamps are a resident-tensor convention (see docs/REFERENCE.md's "Stamp-map
  * scan bound"): a handful to a few hundred entries per model
  * (q_a/q_b/kv_a/kv_b_proj, o_proj, shared-expert and dense-MLP gate/up/down),
  * NEVER the tens of thousands of routed-expert tensors a large MoE model
@@ -326,7 +326,7 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
  * shard aborts the ENTIRE model load immediately, before the user ever sees
  * which layer or tensor was implicated -- these messages name a shard FILE,
  * never a tensor, which is how to tell this abort surface apart from the
- * later per-tensor one at a glance. See docs/FORMATS.md's own section on
+ * later per-tensor one at a glance. See docs/REFERENCE.md's own section on
  * this. */
 static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
     jval *meta = json_get(root, "__metadata__");
@@ -376,7 +376,7 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
                     shard_path, inner->keys[i], v->str, S->fmt_val[dup]); exit(1); }
         if (S->fmt_n >= ST_FMT_STAMP_MAX) {
             fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] stamps more than %d tensor names across "
-                    "this container's shards -- stamps are a resident-tensor convention (docs/FORMATS.md), "
+                    "this container's shards -- stamps are a resident-tensor convention (docs/REFERENCE.md), "
                     "not a bulk migration path; a container stamping this many names is malformed, "
                     "refusing (untrusted container)\n",
                     shard_path, ST_FMT_STAMP_MAX); exit(1); }
@@ -408,7 +408,7 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
  * router, or embed/lm_head is stored here like any other entry but never
  * looked up: it is silently ignored BY DESIGN, not an oversight -- the
  * convention exists to disambiguate a byte-count collision among quantized
- * formats, and only a .qs-backed tensor can have one. See docs/FORMATS.md's
+ * formats, and only a .qs-backed tensor can have one. See docs/REFERENCE.md's
  * "Scope: .qs-backed tensors only". */
 static const char *st_fmt_stamp(shards *S, const char *name) {
     for (int i = 0; i < S->fmt_n; i++)

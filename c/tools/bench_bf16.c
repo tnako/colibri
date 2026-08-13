@@ -1,7 +1,7 @@
 /* bf16 dot-product strategies on Apple silicon, measured.
  *
  * The engine's matmul_h converts bf16->f32 one element at a time (shift into a
- * uint32_t, memcpy into a float). docs/oq-format.md measured that path at
+ * uint32_t, memcpy into a float). docs/REFERENCE.md measured that path at
  * 23.9 GB/s against f32's 47.5 GB/s, i.e. the conversion, not memory, is the
  * limit. Candidates:
  *   scalar      what the engine does today

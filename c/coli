@@ -524,7 +524,7 @@ def env_for(a):
                          ("GOMP_SPINCOUNT", "200000"),
                          ("OMP_DYNAMIC", "FALSE")):
                 e.setdefault(k, v)
-        # Default Windows misurati sul box di riferimento (docs/tuning-9950x3d-5090.md),
+        # Default Windows misurati sul box di riferimento (docs/RUNBOOK.md),
         # tutti lossless e tutti setdefault (un override esplicito vince sempre):
         # - DIRECT=1: 10.7 GB/s O_DIRECT vs 9.0 buffered (iobench, anche a cache
         #   calda); nel motore 0.48 -> 1.02 tok/s. Upstream #162: 1.47x.
