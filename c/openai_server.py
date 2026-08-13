@@ -385,9 +385,10 @@ class InklingStreamSplit:
     answer). Buffers partial markers across chunk boundaries so a marker split
     between two DATA frames never leaks."""
 
-    def __init__(self, on_content, on_reasoning=None):
+    def __init__(self, on_content, on_reasoning=None, on_reasoning_end=None):
         self.on_content = on_content
         self.on_reasoning = on_reasoning
+        self.on_reasoning_end = on_reasoning_end
         self.mode = "content"
         self.buf = ""
 
@@ -404,6 +405,8 @@ class InklingStreamSplit:
                 return
             i, m = min(hits)
             self._emit(self.buf[:i])
+            if m == INK_TEXT and self.mode == "reasoning" and self.on_reasoning_end:
+                self.on_reasoning_end()
             self.mode = "reasoning" if m == INK_THINK else "content"
             self.buf = self.buf[i + len(m):]
 
@@ -702,6 +705,44 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
     return "".join(parts)
 
 
+def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """OLMoE-Instruct's native chat_template (tokenizer_config.json): one
+    bos_token, then per-message <|system|>/<|user|>/<|assistant|> turns each
+    closed by a newline, prior assistant turns also closed by eos_token
+    (bos_token == eos_token == "|||IP_ADDRESS|||", a PII-scrubbing artifact
+    repurposed as this tokenizer's BOS/EOS marker), and a trailing
+    "<|assistant|>\\n" generation prompt. No tool-call syntax and no thinking
+    mode exist in this template, so both parameters are accepted but unused.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the OLMoE engine yet.",
+                       "tools", "unsupported_parameter")
+    boundary = "|||IP_ADDRESS|||"   # bos_token == eos_token in this tokenizer
+    parts = [boundary]
+    last = len(messages) - 1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            parts.append(f"<|system|>\n{text}\n")
+        elif role == "user":
+            parts.append(f"<|user|>\n{text}\n")
+        else:
+            parts.append(f"<|assistant|>\n{text}{boundary}")
+            if index != last:
+                parts.append("\n")
+    parts.append("<|assistant|>\n")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -902,7 +943,18 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]
     if enable_thinking:
-        effort = "High" if reasoning_effort == "high" else "Max"
+        # The endpoint accepts none/minimal/low/medium/high/xhigh, and this used
+        # to render every one of them except "high" as Max -- so a client asking
+        # for `minimal` got more reasoning than one asking for `high`, and the
+        # mapping was not even monotonic (#809). On a single machine that is not
+        # a cosmetic mismatch: unrequested reasoning spends the token budget
+        # before the answer starts.
+        #
+        # GLM-5.2's template takes a word here, not a number, so the levels map
+        # onto the ones it understands, in order. `none` cannot appear: it turns
+        # thinking off upstream and never reaches this branch.
+        effort = {"minimal": "Low", "low": "Low", "medium": "Medium",
+                  "high": "High", "xhigh": "Max"}.get(reasoning_effort, "High")
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     forced = None
     if isinstance(tool_choice, dict):
@@ -977,6 +1029,20 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     prompt.append("<|assistant|><think>" if enable_thinking else
                   "<|assistant|><think></think>")
     return "".join(prompt)
+
+
+def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                         tool_choice=None, audio_out=None):
+    """Render a chat request with the active engine's native prompt contract."""
+    if ARCH == "inkling":
+        return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
+                                    tool_choice, audio_out=audio_out)
+    renderer = (render_chat_kimi if ARCH == "kimi" else
+                render_chat_v4 if ARCH == "deepseek_v4" else
+                render_chat_olmoe if ARCH == "olmoe" else
+                render_chat_laguna if ARCH in ("laguna_xs", "laguna_s") else   # LAGUNA-FORK
+                render_chat)
+    return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
@@ -1494,8 +1560,8 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 def model_arch(model):
     """The model's engine family from its config.json model_type -- the same
-    rule as coli's model_arch(): "inkling"/"kimi" substring, everything else
-    (including an unreadable config) is glm."""
+    rule as coli's model_arch(): "inkling"/"kimi"/"olmoe" substring, everything
+    else (including an unreadable config) is glm."""
     try:
         with open(Path(model) / "config.json", encoding="utf-8") as fh:
             cfg = json.load(fh)
@@ -1508,6 +1574,8 @@ def model_arch(model):
         return "kimi"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
+    if "olmoe" in model_type:
+        return "olmoe"
     # LAGUNA-FORK: two binaries behind one model_type, split on hidden_size --
     # must stay identical to coli's model_arch() or --arch auto and the engine
     # coli picked would disagree.
@@ -1783,7 +1851,21 @@ class Engine:
                     on_accept(info)
 
         while True:
-            kind, value = events.get()
+            try:
+                kind, value = events.get(timeout=0.05)
+            except queue.Empty:
+                # #908: cancelled() is only polled in the "data" branch, so a
+                # client that disconnects before the engine's first DATA frame
+                # (it is still prefilling) never cancels: the CANCEL never went
+                # out, the turn ran to its token limit, and this thread stayed
+                # blocked until the engine emitted something. Poll the callback
+                # while idle so a pre-first-frame disconnect cancels too.
+                if not cancel_sent and not stop_sent and cancelled and cancelled():
+                    cancel_sent = True
+                    with self.write_lock:
+                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                        self.process.stdin.flush()
+                continue
             if kind == "accept":
                 if accepted:
                     raise RuntimeError("engine sent a duplicate ACCEPT frame")
@@ -2011,7 +2093,14 @@ class APIHandler(BaseHTTPRequestHandler):
                              % self.address_string())
             self.close_connection = True
             return
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
+            # ConnectionError, not (BrokenPipeError, ConnectionResetError): those two
+            # are SIBLINGS of ConnectionAbortedError under it, so the pair caught the
+            # POSIX spellings and let the Windows one through. #854's log is pages of
+            # `ConnectionAbortedError: [WinError 10053] An established connection was
+            # aborted by the software in your host machine` escaping to socketserver,
+            # from a `coli web` start that was otherwise healthy.
+            #
             # The client hung up mid-response. That is not an error here, it is
             # how HTTP clients behave: `coli chat` polls /health while the model
             # loads and drops each connection as soon as it has its answer, and
@@ -2288,8 +2377,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self._fail(error, request_id)
         except ClientCancelled:
             pass
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except ConnectionError:
+            pass                      # same widening as handle_one_request, same reason
         except Exception as error:
             self.log_error("request failed: %s", error)
             try:
@@ -2328,7 +2417,7 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH in ("inkling", "kimi"):
+        if grammar is not None and ARCH in ("inkling", "kimi", "olmoe"):
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
@@ -2628,18 +2717,9 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = (render_chat_inkling if ARCH == "inkling" else
-                    render_chat_kimi if ARCH == "kimi" else
-                    render_chat_v4 if ARCH == "deepseek_v4" else
-                    render_chat_laguna if ARCH in ("laguna_xs", "laguna_s") else   # LAGUNA-FORK
-                    render_chat)
         audio_clips = [] if ARCH == "inkling" else None
-        if audio_clips is not None:
-            prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                              tool_choice, audio_out=audio_clips)
-        else:
-            prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                              tool_choice)
+        prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+                                      tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
                         audio=b"".join(audio_clips) if audio_clips else None)
@@ -2673,8 +2753,9 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
-                             tools, tool_choice)
+        prompt = render_chat_for_arch(messages, enable_thinking,
+                                      "high" if enable_thinking else None,
+                                      tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
@@ -2705,8 +2786,12 @@ class APIHandler(BaseHTTPRequestHandler):
         def blocks_and_stop(text, stats):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
             content = []
-            if enable_thinking:
+            reasoning = ""
+            if ARCH == "inkling":
+                text, reasoning = split_inkling(text)
+            elif enable_thinking:
                 reasoning, text = split_thinking_reply(text)
+            if enable_thinking:
                 content.append({"type": "thinking", "thinking": reasoning,
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
@@ -2844,8 +2929,13 @@ class APIHandler(BaseHTTPRequestHandler):
                               "signature": ANTHROPIC_LOCAL_SIGNATURE}})
                 send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
-            split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                     if enable_thinking else None)
+            if ARCH == "inkling":
+                split = InklingStreamSplit(emit_answer,
+                                           emit_thinking if enable_thinking else None,
+                                           close_thinking if enable_thinking else None)
+            else:
+                split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
+                         if enable_thinking else None)
 
             def on_text(chunk):
                 raw.append(chunk)
@@ -2857,7 +2947,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
             stop_filter.finish()
             if split:
-                split.finish()
+                split.close()
                 close_thinking()               # budget exhaustion before </think>
             if tools and not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
@@ -2912,7 +3002,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("kv_slots must be between 1 and 16")
     # LAGUNA-FORK: the Laguna engines re-prefill every request like inkling/kimi
     # do, so they share the single-KV-slot restriction.
-    if ARCH in ("inkling", "kimi", "deepseek_v4", "laguna_xs", "laguna_s") and kv_slots != 1:
+    if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe", "laguna_xs", "laguna_s") and kv_slots != 1:
         raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
@@ -2949,7 +3039,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4", "olmoe",
                                            "laguna_xs", "laguna_s"),   # LAGUNA-FORK
                         default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
@@ -2984,6 +3074,7 @@ def main():
                          "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
                          "laguna-xs-colibri" if ARCH == "laguna_xs" else   # LAGUNA-FORK
                          "laguna-s-colibri" if ARCH == "laguna_s" else
+                         "olmoe-colibri" if ARCH == "olmoe" else
                          "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,

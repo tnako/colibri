@@ -19,7 +19,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, render_chat_kimi, render_chat_laguna, serve,
+                           render_chat, render_chat_kimi, render_chat_olmoe, render_chat_laguna, serve,
                            split_thinking_reply, stop_policy, tune_child_env)
 
 
@@ -113,6 +113,37 @@ class TemplateTest(unittest.TestCase):
                                "content": "answer"}], enable_thinking=True),
             "K3CHAT1\nA 3 6\nwhyanswerG 1\n",
         )
+
+    def test_olmoe_renders_native_chat_template(self):
+        # Matches allenai/OLMoE-1B-7B-0125-Instruct's tokenizer_config.json
+        # chat_template exactly: one leading bos_token, per-role turns closed
+        # by a trailing newline, a prior (non-final) assistant turn also closed
+        # by eos_token before that newline (bos_token == eos_token ==
+        # "|||IP_ADDRESS|||" in this tokenizer), and a trailing
+        # "<|assistant|>\n" generation prompt.
+        prompt = render_chat_olmoe([
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Continue"},
+        ])
+        self.assertEqual(
+            prompt,
+            "|||IP_ADDRESS|||<|system|>\nBe terse.\n<|user|>\nHi\n"
+            "<|assistant|>\nHello|||IP_ADDRESS|||\n<|user|>\nContinue\n"
+            "<|assistant|>\n",
+        )
+
+    def test_olmoe_rejects_tools_and_unknown_roles(self):
+        with self.assertRaisesRegex(APIError, "Tool use"):
+            render_chat_olmoe([{"role": "user", "content": "Hi"}],
+                              tools=[{"type": "function"}])
+        with self.assertRaisesRegex(APIError, "Unsupported role"):
+            render_chat_olmoe([{"role": "tool", "content": "result"}])
+
+    def test_olmoe_rejects_empty_messages(self):
+        with self.assertRaisesRegex(APIError, "non-empty array"):
+            render_chat_olmoe([])
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
@@ -570,6 +601,50 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
+    def test_cancels_generation_before_first_frame(self):
+        # #908: a client that disconnects while the engine is still prefilling
+        # (no DATA frame has arrived) must cancel too. cancelled() used to be
+        # polled only in the "data" branch, so the CANCEL never went out and
+        # the turn ran to its token limit while this thread stayed blocked.
+        # The fake engine emits nothing until it sees CANCEL -- exactly the
+        # pre-first-frame regime -- and must still get one.
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                self.assertEqual(fields[1], request_id)
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        flag = {"cancelled": False}
+        outcome = []
+
+        def generate():
+            try:
+                engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                                cancelled=lambda: flag["cancelled"])
+            except ClientCancelled:
+                outcome.append("cancelled")
+
+        thread = threading.Thread(target=generate)
+        thread.start()
+        for _ in range(200):
+            if any(frame.startswith(b"SUBMIT") for frame in process.writes):
+                break
+            time.sleep(0.01)
+        flag["cancelled"] = True
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        engine.close()
+        self.assertEqual(outcome, ["cancelled"])
+        self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+
     def test_stops_generation_through_successful_done_path(self):
         request_id = None
 
@@ -661,6 +736,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(cap_for_arch("glm", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
+        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
@@ -671,6 +747,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
+        self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
         self.assertEqual(model_arch("/nonexistent"), "glm")
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
@@ -934,6 +1011,47 @@ class ClientHangupTest(unittest.TestCase):
     def test_the_server_still_answers_afterwards(self):
         """The real damage would be a handler thread lost to the exception."""
         self._hang_up_after_request("/health")
+        with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
+                     timeout=2) as response:
+            self.assertEqual(json.load(response)["status"], "ok")
+
+    def _abort(self, *args):
+        """Windows' spelling of the same disconnect, raised where it really lands.
+
+        In #854's log the traceback runs do_GET -> send_json -> end_headers ->
+        flush_headers -> wfile.write -> sendall, so raising from end_headers
+        reproduces the exact shape on any platform.
+        """
+        raise ConnectionAbortedError(
+            10053, "An established connection was aborted by the software in your "
+                   "host machine")
+
+    def test_windows_aborted_connection_is_not_an_error(self):
+        """ConnectionAbortedError is a SIBLING of BrokenPipeError and
+        ConnectionResetError under ConnectionError, not a subclass of either --
+        so catching the pair caught the POSIX spellings and let the Windows one
+        escape. #854 is pages of WinError 10053 tracebacks from a healthy start.
+        """
+        self.assertFalse(
+            issubclass(ConnectionAbortedError, (BrokenPipeError, ConnectionResetError)),
+            "the old except clause would have covered this; the test proves nothing")
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+            except Exception:
+                pass                      # the client sees a broken response; that is fine
+            time.sleep(0.3)
+        self.assertEqual(self.errors, [],
+                         "WinError 10053 surfaced as a server error (#854)")
+
+    def test_the_server_survives_an_aborted_connection(self):
+        """Same as the hangup case: the damage is a lost handler, not the log."""
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+            except Exception:
+                pass
+            time.sleep(0.3)
         with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
                      timeout=2) as response:
             self.assertEqual(json.load(response)["status"], "ok")
@@ -1805,6 +1923,45 @@ class ConnectionLimitTest(unittest.TestCase):
         time.sleep(APIHandler.READ_DEADLINE + 1.5)
         self.assertEqual(self.server._conn_live, 0,
                          "dripping connections were never reclaimed")
+
+
+class ReasoningEffortTest(unittest.TestCase):
+    """render_chat mapped every level except "high" onto Max (#809).
+
+    The endpoint accepts none/minimal/low/medium/high/xhigh. Four of the five
+    that enable thinking rendered Max, so a client asking for `minimal` got
+    more reasoning than one asking for `high` -- and on a single machine
+    unrequested reasoning spends the token budget before the answer starts.
+    """
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def effort(self, level):
+        import re
+        text = render_chat(self.MESSAGES, enable_thinking=True,
+                           reasoning_effort=level)
+        found = re.search(r"Reasoning Effort: (\w+)", text)
+        return found.group(1) if found else None
+
+    def test_levels_are_distinct_and_ordered(self):
+        rendered = [self.effort(l) for l in
+                    ("minimal", "low", "medium", "high", "xhigh")]
+        rank = {"Low": 0, "Medium": 1, "High": 2, "Max": 3}
+        scores = [rank[r] for r in rendered]
+        self.assertEqual(scores, sorted(scores), rendered)
+        self.assertLess(scores[0], scores[-1],
+                        "minimal and xhigh render the same effort")
+
+    def test_minimal_is_not_max(self):
+        """The reported symptom, pinned on its own."""
+        self.assertNotEqual(self.effort("minimal"), "Max")
+        self.assertNotEqual(self.effort("low"), "Max")
+        self.assertNotEqual(self.effort("medium"), "Max")
+
+    def test_thinking_off_emits_no_effort_line(self):
+        text = render_chat(self.MESSAGES, enable_thinking=False,
+                           reasoning_effort="xhigh")
+        self.assertNotIn("Reasoning Effort", text)
 
 
 if __name__ == "__main__":
