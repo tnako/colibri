@@ -960,6 +960,7 @@ static void load_resident_experts(Model *m) {
 
 
 #ifdef LAGUNA_METAL
+static double mem_avail_bytes(void);
 /* ---- GPU expert bank, mapped not copied (LAGUNA-FORK) ----------------------
  * Locate every layer's three expert tensors inside their mmap'd shard and hand
  * the addresses to Metal. Nothing is read, unpacked or copied here: the GPU
@@ -1012,11 +1013,33 @@ static int gpu_experts_map(Model *m) {
     { int64_t hw = 0; size_t sz = sizeof(hw);
       if (sysctlbyname("hw.memsize", &hw, &sz, NULL, 0) == 0 && hw > 0) phys_ram = (double)hw; }
 #endif
-    if (phys_ram > 0 && bank_bytes > phys_ram * 0.85) {
+    int force_exp = getenv("LAGUNA_GPU_EXP_FORCE") ? atoi(getenv("LAGUNA_GPU_EXP_FORCE")) : 0;
+    if (phys_ram > 0 && !force_exp && bank_bytes > phys_ram * 0.85) {
         fprintf(stderr,
             "[mem] gpu experts: bank is %.1f GB, exceeds 85%% of %.1f GB physical RAM -> "
             "falling back to the resident/streaming path (would swap otherwise)\n",
             bank_bytes/1e9, phys_ram/1e9);
+        return 0;
+    }
+
+    /* LAGUNA-FORK 2026-08-13: the bank fits in installed RAM but not in what is
+     * GENUINELY available -- mem_avail_bytes() excludes the file-cache pages,
+     * which is exactly what a zero-copy bank consists of. On a loaded 32 GB Mac
+     * the 85%-of-total guard alone still mapped the 7.9 GB (XS) / 15.7 GB
+     * (oQ4e) bank, prefill then faulted ALL of it into RAM for every chunk, and
+     * macOS wrote 2-8 GB of anonymous pages to swap (visible in htop).
+     * Fall back to streaming when the bank cannot live in real headroom:
+     * streaming touches only the pages of the routed experts, ~1/8 of the
+     * bank, and macOS can evict that file cache without swapping.
+     * LAGUNA_GPU_EXP_FORCE=1 bypasses BOTH this check and the 85%-of-total
+     * check above, for users who know their box has the room. */
+    double avail_now = mem_avail_bytes();
+    if (!force_exp && avail_now > 0 && bank_bytes > avail_now) {
+        fprintf(stderr,
+            "[mem] gpu experts: bank is %.1f GB, only %.1f GB of RAM is genuinely "
+            "available (file cache excluded) -> streaming instead (would swap otherwise; "
+            "LAGUNA_GPU_EXP_FORCE=1 overrides)\n",
+            bank_bytes/1e9, avail_now/1e9);
         return 0;
     }
 
@@ -1215,7 +1238,30 @@ static double mem_avail_bytes(void) {
     vm_statistics64_data_t vs; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &n) != KERN_SUCCESS)
         return 0;
-    return (double)(vs.free_count + vs.inactive_count + vs.purgeable_count) * page;
+    /* LAGUNA-FORK 2026-08-13: count only free + purgeable + a QUARTER of the
+     * inactive pages as "available for anonymous allocation".
+     *
+     * inactive_count on macOS is dominated by FILE CACHE, and this engine
+     * populates a lot of it itself: the dense weights are pread'd into the
+     * page cache and, on a GPU build, the routed-expert bank is mmap'd and
+     * handed to Metal zero-copy. Those pages are "reclaimable", but they are
+     * pages THIS process re-faults within seconds, so handing them to the
+     * cache/bank sizing (avail*0.70 / *0.9 below) as if they were free
+     * double-counts the same physical RAM. On a loaded 32 GB Mac, inactive is
+     * typically 8-14 GB and the old formula reported ~15 GB "available" -- the
+     * engine then sized a ~10-13 GB LRU cache / Q8R bank ON TOP of that, the
+     * GPU bank faulted in its 8-16 GB, and macOS wrote 2-8 GB to swap.
+     * Counting a quarter (safety share for genuinely foreign reclaimable
+     * cache) and clamping to 85% of installed RAM keeps the anonymous budget
+     * honest instead of over-committing against the page cache. */
+    double avail = (double)(vs.free_count + vs.purgeable_count) * page
+                 + (double)(vs.inactive_count / 4) * page;
+    { int64_t hw = 0; size_t sz = sizeof(hw);
+      if (sysctlbyname("hw.memsize", &hw, &sz, NULL, 0) == 0 && hw > 0) {
+          double cap = (double)hw * 0.85;
+          if (avail > cap) avail = cap;
+      } }
+    return avail;
 #else
     return 0;
 #endif
